@@ -15,7 +15,7 @@ const { outputFiles } = await build({
 })
 const code = new TextDecoder().decode(outputFiles[0].contents)
 const modUrl = 'data:text/javascript;base64,' + Buffer.from(code).toString('base64')
-const { computeFoldGroups, foldLabel, toolCallDetail, blocksToText, computeInjectionGroups } = await import(modUrl)
+const { computeFoldGroups, foldLabel, toolCallDetail, blocksToText, computeInjectionGroups, formatInjectionClock } = await import(modUrl)
 
 // ---- mock 快照 ----
 function turnLoc(turn) {
@@ -30,8 +30,11 @@ function contextNode(key, text, loc) {
     data: { source: { kind: 'plugin', plugin: 'meow-memory' }, content: [{ type: 'text', text }] },
   }
 }
-function userNode(key, loc, content) {
-  return { key, kind: 'user', location: loc, data: { source: { kind: 'user' }, ...(content ? { content } : {}) } }
+function userNode(key, loc, content, time) {
+  return {
+    key, kind: 'user', location: loc,
+    data: { source: { kind: 'user' }, ...(content ? { content } : {}), ...(time === undefined ? {} : { time }) },
+  }
 }
 function steeringNode(key, loc) {
   return { key, kind: 'steering', location: loc, data: {} }
@@ -192,6 +195,32 @@ console.log('=== 7. 并行 memory_remember 计数 ===')
   check('文案显示新增 3 条', foldLabel(g, false).includes('新增记忆 3 条'))
 }
 
+// ---- 8. 异常快照防护：节点缺 location 不抛（GitHub issue #2 回归） ----
+console.log('=== 8. 缺 location 防护 ===')
+{
+  // 无 location 的 meow-memory context 节点（旧运行时/异常快照可能吐出），
+  // 且排在正常节点之前：修复前 turnOf() 读 location.kind 直接炸掉整轮渲染。
+  const badCtx = {
+    key: 'bad-ctx', kind: 'context',
+    data: { source: { kind: 'plugin', plugin: 'meow-memory' }, content: [{ type: 'text', text: REFLECT }] },
+  }
+  const nodes = new Map([
+    ['bad-ctx', badCtx],
+    ['ctx-1', contextNode('ctx-1', DREAM, turnLoc(6))],
+    ['asst-1', assistantNode('asst-1', turnLoc(6), 'settled')],
+  ])
+  const s = snapshot(['bad-ctx', 'ctx-1', 'asst-1'], nodes, (t) => t === 6 ? ['ctx-1', 'asst-1'] : [])
+  let groups
+  try {
+    groups = computeFoldGroups(s)
+    check('缺 location 不抛异常（issue #2）', true)
+  } catch {
+    check('缺 location 不抛异常（issue #2）', false)
+  }
+  check('坏点之后的正常 dream 组不受影响', groups?.length === 1 && groups[0].variant === 'dream')
+  check('缺 location 的组被跳过=不折叠保持可见', !groups?.some((g) => g.id === 'bad-ctx'))
+}
+
 // ---- 9. 注入折叠：首轮长期记忆 / 关键词命中识别与解析 ----
 console.log('=== 9. computeInjectionGroups ===')
 {
@@ -199,7 +228,7 @@ console.log('=== 9. computeInjectionGroups ===')
   const HIT = '可能相关的记忆，仅供参考：\n- [fact:abc] 内容\n------\n本轮用户prompt：\n\n再问一句'
   const PLAIN = '普通消息没有注入'
   const nodes = new Map([
-    ['u-first', userNode('u-first', turnLoc(1), [{ type: 'text', text: FIRST }])],
+    ['u-first', userNode('u-first', turnLoc(1), [{ type: 'text', text: FIRST }], 1755900000000)],
     ['u-hit', userNode('u-hit', turnLoc(2), [{ type: 'text', text: HIT }])],
     ['u-plain', userNode('u-plain', turnLoc(3), [{ type: 'text', text: PLAIN }])],
     ['u-img', userNode('u-img', turnLoc(4), [{ type: 'text', text: HIT }, { type: 'image', attachment: {} }])],
@@ -210,11 +239,24 @@ console.log('=== 9. computeInjectionGroups ===')
   const first = injs.find((g) => g.id === 'u-first')
   check('首轮注入 kind=first', first?.kind === 'first')
   check('首轮 userText 解析', first?.userText === '你好')
+  check('首轮 time 提取', first?.time === 1755900000000)
   check('首轮 injectedText 含完整注入', first?.injectedText.includes('===== 长期记忆 =====') && first?.injectedText.includes('本轮用户prompt：'))
   const hit = injs.find((g) => g.id === 'u-hit')
   check('命中注入 kind=hit', hit?.kind === 'hit')
   check('命中 userText 解析', hit?.userText === '再问一句')
+  check('无 time → undefined', hit?.time === undefined)
   check('命中 injectedText 含标记', hit?.injectedText.includes('可能相关的记忆，仅供参考：'))
+}
+
+// ---- 10. 注入消息时钟（对齐 dsh formatMessageClock 规则） ----
+console.log('=== 10. formatInjectionClock ===')
+{
+  const now = new Date(2026, 7, 23, 15, 0).getTime() // 2026-08-23 15:00 本地
+  const mk = (y, mo, d, h, mi) => new Date(y, mo, d, h, mi).getTime()
+  check('同天 → HH:mm', formatInjectionClock(mk(2026, 7, 23, 9, 5), now) === '09:05')
+  check('同天 → HH:mm 补零', formatInjectionClock(mk(2026, 7, 23, 15, 0), now) === '15:00')
+  check('今年非今天 → M月D日 HH:mm', formatInjectionClock(mk(2026, 0, 2, 8, 30), now) === '1月2日 08:30')
+  check('跨年 → Y年M月D日 HH:mm', formatInjectionClock(mk(2025, 11, 31, 23, 59), now) === '2025年12月31日 23:59')
 }
 
 console.log(failures === 0 ? '\nALL CLIENT-FOLD TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)

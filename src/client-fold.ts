@@ -51,11 +51,15 @@ interface ContextLike {
   readonly content?: readonly { type?: string; text?: string }[]
 }
 
-/** 从节点 location 提取 turn 号（unresolved/session 定位无法确定时返回 undefined）。 */
+/** 从节点 location 提取 turn 号（unresolved/session 定位无法确定时返回 undefined，
+ *  调用方对 undefined 一律跳过=不折叠保持可见）。location 与 location.turn 均做
+ *  缺失防护：异常快照/版本偏差下节点可能无 location（GitHub issue #2），缺失时
+ *  与 unresolved 同路径降级，绝不抛错——computeFoldGroups 在每次渲染都跑，一炸
+ *  就是一整个会话视图。 */
 function turnOf(node: ChatNode): number | undefined {
   const location = node.location
-  if (location.kind === 'turn') return location.turn.turn
-  if (location.kind === 'step') return location.turn.turn
+  if (location?.kind === 'turn') return location.turn?.turn
+  if (location?.kind === 'step') return location.turn?.turn
   return undefined
 }
 
@@ -179,6 +183,8 @@ export interface InjectionGroup {
   readonly injectedText: string
   /** 用户 prompt 原文（分隔标记之后）。 */
   readonly userText: string
+  /** 消息事件时间（Unix epoch ms）；缺失时操作行不显示时钟。 */
+  readonly time?: number
 }
 
 /**
@@ -204,7 +210,32 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
     const sepIdx = text.lastIndexOf(PROMPT_SEPARATOR)
     if (sepIdx === -1) continue // 没有分隔标记（异常数据）：不折叠
     const userText = text.slice(sepIdx + PROMPT_SEPARATOR.length).replace(/^\n+/, '')
-    groups.push({ id: key, kind, injectedText: text.slice(0, sepIdx + PROMPT_SEPARATOR.length), userText })
+    const time = typeof (node.data as { time?: unknown }).time === 'number'
+      ? (node.data as { time: number }).time
+      : undefined
+    groups.push({ id: key, kind, injectedText: text.slice(0, sepIdx + PROMPT_SEPARATOR.length), userText, time })
   }
   return groups
+}
+
+/** 注入用户消息的时间标签。与 dsh 本体 formatMessageClock 同规则（同天 HH:mm、
+ *  今年「M月D日 HH:mm」、跨年「Y年M月D日 HH:mm」，中文产品文案），供插件自绘的
+ *  注入消息操作行使用——本体按钮的复制文本闭包含注入前缀，无法直接复用。
+ * @param time - 消息事件时间（Unix epoch ms）。
+ * @param now - 参考时刻（默认当前；测试可注入）。
+ * @returns 时钟字符串（24 小时制补零）。
+ */
+export function formatInjectionClock(time: number, now: number = Date.now()): string {
+  const d = new Date(time)
+  const n = new Date(now)
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  const clock = `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  const sameDay = d.getFullYear() === n.getFullYear()
+    && d.getMonth() === n.getMonth()
+    && d.getDate() === n.getDate()
+  if (sameDay) return clock
+  const md = d.getFullYear() === n.getFullYear()
+    ? `${d.getMonth() + 1}月${d.getDate()}日`
+    : `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`
+  return `${md} ${clock}`
 }

@@ -53,7 +53,7 @@ const legacy = [
   '',
   '> 说明头',
   '',
-  '**用户 GitHub：Phant0Meow，就是 FemWA 作者本人（jovielher@163.com）**',
+  '**用户 GitHub：Phant0Meow，就是 FemWA 作者本人（meow@example.com）**',
   '作为长期协作伙伴，我应该重事实轻客套，先计划后动手。',
   '',
   '## 重要事实与决定 (fact)',

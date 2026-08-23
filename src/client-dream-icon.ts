@@ -200,6 +200,11 @@ export function startDreamIconManager(): () => void {
   }
 
   // 样式常驻全局（图标由 data 属性驱动，规则在即生效；与折叠 UI 的 CSS 同策略）。
+  // 热重载 dispose 不删 style——注入前先移除本插件旧 style，防多代规则堆积污染
+  // （同 client.ts apply 的处理）。
+  for (const stale of Array.from(document.querySelectorAll('style[data-meow-dream-icon-css]'))) {
+    stale.remove()
+  }
   const style = document.createElement('style')
   style.dataset.meowDreamIconCss = 'true'
   style.textContent = ICON_CSS

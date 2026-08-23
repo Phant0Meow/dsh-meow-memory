@@ -20,7 +20,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { ConversationSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
 import type { InputZone } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { AssistantChatData, ChatNode, ToolChatData } from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { blocksToText, computeFoldGroups, computeInjectionGroups, foldLabel, toolCallDetail, type FoldGroup, type InjectionGroup } from './client-fold.ts'
+import { blocksToText, computeFoldGroups, computeInjectionGroups, foldLabel, formatInjectionClock, toolCallDetail, type FoldGroup, type InjectionGroup } from './client-fold.ts'
 import { startDreamIconManager } from './client-dream-icon.ts'
 
 /** 折叠行标记（CSS 规则隐藏）。 */
@@ -67,19 +67,64 @@ const FOLD_CSS = `[${FOLDED_ATTR}="true"] { display: none !important; }
 }
 [${INJ_PROMPT_ATTR}] {
   display: flex;
-  justify-content: flex-end;
-  margin: 2px 0 6px;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
 }
-[${INJ_PROMPT_ATTR}] > div {
-  max-width: 82%;
-  padding: 8px 12px;
-  border-radius: 12px;
-  background: var(--dsw-alias-bubble-user-bg, rgba(127,127,127,.12));
-  color: var(--dsw-alias-label-primary, inherit);
-  font-size: 14px;
-  line-height: 1.7;
+/* 用户 prompt 气泡：样式对齐 dsh 本体 UserStyleBubble（MessageItem.module.css
+ * .userStack/.bubble）——同 token 同尺寸，主题切换自动跟随。 */
+[${INJ_PROMPT_ATTR}] > [data-meow-inj-bubble] {
+  max-width: min(525px, 82%);
+  padding: 10px 16px;
+  border-radius: 22px;
+  background: var(--dsw-specific-bubble);
+  color: var(--dsw-alias-label-primary);
+  font-size: 16px;
+  line-height: 24px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+[data-meow-inj-actions] {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 28px;
+  background: transparent;
+}
+[data-meow-inj-time] {
+  padding-right: 12px;
+  font-size: 14px;
+  line-height: 24px;
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+  background: transparent;
+}
+@media (hover: hover) {
+  [data-meow-inj-time] {
+    opacity: 0;
+    transition: opacity 80ms ease;
+  }
+  [${INJ_PROMPT_ATTR}]:hover [data-meow-inj-time],
+  [${INJ_PROMPT_ATTR}]:focus-within [data-meow-inj-time] {
+    opacity: 1;
+  }
+}
+[data-meow-inj-copy] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 6px;
+  border: none;
+  border-radius: 28px;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+[data-meow-inj-copy]:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary);
 }`
 
 /** 卡片克隆签名缓存（groupId → 原始行文本签名）：展开时行内容更新/不完整则自愈重克隆。 */
@@ -181,7 +226,8 @@ function enhanceClone(clone: HTMLElement, node: ChatNode | undefined): void {
   // 注意：assistant 节点在 ChatNodeDataMap 注册的 kind 是 'assistant-step'（dsh 源码
   // conversation-nodes/assistant.ts），不是 'assistant'——写错则 think 增强永不生效。
   if (node.kind === 'assistant-step') {
-    const blocks = (node.data as AssistantChatData).blocks
+    // issue #2：异常数据缺 blocks 时按空数组处理，不让增强路径抛错。
+    const blocks = (node.data as AssistantChatData).blocks ?? []
     const reasoning = blocks.filter((b): b is Extract<typeof b, { kind: 'reasoning' }> => b.kind === 'reasoning')
     const toolCalls = blocks.filter((b): b is Extract<typeof b, { kind: 'tool-call' }> => b.kind === 'tool-call')
     const thinkRows = Array.from(clone.querySelectorAll<HTMLElement>('[data-variant="think"]'))
@@ -198,6 +244,7 @@ function enhanceClone(clone: HTMLElement, node: ChatNode | undefined): void {
     })
   } else if (node.kind === 'tool-call') {
     const root = (node.data as ToolChatData).root
+    if (root === undefined) return // issue #2：异常数据无 root 时跳过增强（与 toolNameOf 同防护）
     const rowEl = clone.querySelector<HTMLElement>('[data-disclosure-row]')
     if (rowEl === null) return
     const name = 'name' in root ? root.name : (root.call?.name ?? root.callId)
@@ -244,9 +291,48 @@ function fillBody(id: string, visible: boolean, keys: readonly string[], session
   }
 }
 
+/** 复制/已复制图标（与 dsh 本体 IconCopyOutline16 / IconCheckOutline16 同 path，
+ *  ui-primitives src/icons/index.tsx；fill currentColor 跟随按钮颜色）。 */
+const COPY_ICON_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6.14929 4.02032C7.11197 4.02032 7.87983 4.02016 8.49597 4.07598C9.12128 4.13269 9.65792 4.25188 10.1415 4.53106C10.7202 4.8653 11.2008 5.3459 11.535 5.92462C11.8142 6.40818 11.9334 6.94481 11.9901 7.57012C12.0459 8.18625 12.0458 8.95419 12.0458 9.9168C12.0458 10.8795 12.0459 11.6473 11.9901 12.2635C11.9334 12.8888 11.8142 13.4254 11.535 13.909C11.2008 14.4877 10.7202 14.9683 10.1415 15.3025C9.65792 15.5817 9.12128 15.7009 8.49597 15.7576C7.87984 15.8134 7.11196 15.8133 6.14929 15.8133C5.18667 15.8133 4.41874 15.8134 3.80261 15.7576C3.1773 15.7009 2.64067 15.5817 2.1571 15.3025C1.5784 14.9683 1.09778 14.4877 0.76355 13.909C0.484366 13.4254 0.365184 12.8888 0.308472 12.2635C0.252649 11.6473 0.252808 10.8795 0.252808 9.9168C0.252808 8.95418 0.252664 8.18625 0.308472 7.57012C0.365184 6.94481 0.484366 6.40818 0.76355 5.92462C1.09777 5.34589 1.57839 4.86529 2.1571 4.53106C2.64067 4.25188 3.1773 4.13269 3.80261 4.07598C4.41874 4.02017 5.18666 4.02032 6.14929 4.02032ZM6.14929 5.37774C5.16181 5.37774 4.46634 5.37761 3.92566 5.42657C3.39434 5.47472 3.07859 5.56574 2.83582 5.70587C2.4632 5.92106 2.15354 6.2307 1.93835 6.60333C1.79823 6.8461 1.70721 7.16185 1.65906 7.69317C1.6101 8.23385 1.61023 8.92933 1.61023 9.9168C1.61023 10.9043 1.61009 11.5998 1.65906 12.1404C1.70721 12.6717 1.79823 12.9875 1.93835 13.2303C2.15356 13.6029 2.46321 13.9126 2.83582 14.1277C3.07859 14.2679 3.39434 14.3589 3.92566 14.407C4.46634 14.456 5.16182 14.4559 6.14929 14.4559C7.13682 14.4559 7.83224 14.456 8.37292 14.407C8.90425 14.3589 9.21999 14.2679 9.46277 14.1277C9.83535 13.9126 10.145 13.6029 10.3602 13.2303C10.5004 12.9875 10.5914 12.6717 10.6395 12.1404C10.6885 11.5998 10.6884 10.9043 10.6884 9.9168C10.6884 8.92934 10.6885 8.23384 10.6395 7.69317C10.5914 7.16185 10.5004 6.8461 10.3602 6.60333C10.1451 6.23071 9.83536 5.92107 9.46277 5.70587C9.21999 5.56574 8.90424 5.47472 8.37292 5.42657C7.83224 5.3776 7.13682 5.37774 6.14929 5.37774ZM9.80164 0.367975C10.7638 0.367975 11.5314 0.36788 12.1473 0.423639C12.7726 0.480307 13.3093 0.598759 13.7928 0.877741C14.3717 1.21192 14.8521 1.69355 15.1864 2.27227C15.4655 2.75574 15.5857 3.29164 15.6425 3.9168C15.6983 4.53301 15.6971 5.3016 15.6971 6.26446V7.82989C15.6971 8.29264 15.6989 8.58993 15.6649 8.84844C15.4668 10.3525 14.401 11.5738 12.9833 11.9988V10.5467C13.6973 10.1903 14.2105 9.49662 14.3192 8.67169C14.3387 8.52347 14.3407 8.3358 14.3407 7.82989V6.26446C14.3407 5.27706 14.3398 4.58149 14.2909 4.04083C14.2428 3.50968 14.1526 3.19372 14.0126 2.95098C13.7974 2.57849 13.4876 2.26869 13.1151 2.05352C12.8724 1.91347 12.5564 1.82237 12.0253 1.77423C11.4847 1.72528 10.7888 1.7254 9.80164 1.7254H7.71472C6.7562 1.72558 5.92665 2.27697 5.52332 3.07891H4.07019C4.54221 1.51132 5.9932 0.368186 7.71472 0.367975H9.80164Z" fill="currentColor"/></svg>'
+const CHECK_ICON_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M15.0498 3.92579L8.49512 12.3818C8.25774 12.6881 8.04517 12.9645 7.84668 13.1689C7.63957 13.3823 7.38732 13.5841 7.04492 13.6719C6.86373 13.7183 6.6757 13.7346 6.48926 13.7197C6.13666 13.6915 5.8528 13.5355 5.6123 13.3604C5.38201 13.1926 5.12573 12.9567 4.83984 12.6953L1.03125 9.21289L1.96875 8.1875L5.77734 11.6699C6.08684 11.9529 6.27773 12.1249 6.43066 12.2363C6.50183 12.2882 6.54699 12.3135 6.57324 12.3252C6.58525 12.3305 6.59269 12.3322 6.5957 12.333C6.59802 12.3336 6.59961 12.334 6.59961 12.334C6.63317 12.3367 6.66758 12.3335 6.7002 12.3252C6.7002 12.3252 6.70211 12.3251 6.7041 12.3242C6.70698 12.3229 6.71348 12.319 6.72461 12.3115C6.74849 12.2956 6.78843 12.2642 6.84961 12.2012C6.98138 12.0654 7.13957 11.8628 7.39648 11.5313L13.9502 3.07422L15.0498 3.92579Z" fill="currentColor"/></svg>'
+
+/** 写剪贴板并给出「已复制」反馈（图标切对勾 1s，对齐本体 MessageIconActions）。
+ *  复制的是用户 prompt 原文——本体按钮的文本闭包含注入前缀，不能复用。
+ *  clipboard API 失败（非安全上下文等）回退 execCommand。 */
+async function copyInjectionText(button: HTMLButtonElement, text: string): Promise<void> {
+  let ok = false
+  try {
+    await navigator.clipboard.writeText(text)
+    ok = true
+  } catch {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    try {
+      ok = document.execCommand('copy')
+    } catch {
+      ok = false
+    }
+    textarea.remove()
+  }
+  if (!ok || button.dataset.meowInjState === 'copied') return
+  button.dataset.meowInjState = 'copied'
+  button.title = '已复制'
+  button.innerHTML = CHECK_ICON_SVG
+  window.setTimeout(() => {
+    button.dataset.meowInjState = 'copy'
+    button.title = '复制'
+    button.innerHTML = COPY_ICON_SVG
+  }, 1000)
+}
+
 /** 应用一次注入折叠（首轮长期记忆/关键词命中）：原行隐藏，原位插入
- *  「已注入记忆」横条（点开显示注入全文）+ 用户 prompt 气泡。
- *  幂等：只做元素存在性/文本写入；克隆行不重建（内容由快照确定，不变）。 */
+ *  「已注入记忆」横条（点开显示注入全文）+ 用户 prompt 气泡 + 操作行
+ *  （复制按钮写 userText 原文 + hover 显隐时钟），样式与本体 UserStyleBubble
+ *  对齐（同 token 同尺寸）。幂等：只做元素存在性/文本写入；事件只挂一次。 */
 function applyInjectionFold(
   groups: readonly InjectionGroup[],
   expanded: ReadonlySet<string>,
@@ -299,17 +385,40 @@ function applyInjectionFold(
       } else {
         body.style.display = 'none'
       }
-      // 用户 prompt 气泡（纯文本；带附件的消息不折叠——computeInjectionGroups 已过滤）
+      // 用户 prompt 气泡 + 操作行（纯文本气泡；带附件的消息不折叠——computeInjectionGroups 已过滤）。
       let prompt = anchor.querySelector<HTMLElement>(`:scope > [${INJ_PROMPT_ATTR}]`)
       if (prompt === null) {
         prompt = document.createElement('div')
         prompt.setAttribute(INJ_PROMPT_ATTR, 'true')
         const bubble = document.createElement('div')
+        bubble.dataset.meowInjBubble = 'true'
         prompt.appendChild(bubble)
+        const actions = document.createElement('div')
+        actions.dataset.meowInjActions = 'true'
+        const timeLabel = document.createElement('span')
+        timeLabel.dataset.meowInjTime = 'true'
+        actions.appendChild(timeLabel)
+        const copyButton = document.createElement('button')
+        copyButton.type = 'button'
+        copyButton.dataset.meowInjCopy = 'true'
+        copyButton.title = '复制'
+        copyButton.innerHTML = COPY_ICON_SVG
+        copyButton.addEventListener('click', () => {
+          void copyInjectionText(copyButton, group.userText)
+        })
+        actions.appendChild(copyButton)
+        prompt.appendChild(actions)
         anchor.appendChild(prompt)
       }
-      const bubble = prompt.firstElementChild as HTMLElement | null
+      const bubble = prompt.querySelector<HTMLElement>(':scope > [data-meow-inj-bubble]')
       if (bubble !== null && bubble.textContent !== group.userText) bubble.textContent = group.userText
+      const timeLabel = prompt.querySelector<HTMLElement>(':scope > [data-meow-inj-actions] > [data-meow-inj-time]')
+      if (timeLabel !== null) {
+        const label = group.time === undefined ? '' : formatInjectionClock(group.time)
+        if (timeLabel.textContent !== label) timeLabel.textContent = label
+        if (label === '') timeLabel.style.display = 'none'
+        else if (timeLabel.style.display !== '') timeLabel.style.display = ''
+      }
     }
   }
 }
@@ -420,6 +529,12 @@ export function apply(ctx: any): () => void {
   // 会话列表"已 dream"小月牙：独立于 slots，直接启动（host 路由不可用时静默降级）。
   disposers.push(startDreamIconManager())
   // CSS 常驻全局（不随组件卸载移除：折叠行的隐藏由 data 属性驱动，规则在即生效）。
+  // 热重载时 dispose 不删 style，直接 append 会堆积多代规则——旧代规则（如假气泡
+  // 时代的 `[data-meow-injection-prompt] > div` 背景）会以同等/更高特异性命中新 DOM
+  // （操作行灰底就是这么来的）。注入前先移除本插件旧 style：任意时刻只有一份最新规则。
+  for (const stale of Array.from(document.querySelectorAll('style[data-meow-memory-css]'))) {
+    stale.remove()
+  }
   const style = document.createElement('style')
   style.dataset.meowMemoryCss = 'true'
   style.textContent = FOLD_CSS

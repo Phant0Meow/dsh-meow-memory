@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.14.0 (2026-08-23)
+
+### 折叠 UI 异常快照防护（GitHub issue #2）
+- 外部用户报告：`turnOf()` 无保护读 `node.location.kind`，节点缺 `location` 时抛 "Cannot read properties of undefined (reading 'kind')"，而 `computeFoldGroups()` 挂在每次快照渲染的 `useMemo` 里，异常会炸掉整个会话视图。修复：`turnOf()` 对 `location` 与 `location.turn` 均做缺失防护——缺失时与 `unresolved` 同路径降级为「不折叠、保持可见」，绝不抛错；展开卡片的 `enhanceClone()` 同步加防护（assistant 缺 `blocks` 按空数组、tool-call 缺 `root` 跳过增强）。
+- 新增回归测试：无 `location` 的 context 节点排在正常节点之前，不抛异常且不影响后续组识别。
+
+### 注入折叠假气泡对齐本体 + 复制按钮/时钟
+- 首轮/命中注入折叠的用户 prompt 假气泡此前 token 用错（`--dsw-alias-bubble-user-bg`），颜色圆角字号与本体不一致且无操作按钮。重构为对齐 dsh 本体 `UserStyleBubble`（同 token `--dsw-specific-bubble`、22px 圆角、10px 16px padding、16px/24px 字号、`min(525px,82%)` 宽），主题切换自动跟随。
+- 自绘复制按钮（SVG 同本体 IconCopyOutline16 path）：clipboard 写**用户 prompt 原文**（本体按钮的文本闭包含注入前缀，无法复用），失败回退 execCommand；成功后图标切对勾 1s。
+- hover 显隐时间标签：`formatInjectionClock` 对齐本体 formatMessageClock 规则（同天 HH:mm / 今年 M月D日 HH:mm / 跨年加年份）。
+
+### 热重载 style 堆积修复
+- CSS 常驻 style 在热重载 dispose 时不被删除，多代规则堆积后旧代规则（如假气泡时代 `[data-meow-injection-prompt] > div` 背景）以同等特异性命中新 DOM——注入操作行灰底根因。现在 client 与 dream-icon 注入前先移除本插件旧 style 标签，任意时刻只有一份最新规则。
+
+### 测试夹具脱敏
+- test.mjs / smoke.mjs 记忆内容夹具中的真实邮箱替换为 example.com 占位。
+
 ## v0.13.0 (2026-08-23)
 
 ### dream 触发规则改版（用户拍板）
