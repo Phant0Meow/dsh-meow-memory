@@ -11,7 +11,7 @@
 文本恒定，因此不会破坏 LLM provider 的 KV/上下文缓存。动态内容（soul/user 全量、设计原则、
 记忆导引）作为**第一条用户消息的前缀**注入，且首轮只注入长期记忆、不做关键词命中；
 从第二轮起每条用户消息做关键词命中（top-2）。模型按需用 `memory_search` /
-`memory_project` 深入检索。每个窗口由自己的主 agent 在夜间（"dream"）整理记忆
+`memory_project` 深入检索。每个窗口由自己的主 agent 在空闲时（"dream"）整理记忆
 （本窗口建立 + 提取过的记忆），以窗口最后一次对话时间戳冻结其知识。
 
 ## ✨ 功能特性
@@ -54,11 +54,17 @@
   （原文视图）带相对 + 绝对时间戳（如「2026-08-15 10:58 [2 天前]」）。
 - **project 归属**：全局适用的信息 project 填 `"全局"`（与留空=未标记区分）；同时适用于
   多个项目时用英文逗号分隔（如 `"dsh, femwa"`）——检索/命中按"包含当前项目名 或 全局"判定。
-- **按窗口 dream**：夜间（按 `timeZone` 计算，默认 00:00–07:00，空闲时）每个最后发言
-  晚于上次 dream 的窗口由自己的主 agent 整理——分两轮（第 1 轮原子记忆
-  project/fact/lesson/rules/soul/user，第 2 轮 topic 记忆），project 小标题分段，
-  每条记忆附关键词行（AI 核查/重写关键词用），范围=本窗口建立 + 提取过的记忆，
-  使用其完整会话上下文。无 live agent 且超过 24h 的旧窗口、以及已归档的会话，均不处理。
+- **按窗口 dream**：窗口空闲 ≥ `idleMinutes`（默认 **180 分钟 = 3 小时**）即进入允许
+  触发状态（替代原夜间窗口），每个最后发言晚于上次 dream 的窗口由自己的主 agent
+  整理——分轮处理（第 1 轮原子记忆 project/fact/lesson/rules/soul/user，第 2 轮 topic
+  记忆，第 3 轮项目总结——本窗口涉及具体项目时追加：调 memory_project 复查并精简成
+  新的项目长期记忆，被取代的旧条目归档），project 小标题分段，每条记忆附关键词行
+  （AI 核查/重写关键词用），范围=本窗口
+  建立 + 提取过的记忆，使用其完整会话上下文。**峰时抑制**（按 `timeZone` 计算，默认
+  北京时间）：`suppressWindows`（默认 09:00–12:00、14:00–18:00，API 峰谷电价峰时）
+  及各自开始前 `suppressLeadMinutes`（默认 15）分钟内不触发，峰时结束后下一个检查
+  周期自动触发；进行中的 dream 不打断。无 live agent 且超过 24h 的旧窗口、以及已归档
+  的会话，均不处理。
 - **反思**：单次任务内连续 ≥7 个工具 step 后，插件询问模型自上次整理以来是否有值得记忆的内容。
   最后工具是 `memory_*` 视为已主动记忆、不重复反思；被取消的轮次绝不触发。
 - **注入折叠 UI（client 端）**：首轮长期记忆 / 每消息关键词命中的注入文本在前端
@@ -125,21 +131,25 @@ npm install meow-memory
     reflectTurns: 7        # 触发反思所需的连续工具轮数
     dream:
       enabled: true
-      windowStart: 0       # 夜间窗口小时数，按下方 timeZone 计算
-      windowEnd: 7
-      idleMinutes: 30      # 多长时间无会话事件后允许 dream
+      idleMinutes: 180      # 窗口空闲 ≥180 分钟（3 小时）允许 dream
+      suppressWindows:      # 峰时抑制时段（按下方 timeZone 计算，"HH:MM" 起止）
+        - start: '09:00'    #   API 峰谷电价峰时
+          end: '12:00'
+        - start: '14:00'
+          end: '18:00'
+      suppressLeadMinutes: 15  # 每个峰时开始前 15 分钟也不触发
       checkMinutes: 15
-      timeZone: 'Asia/Shanghai'  # 用户机器时钟为美区时间；夜间窗口必须
+      timeZone: 'Asia/Shanghai'  # 用户机器时钟为美区时间；抑制时段必须
                                  # 按此固定时区计算
 ```
 
 ## 🧠 工作原理
 
 ```
-第一条用户消息（首轮）         第二条起的每条消息                夜间
+第一条用户消息（首轮）         第二条起的每条消息                空闲≥3h 且非峰时
 ┌────────────────────┐        ┌────────────────────┐        ┌──────────────────────┐
 │ ===== 长期记忆 ===== │        │ 可能相关的记忆，仅供  │        │ 按窗口 dream：        │
-│ 【关于你】(soul)     │        │ 参考：keywords 命中   │        │ 两轮（原子/topic）    │
+│ 【关于你】(soul)     │        │ 参考：keywords 命中   │        │ 三轮（含项目总结）      │
 │ 【关于user】         │        │ top-2（全局+当前     │        │ 七层+提取过的，       │
 │ 【设计原则】(rules)   │        │ project 锚定）      │        │ updated_at 以 T 封存  │
 │ 【记忆导引】          │        └────────────────────┘        └──────────────────────┘
@@ -156,7 +166,7 @@ npm install meow-memory
 ```sh
 npm install
 npm run build          # esbuild 打包 → lib/index.js（自包含）
-npm run test           # 214 项逻辑测试：db / bm25 / migrate / inject / reflect / dream / tools / apply
+npm run test           # 228 项逻辑测试：db / bm25 / migrate / inject / reflect / dream / tools / apply
 ```
 
 `@deepseek-ai/*` 包位于 dsh-meow pnpm workspace 中，不在本包的 `node_modules` 里。

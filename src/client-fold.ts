@@ -5,7 +5,11 @@
  * { kind: 'plugin', plugin: 'meow-memory' } 的节点 = 反思/dream 轮 prompt
  * （steer 注入的 user/message 事件，非 append 改写，渲染为 context 行）。
  * 范围：该 prompt 所在 turn 内、位于 prompt 之后的全部节点（排除 user/steering，
- * 防止误折叠反思期间用户插入的消息），用快照的 locations.getTurn(turn) 获取。
+ * 防止误折叠反思期间用户插入的消息；排除 turn-tail——dsh 每个完成 turn 唯一的
+ * 操作 footer（复制/分支/耗时行）。反思 prompt 经 agent/turn-stopping steer 注入，
+ * dsh 契约是「延续同一个 turn」，即正常轮与反思轮共用这一个 turn-tail，藏掉它
+ * 正常轮工作汇报的复制/点赞行也会消失，必须保持可见），用快照的
+ * locations.getTurn(turn) 获取。
  * 计数：范围内 kind='tool' 节点中 memory_remember / memory_update 的调用次数。
  * 状态：范围内有 running assistant → 进行中；interrupted → 已中断；否则已完成。
  */
@@ -33,7 +37,7 @@ export interface FoldGroup {
   /** 起点 context 节点的 key（快照 chat 节点 key，全局唯一）。 */
   readonly id: string
   readonly variant: FoldVariant
-  /** 折叠的节点 keys（按渲染顺序；不含 user/steering）。 */
+  /** 折叠的节点 keys（按渲染顺序；不含 user/steering/turn-tail）。 */
   readonly keys: readonly string[]
   /** memory_remember 调用次数（"新增记忆 N 条"）。 */
   readonly rememberCount: number
@@ -102,7 +106,8 @@ export function computeFoldGroups(snapshot: ConversationSnapshot): FoldGroup[] {
       .slice(startIdx === -1 ? 0 : startIdx)
       .filter((k) => {
         const n = nodes.get(k)
-        return n !== undefined && n.kind !== 'user' && n.kind !== 'steering'
+        // turn-tail = 该 turn 的操作 footer（复制/点赞/耗时行），保持可见不折叠。
+        return n !== undefined && n.kind !== 'user' && n.kind !== 'steering' && n.kind !== 'turn-tail'
       })
     let rememberCount = 0
     let updateCount = 0

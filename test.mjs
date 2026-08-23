@@ -35,6 +35,8 @@ import {
   getCurrentProject,
   setCurrentProject,
   hourInTimeZone,
+  minutesInTimeZone,
+  isDreamSuppressed,
   collectDreamStates,
 } from './lib/index.js'
 
@@ -147,7 +149,7 @@ check('check gate passes first', dbW.claimCheckGate(0) === true)
 check('check gate blocks within interval', dbW.claimCheckGate(86_400_000) === false)
 check('check gate passes after interval', dbW.claimCheckGate(0) === true)
 
-// dream 两轮结构：原子（project/fact/lesson）/ topic 分开；本窗口建立 ∪ 提取过的记忆；project 小标题
+// dream 分轮结构：原子（project/fact/lesson）/ topic / 项目总结；本窗口建立 ∪ 提取过的记忆；project 小标题
 const wsD = mkdtempSync(join(tmpdir(), 'mm-dream-'))
 const dbD = new MemoryDb(memoryDbPath(wsD))
 const wid = 'win-dream-1'
@@ -166,7 +168,8 @@ const otherTopic = dbD.insert({ level: 'topic', content: '提取过的话题', t
 dbD.insert({ level: 'fact', content: '没提取过的', project: 'meow-eyes', source_session: 'win-other2', created_at: 700 })
 markInjected(wsD, wid, [otherFact.id, otherTopic.id], '.dsh-meow') // 模拟本窗口提取记录（injected）
 const rounds = collectDreamRounds(dbD, wid, wsD, '.dsh-meow')
-check('dream rounds: 2 (atomic + topic)', rounds.length === 2 && rounds[0].kind === 'atomic' && rounds[1].kind === 'topic', `got ${JSON.stringify(rounds.map((r) => r.kind))}`)
+check('dream rounds: 3 (atomic + topic + project-summary)', rounds.length === 3 && rounds[0].kind === 'atomic' && rounds[1].kind === 'topic' && rounds[2].kind === 'project-summary', `got ${JSON.stringify(rounds.map((r) => r.kind))}`)
+check('project-summary round lists window projects sorted', JSON.stringify(rounds[2].projects) === JSON.stringify(['dsh', 'femwa']), `got ${JSON.stringify(rounds[2].projects)}`)
 check('atomic groups: dsh, femwa, unlabeled last', rounds[0].groups.map((g) => g.name).join(',') === 'dsh,femwa,', `got ${rounds[0].groups.map((g) => g.name).join(',')}`)
 const dshGroup = rounds[0].groups.find((g) => g.name === 'dsh')
 check('atomic level order project→fact→lesson→rules', dshGroup !== undefined && dshGroup.rows.map((r) => r.level).join(',') === 'project,fact,fact,lesson,rules')
@@ -177,7 +180,7 @@ check('seen rows included, unseen other-window rows excluded', rounds[0].groups.
 check('topic round: only topic, own + seen included', rounds[1].groups.every((g) => g.rows.every((r) => r.level === 'topic')) && rounds[1].groups.some((g) => g.rows.some((r) => r.title === '话题X')) && rounds[1].groups.some((g) => g.rows.some((r) => r.title === '外来话题')))
 const dreamMsg0 = buildDreamMessage(dbD, wid, 5000, rounds, 0)
 const d0 = dreamMsg0.content.map((b) => (b.type === 'text' ? b.text : '')).join('')
-check('dream round0 marker + title', d0.includes('[meow-memory-dream]') && d0.includes('第 1/2 组 - 原子记忆条目'))
+check('dream round0 marker + title', d0.includes('[meow-memory-dream]') && d0.includes('第 1/3 组 - 原子记忆条目'))
 check('dream round0 project headings', d0.includes('【project：dsh】') && d0.includes('【project：femwa】') && d0.includes('【project：无项目 - 全局信息，或缺少项目标签】'))
 check('dream round0 T label + timestamp rule', d0.includes('本窗口记忆封存时间戳：1970-01-01 00:00') && d0.includes('时间戳规则') && d0.includes('**最后更新**'))
 check('dream round0 judgement + rules', d0.includes('如何判断该更新') && d0.includes('project标签是否准确') && d0.includes('importance') && d0.includes('拆分成多条') && d0.includes('本组整理完成'))
@@ -186,8 +189,14 @@ check('dream round0 rows carry keywords line', d0.includes('关键词: 事实, �
 check('dream round0 excludes topic rows', !d0.includes('话题X') && !d0.includes('外来话题'))
 const dreamMsg1 = buildDreamMessage(dbD, wid, 5000, rounds, 1)
 const d1 = dreamMsg1.content.map((b) => (b.type === 'text' ? b.text : '')).join('')
-check('dream round1 topic title + guide', d1.includes('第 2/2 组 - topic记忆条目') && d1.includes('topic记忆更新指导') && d1.includes('拆分') && d1.includes('本组整理完成'))
+check('dream round1 topic title + guide', d1.includes('第 2/3 组 - topic记忆条目') && d1.includes('topic记忆更新指导') && d1.includes('拆分') && d1.includes('本组整理完成'))
 check('dream round1 has topic rows, no atomic', d1.includes('话题X') && d1.includes('外来话题') && !d1.includes('事实1'))
+// 第 3 轮=项目总结（用户拍板 2026-08-22）：不带条目列表，AI 自己调 memory_project 复查并精简
+const dreamMsg2 = buildDreamMessage(dbD, wid, 5000, rounds, 2)
+const d2 = dreamMsg2.content.map((b) => (b.type === 'text' ? b.text : '')).join('')
+check('dream round2 summary title + projects', d2.includes('第 3/3 组 - 项目总结') && d2.includes('本组涉及的项目：dsh、femwa'))
+check('dream round2 memory_project flow + rules', d2.includes('请再次使用 memory_project 工具') && d2.includes('长期记忆') && d2.includes('每一条里面只讲一个要点') && d2.includes('已被你的新总结取代') && d2.includes('status=archived') && d2.includes('本组整理完成'))
+check('dream round2 has no entry list', !d2.includes('【本组记忆】') && !d2.includes('事实1'))
 dbD.close()
 
 // topic 轮默认触发：窗口无任何记忆也发（空 topic 轮提示 AI 回顾建新 topic）
@@ -243,7 +252,7 @@ advanceDream({ session: { header: { id: 'win-orphan', cwd: wsOrphan } } }, '.dsh
 advanceDream({ session: { header: { id: 'win-orphan', cwd: wsOrphan } } }, '.dsh-meow') // topic 轮 → 收尾
 check('orphan dream finalized by advanceDream', dbOrphan.getDreamLease('win-orphan') === null &&
   dbOrphan.getWindow('win-orphan')?.last_dream_time !== null)
-// 多轮推进：原子轮 + topic 轮两轮——advanceDream 先推进到第 2 轮并 steer，再推进收尾
+// 多轮推进：原子轮 → topic 轮 → 项目总结轮——advanceDream 逐轮 steer，最后一轮收尾
 dbOrphan.insert({ level: 'fact', content: '第二组记忆', source_session: 'win-orphan', project: 'p2' })
 dbOrphan.insert({ level: 'topic', content: '孤儿话题内容', title: '孤儿T', source_session: 'win-orphan' })
 dbOrphan.touchWindow('win-orphan', wsOrphan, Date.now())
@@ -253,6 +262,9 @@ startWindowDream({}, agent2, wsOrphan, '.dsh-meow')
 check('lease group_idx 0 after start', dbOrphan.getDreamLease('win-orphan')?.group_idx === 0)
 advanceDream(agent2, '.dsh-meow')
 check('advanceDream advances to topic round + steers', dbOrphan.getDreamLease('win-orphan')?.group_idx === 1 && steeredMsg !== null)
+advanceDream(agent2, '.dsh-meow')
+const steeredText = steeredMsg !== null && Array.isArray(steeredMsg?.content) ? steeredMsg.content.map((b) => (b.type === 'text' ? b.text : '')).join('') : ''
+check('advanceDream advances to project-summary round (p2)', dbOrphan.getDreamLease('win-orphan')?.group_idx === 2 && steeredText.includes('本组涉及的项目：p2'))
 advanceDream(agent2, '.dsh-meow')
 check('advanceDream finalizes after last round', dbOrphan.getDreamLease('win-orphan') === null)
 dbOrphan.close()
@@ -297,10 +309,36 @@ const iconStates2 = collectDreamStates([{ id: 'any', cwd: wsNoDb }])
 check('dream-states: workspace without memory db skipped (no db created)', iconStates2.dreamed.length === 0 && iconStates2.dreaming.length === 0 && !existsSync(join(wsNoDb, '.dsh-meow', 'memory.db')))
 dbIcon.close()
 
-// ── dream 时区（用户系统是美区时间，夜间窗口必须按 Asia/Shanghai 算） ───────
+// ── dream 时区（用户系统是美区时间，抑制时段必须按 Asia/Shanghai 算） ───────
 const midnightUtc = new Date('2026-08-15T00:00:00.000Z')
 check('hourInTimeZone Shanghai at UTC midnight = 8', hourInTimeZone('Asia/Shanghai', midnightUtc) === 8)
 check('hourInTimeZone UTC at UTC midnight = 0', hourInTimeZone('UTC', midnightUtc) === 0)
+check('minutesInTimeZone Shanghai at UTC midnight = 480', minutesInTimeZone('Asia/Shanghai', midnightUtc) === 480)
+check('minutesInTimeZone Shanghai 09:23 = 563', minutesInTimeZone('Asia/Shanghai', new Date('2026-08-15T01:23:00.000Z')) === 563)
+
+// ── dream 峰时抑制（用户拍板 2026-08-19：空闲≥3h 允许触发；北京时间
+//    09:00–12:00 / 14:00–18:00（API 峰谷电价峰时）及各自前 15 分钟不触发） ──
+const suppressCfg = {
+  enabled: true,
+  idleMinutes: 180,
+  checkMinutes: 15,
+  suppressWindows: [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '18:00' }],
+  suppressLeadMinutes: 15,
+  timeZone: 'Asia/Shanghai',
+}
+const sup = (iso) => isDreamSuppressed(suppressCfg, new Date(iso))
+check('suppress: 08:44 allowed (before lead)', sup('2026-08-15T00:44:00.000Z') === false)
+check('suppress: 08:45 blocked (15min lead)', sup('2026-08-15T00:45:00.000Z') === true)
+check('suppress: 09:00 blocked (peak start)', sup('2026-08-15T01:00:00.000Z') === true)
+check('suppress: 11:59 blocked (peak end-1min)', sup('2026-08-15T03:59:00.000Z') === true)
+check('suppress: 12:00 allowed (peak over)', sup('2026-08-15T04:00:00.000Z') === false)
+check('suppress: 13:44 allowed (before lead)', sup('2026-08-15T05:44:00.000Z') === false)
+check('suppress: 13:45 blocked (15min lead)', sup('2026-08-15T05:45:00.000Z') === true)
+check('suppress: 17:59 blocked (peak end-1min)', sup('2026-08-15T09:59:00.000Z') === true)
+check('suppress: 18:00 allowed (peak over)', sup('2026-08-15T10:00:00.000Z') === false)
+check('suppress: 00:00 allowed (midnight)', sup('2026-08-15T16:00:00.000Z') === false)
+check('suppress: lead 0 disables lead-in', isDreamSuppressed({ ...suppressCfg, suppressLeadMinutes: 0 }, new Date('2026-08-15T00:45:00.000Z')) === false)
+check('suppress: invalid window skipped', isDreamSuppressed({ ...suppressCfg, suppressWindows: [{ start: 'xx', end: 'yy' }] }, new Date('2026-08-15T01:00:00.000Z')) === false)
 
 // migrate
 const ws2 = mkdtempSync(join(tmpdir(), 'mm-mig-'))

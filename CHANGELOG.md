@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.13.0 (2026-08-23)
+
+### dream 触发规则改版（用户拍板）
+- **夜间窗口废弃**：不再要求 00:00–07:00 才触发；改为**窗口空闲 ≥ 3 小时**（`idleMinutes` 默认 180）即进入允许触发状态。
+- **峰时抑制**：新增 `suppressWindows`（默认 `09:00-12:00`、`14:00-18:00`，API 峰谷电价峰时，按 `timeZone` 计算）与 `suppressLeadMinutes`（默认 15）——峰时及其开始前 15 分钟内不触发 dream，峰时结束后下一个检查周期自动触发；进行中的 dream 不打断，只挡新启动。
+- 新增 `minutesInTimeZone` / `isDreamSuppressed`（分钟级时区换算，支持跨午夜时段）。
+- 删除死配置 `minIntervalHours`；`windowStart`/`windowEnd` 移除（夜间窗口概念废弃）。
+- 手动 `memory_dream` 不受峰时抑制（用户主动触发，成本自担）。
+- 文案同步：MEMORY_GUIDE / 工具描述 / 启动日志 / README 双语。
+- 顺带修：v0.13.0 改版时旧夜间时代的「全局 lastActivity 门」没被移除，任意窗口活跃会挡死所有窗口的 dream——已删除，空闲判定完全回到窗口级 `last_event_time`。
+
+### dream 整理 prompt 增强（2026-08-22）
+- **第三轮「项目总结」**：dream 从两轮变三轮——原子记忆 → topic → 项目总结；第三轮仅当本窗口涉及具体项目时追加，要求 AI 逐个调 `memory_project` 复查并把啰嗦冗杂的项目描述总结成精简条目（其他窗口首先看到的项目长期记忆），被取代的旧条目归档（未完成 todo/独特教训保留不强折）。
+- 新增三条整理规则：被推翻/被改掉/被证明无效的设计和信息 → 归档（stale 只表示「完结」，留库误导）；importance 防虚标（工作进展 1 最多 2，很严重才 3）；原子轮首加「逐条检查过时/误导记忆，优先归档」义务。
+- ATOMIC_GUIDE 12→13 条、TOPIC_GUIDE 10→11 条。
+
+### 反思轮折叠 UI 修复：复制/点赞行不再被误藏
+- 反思 prompt 经 `agent/turn-stopping` steer 注入，dsh 契约是**延续同一个 turn**——正常轮与反思轮共用唯一的 turn-tail footer（AI 回答下方复制/点赞/耗时整行）。折叠范围过滤此前只排除 user/steering，把这行也藏掉了。现在 `computeFoldGroups` 排除 `turn-tail` 节点，操作行保持可见（显示在折叠横条下方）。
+
 ## v0.12.0 (2026-08-19)
 
 ### memory_search 结果构成改版（用户拍板）

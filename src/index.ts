@@ -12,8 +12,10 @@
  * - 反思：干过活的 turn 结束后引导模型记忆——【一】新记忆（project 列表/纠正/偏好）、
  *   【二】更新判断（含关键词不准反推）、【三】通用要求（subcategory/关键词 8-13/importance）；
  *   topic 归 dream 轮处理（用户拍板 2026-08-19）。
- * - dream：按窗口夜间整理——每个窗口由自己的主 agent 整理自己建立/提取过的记忆，
- *   分两轮（原子记忆 project/fact/lesson → topic 记忆），project 小标题分段；
+ * - dream：按窗口空闲整理（用户拍板 2026-08-19：空闲 ≥3h 即允许，替代原夜间窗口；
+ *   北京时间峰时 09:00–12:00 / 14:00–18:00 及前 15 分钟抑制不触发）——每个窗口由
+ *   自己的主 agent 整理自己建立/提取过的记忆，分轮处理（原子记忆 project/fact/lesson
+ *   → topic 记忆 → 项目总结，2026-08-22 加第三轮），project 小标题分段；
  *   updated_at 封存（"记忆时间戳"=最后更新时间）；串行；旧窗口不碰。
  * - 迁移：首次打开库时把旧 PROJECT.md 导入 SQLite，文件改名 .imported 留底。
  */
@@ -134,7 +136,7 @@ export const MEMORY_GUIDE = `【记忆系统】meow-memory 提供跨会话记忆
 【整理记忆】
 
 8. 整理本窗口记忆：memory_dream
-- 一般夜间自动触发，也可以手动调用。
+- 窗口空闲 3 小时以上自动触发（北京时间峰时 9-12 点/14-18 点及各自前 15 分钟不触发），也可以手动调用。
 
 
 三、记忆写作准则（新建和更新记忆时都必须遵守）：
@@ -213,16 +215,20 @@ export const Config = z.object({
   reflectTurns: z.number().min(1).max(50).default(7),
   /** 首次打开库时自动迁移旧 PROJECT.md。 */
   autoMigrate: z.boolean().default(true),
-  /** 夜间整理。 */
+  /** 空闲整理（dream）。 */
   dream: z
     .object({
       enabled: z.boolean().default(true),
-      windowStart: z.number().min(0).max(23).default(0),
-      windowEnd: z.number().min(0).max(24).default(7),
-      idleMinutes: z.number().min(1).default(30),
-      minIntervalHours: z.number().min(1).default(24),
+      /** 窗口空闲多少分钟后允许 dream（用户拍板 2026-08-19：3 小时）。 */
+      idleMinutes: z.number().min(1).default(180),
+      /** 抑制时段（目标时区，"HH:MM" 起止）：这些时段内不触发 dream。 */
+      suppressWindows: z
+        .array(z.object({ start: z.string(), end: z.string() }))
+        .default([{ start: '09:00', end: '12:00' }, { start: '14:00', end: '18:00' }]),
+      /** 每个抑制时段开始前追加的不触发分钟数（峰时前 15 分钟也不触发）。 */
+      suppressLeadMinutes: z.number().min(0).max(120).default(15),
       checkMinutes: z.number().min(1).default(15),
-      // 用户系统是美区时间（隐私设置），夜间窗口按中国时区计算
+      // 用户系统是美区时间（隐私设置），抑制时段按中国时区计算
       timeZone: z.string().default('Asia/Shanghai'),
     })
     .default({}),
@@ -252,10 +258,9 @@ function resolveConfig(config: unknown): ResolvedConfig {
     autoMigrate: c.autoMigrate ?? true,
     dream: {
       enabled: d.enabled ?? true,
-      windowStart: d.windowStart ?? 0,
-      windowEnd: d.windowEnd ?? 7,
-      idleMinutes: d.idleMinutes ?? 30,
-      minIntervalHours: d.minIntervalHours ?? 24,
+      idleMinutes: d.idleMinutes ?? 180,
+      suppressWindows: d.suppressWindows ?? [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '18:00' }],
+      suppressLeadMinutes: d.suppressLeadMinutes ?? 15,
       checkMinutes: d.checkMinutes ?? 15,
       timeZone: d.timeZone ?? 'Asia/Shanghai',
     },
@@ -542,10 +547,10 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     ctx.logger.info(`meow-memory: reflect steered after ${resolved.reflectTurns}+ tool turns`)
   })
 
-  // 3) 夜间整理（按窗口；windowIndex 记录 sessionId → workspace）。
+  // 3) 空闲整理（按窗口；windowIndex 记录 sessionId → workspace）。
   const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex, signalDreamState)
   ctx.logger.info(
-    `meow-memory: dream scheduled (window ${resolved.dream.windowStart}:00-${resolved.dream.windowEnd}:00, idle ${resolved.dream.idleMinutes}m, every ${resolved.dream.checkMinutes}m)`,
+    `meow-memory: dream scheduled (idle ${resolved.dream.idleMinutes}m, suppress ${resolved.dream.suppressWindows.map((w) => `${w.start}-${w.end}`).join(' ')} lead ${resolved.dream.suppressLeadMinutes}m, every ${resolved.dream.checkMinutes}m, tz ${resolved.dream.timeZone})`,
   )
 
   // 4) 会话列表"已 dream"图标数据面（仿 meow-eyes describe 路由，webServer 可选服务）：
@@ -701,4 +706,4 @@ export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, readSeen, markSearched, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, startWindowDream, advanceDream, abortDream, recoverInterruptedDream } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, advanceDream, abortDream, recoverInterruptedDream } from './dream.js'

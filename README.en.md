@@ -13,7 +13,7 @@ principles, memory guide) is injected as a **prefix of the first user message**,
 first turn injects long-term memory only — no keyword hits. From the second user message
 on, every message gets a keyword hit (top-2). The model deep-dives into the rest on demand
 with `memory_search` / `memory_project`. Each window's own agent consolidates its memories
-at night ("dream") — memories it created plus ones it was shown — with the window's knowledge
+when idle ("dream") — memories it created plus ones it was shown — with the window's knowledge
 frozen at the last conversation timestamp.
 
 ## ✨ Features
@@ -65,12 +65,18 @@ frozen at the last conversation timestamp.
 - **Project attribution**: global info gets `project: "全局"` (distinct from blank = unmarked);
   multi-project info uses comma-separated names (e.g. `"dsh, femwa"`) — search/hits match
   "contains current project name OR global".
-- **Per-window dream**: at night (00:00–07:00 in the configured `timeZone`, default
-  Asia/Shanghai, idle) every window whose last chat is newer than its last dream gets
-  consolidated by its own main agent — two rounds (atomic: project/fact/lesson/rules/soul/user,
-  then topic), project sub-headings, memories it created plus ones it was shown — using its
-  full conversation context. Old windows (no live agent, >24h) and archived sessions are left
-  alone.
+- **Per-window dream**: a window becomes dream-eligible once idle ≥ `idleMinutes` (default
+  **180 min = 3 hours**, replacing the old night window); every window whose last chat is
+  newer than its last dream gets consolidated by its own main agent — round-based (atomic:
+  project/fact/lesson/rules/soul/user, then topic, then a project-summary round whenever the
+  window touched concrete projects — it re-checks each project via memory_project, distills
+  concise long-term entries and archives the superseded ones), project sub-headings, memories
+  it created plus ones it was shown — using its full conversation context. **Peak-hour suppression**
+  (in the configured `timeZone`, default Asia/Shanghai): no dream starts inside
+  `suppressWindows` (default 09:00–12:00 & 14:00–18:00, API peak-tariff hours) nor within
+  `suppressLeadMinutes` (default 15) before each window — it fires on the next check cycle
+  after the peak ends; a dream already in progress is never interrupted. Old windows (no live
+  agent, >24h) and archived sessions are left alone.
 - **Reflection**: after ≥7 consecutive tool steps within one task the plugin asks the
   model whether anything since the last consolidation is worth remembering. A turn whose
   last tool is a `memory_*` tool counts as already having consolidated (no re-reflection);
@@ -145,22 +151,26 @@ All fields are optional (profile patch or `cordis.patch.yml`):
     reflectTurns: 7        # consecutive tool turns before reflection triggers
     dream:
       enabled: true
-      windowStart: 0       # night window hours, computed in timeZone (below)
-      windowEnd: 7
-      idleMinutes: 30      # no session events for this long before dreaming
+      idleMinutes: 180      # window is dream-eligible after ≥180 min (3 h) idle
+      suppressWindows:      # peak-hour suppression (computed in timeZone below, "HH:MM")
+        - start: '09:00'    #   API peak-tariff hours
+          end: '12:00'
+        - start: '14:00'
+          end: '18:00'
+      suppressLeadMinutes: 15  # also suppressed for 15 min before each window
       checkMinutes: 15
-      timeZone: 'Asia/Shanghai'  # the user's machine clock is US time; the night
-                                 # window must follow this fixed zone instead
+      timeZone: 'Asia/Shanghai'  # the user's machine clock is US time; suppression
+                                 # windows must follow this fixed zone instead
 ```
 
 ## 🧠 How it works
 
 ```
-First user message (turn 1)      Every message from turn 2            night
+First user message (turn 1)      Every message from turn 2            idle ≥3h, not peak
 ┌────────────────────┐          ┌────────────────────┐        ┌──────────────────────┐
 │ ===== 长期记忆 ===== │          │ 可能相关的记忆，仅供  │        │ per-window dream:     │
-│ 【关于你】(soul)     │          │ 参考：keyword hits    │        │ two rounds (atomic/   │
-│ 【关于user】         │          │ top-2 (global +     │        │ topic), 7 layers +    │
+│ 【关于你】(soul)     │          │ 参考：keyword hits    │        │ three rounds (atomic/ │
+│ 【关于user】         │          │ top-2 (global +     │        │ topic, summary), 7+   │
 │ 【设计原则】(rules)   │          │ current-project     │        │ extracted, updated_at │
 │ 【记忆导引】          │          │ anchor)            │        │ stamped at T          │
 │ ─────────────      │          └────────────────────┘        └──────────────────────┘
@@ -176,7 +186,7 @@ First user message (turn 1)      Every message from turn 2            night
 ```sh
 npm install
 npm run build          # esbuild bundle → lib/index.js (self-contained)
-npm run test           # 214 logic tests: db / bm25 / migrate / inject / reflect / dream / tools / apply
+npm run test           # 228 logic tests: db / bm25 / migrate / inject / reflect / dream / tools / apply
 ```
 
 The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's

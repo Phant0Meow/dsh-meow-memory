@@ -1,18 +1,25 @@
 /**
- * meow-memory v2 — 按窗口夜间整理（dream）。
+ * meow-memory v2 — 按窗口空闲整理（dream）。
  *
  * 用户拍板（2026-08-15 原始设计 + 2026-08-19 改版）：
  * - 每个 session 窗口由它自己的主 agent 整理：只发本窗口（source_session）建立的
  *   七层记忆（soul/user/project/fact/lesson/topic/rules），对着自己的完整对话上下文整理。
  * - 2026-08-19 改版（用户拍板）：① 不再按 project 逐轮——所有 project 混在同一轮，
  *   用【project：xxx】小标题分段，最后一段【project：无项目 - 全局信息，或缺少项目标签】；
- *   ② 固定两轮：第 1 轮=原子记忆（project/fact/lesson/rules/soul/user，不含 topic），
- *   第 2 轮=topic 记忆，空轮跳过（轮数动态，消息显示"第 N/M 组"）；③ 记忆范围=本窗口
+ *   ② 分轮：第 1 轮=原子记忆（project/fact/lesson/rules/soul/user，不含 topic），
+ *   第 2 轮=topic 记忆（空也发，回顾对话建新 topic）；2026-08-22 加第 3 轮=项目总结
+ *   （本窗口涉及具体项目时追加：调 memory_project 复查并精简成新的项目长期记忆，
+ *   被取代的旧条目归档）；轮数动态，消息显示"第 N/M 组"；③ 记忆范围=本窗口
  *   建立的 ∪ 本窗口提取过的（sessions/<id>.json 的 injected+searched）；④ 条目展示
  *   绝对时间戳（最后更新时间）；组内排序 project → level → 创建时间不变。
  * - T = dream 开始前窗口最后一轮正常对话时间（先记死）；收尾时该窗口所有条目
  *   updated_at = T（"记忆时间戳"=最后更新时间），windows 表 last_dream_time = T。
  * - 判定：窗口最后事件时间 > 24h 前 且 > 上次 dream 时间 → 需要 dream。
+ * - 触发（用户拍板 2026-08-19）：窗口空闲 ≥ idleMinutes（默认 3 小时）即允许触发，
+ *   替代原夜间窗口（00:00–07:00）；但当前时间处于峰时抑制时段（北京时间
+ *   09:00–12:00、14:00–18:00，API 峰谷电价峰时，及各自开始前 15 分钟）时不触发，
+ *   等峰时结束后的下一个检查周期自然触发。进行中的 dream 不打断，只挡新启动；
+ *   手动 memory_dream 不受峰时抑制。
  * - 串行：同一时刻只有一个进行中的 dream 任务；旧窗口（无 live agent）不碰。
  *
  * 冲突处理：memory_search 返回 top-k 后按 updated_at 重排 + 顶部提示；
@@ -56,10 +63,12 @@ export interface DreamGroup {
   rows: MemoryRow[]
 }
 
-/** 一轮 = 一种记忆类型（原子 / topic），内部按 project 小标题分段。 */
+/** 一轮 = 一种记忆类型（原子 / topic / 项目总结）。 */
 export interface DreamRound {
-  kind: 'atomic' | 'topic'
+  kind: 'atomic' | 'topic' | 'project-summary'
   groups: DreamGroup[]
+  /** 仅 project-summary 轮：本窗口涉及的项目名清单（AI 逐个调 memory_project 复查）。 */
+  projects?: string[]
 }
 
 /** 绝对时间戳（UTC 分钟级，与封存时间戳一致）。 */
@@ -90,9 +99,10 @@ function groupByProject(rows: MemoryRow[]): DreamGroup[] {
 
 /** dream 记忆范围（用户拍板 2026-08-19）：本窗口建立的 ∪ 本窗口提取过的
  *  （sessions/<id>.json 的 injected+searched，readSeen）。
- *  分两轮：第 1 轮=原子记忆（project/fact/lesson/rules/soul/user，不含 topic），空则跳过；
+ *  分轮：第 1 轮=原子记忆（project/fact/lesson/rules/soul/user，不含 topic），空则跳过；
  *  第 2 轮=topic 记忆**默认触发**（用户拍板 2026-08-19：空也发——AI 回顾对话历史，
- *  可能有新 topic 要创建）。 */
+ *  可能有新 topic 要创建）；第 3 轮=项目总结（用户拍板 2026-08-22，本窗口涉及具体项目
+ *  时追加——调 memory_project 复查并精简成新的项目长期记忆，被取代的旧条目归档）。 */
 export function collectDreamRounds(
   db: ReturnType<typeof getDb>,
   sessionId: string,
@@ -113,6 +123,11 @@ export function collectDreamRounds(
   const rounds: DreamRound[] = []
   if (atomic.length > 0) rounds.push({ kind: 'atomic', groups: groupByProject(atomic) })
   rounds.push({ kind: 'topic', groups: groupByProject(topic) }) // topic 轮默认触发（空轮也让 AI 回顾建新 topic）
+  // 第 3 轮=项目总结：项目集合=候选条目 project 并集（projectList 自动排除 全局/未标记；
+  // db.list 不筛状态，前序轮归档不会让轮数中途变化）。没碰过任何项目就不发这一轮。
+  const projects = new Set<string>()
+  for (const r of [...atomic, ...topic]) for (const p of projectList(r.project)) projects.add(p)
+  if (projects.size > 0) rounds.push({ kind: 'project-summary', groups: [], projects: [...projects].sort() })
   return rounds
 }
 
@@ -136,22 +151,24 @@ const ATOMIC_GUIDE = [
   '',
   '## 如何判断该更新——回看之前建立和读到的记忆，你现在觉得：',
   '1. 有没有当时记录错误或片面、过时、信息需要更新、用户改变决定、已有新进展的条目？ → 请及时更新内容，记忆库的信息应该吻合project进展的最新状态。',
-  '2. 有没有已完成的 todo 条目？ → 设 status = stale（视为done）；',
-  '3. 有没有错误的、过于琐碎、你现在看它根本不重要的条目？ → 设 status=archived；',
-  '4. 有没有曾经的bug已被修复，曾经的lesson已不再适用？ → 修改内容，或者设 status=archived；',
-  '5. 有没有发现互相矛盾的条目？ → 按你所知道的事实修改。保留最新事实，旧版本设 status=archived；',
-  '6. 现在回头去看，那些记忆的 importance 标记是否正确（按记忆系统 importance 准则核查）；',
-  '7. 有没有哪条记忆太长，信息太多？→ 拆分成多条，可用update修改，或remember新建新条目。',
-  '8. 记忆的关键词是否准确？→ 如果准确就不使用keywords参数，如果你觉得关键词不准，请使用memory_update的keywords参数更新它——当用户prompt命中某条记忆的关键词，它就会被提取。所以你需要反向思考，"你希望在用户prompt提及哪些词的时候，这条记忆被检索到？"以此作为关键词的写入标准。不要用项目名当关键词，用更加针对这条记忆本身的信息作为关键词。优先提取核心实体、语义中心、专有名词。8-13个。',
-  '9. project标签是否准确？是否有些信息应该是全局信息但被错误的标记了project？那应该删去project标记。是否有些信息明明属于某个project，却没写project信息？那应该加上。',
-  '10. 学而不思则罔，更多抽象泛化：',
+  '2. 有没有被推翻的、被改掉的、被证明无效的设计和信息？ → 应设 status=archived 归档，绝不要让它们保持active或stale。stale只表示「完结」（todo做完、话题达成目标），不是「作废」；已被替代的旧方案旧结论继续留在库里，只会误导之后的会话。',
+  '3. 有没有已完成的 todo 条目？ → 设 status = stale（视为done）；',
+  '4. 有没有错误的、过于琐碎、你现在看它根本不重要的条目？ → 设 status=archived；',
+  '5. 有没有曾经的bug已被修复，曾经的lesson已不再适用？ → 修改内容，或者设 status=archived；',
+  '6. 有没有发现互相矛盾的条目？ → 按你所知道的事实修改。保留最新事实，旧版本设 status=archived；',
+  '7. 现在回头去看，那些记忆的 importance 标记是否正确（按记忆系统 importance 准则核查）？注意：不要轻易将信息标记为高重要性——工作进展类的重要性一般是1，最多只到2，很严重的事情才能用3；发现虚标的应调低；',
+  '8. 有没有哪条记忆太长，信息太多？→ 拆分成多条，可用update修改，或remember新建新条目。',
+  '9. 记忆的关键词是否准确？→ 如果准确就不使用keywords参数，如果你觉得关键词不准，请使用memory_update的keywords参数更新它——当用户prompt命中某条记忆的关键词，它就会被提取。所以你需要反向思考，"你希望在用户prompt提及哪些词的时候，这条记忆被检索到？"以此作为关键词的写入标准。不要用项目名当关键词，用更加针对这条记忆本身的信息作为关键词。优先提取核心实体、语义中心、专有名词。8-13个。',
+  '10. project标签是否准确？是否有些信息应该是全局信息但被错误的标记了project？那应该删去project标记。是否有些信息明明属于某个project，却没写project信息？那应该加上。',
+  '11. 学而不思则罔，更多抽象泛化：',
   '- 这是总结抽象框架的极好时机，你看看有没有可以总结沉淀的通用规则？可添加新记忆。',
   '- 你现在对某些记忆条目可能有更好更深刻地理解，你可以更新他们。',
-  '11. 看一下首轮注入的内容，你现在觉得那些内容都重要吗？有必要每个session首轮注入吗？如果有不重要的，你可以降低他们的importance或者将他们移动到其他level（比如fact）。',
+  '12. 看一下首轮注入的内容，你现在觉得那些内容都重要吗？有必要每个session首轮注入吗？如果有不重要的，你可以降低他们的importance或者将他们移动到其他level（比如fact）。',
   '首轮只注入：soul（AI 自身）/ user（用户偏好）/ 全局 rules（importance≥2）。想加入首轮：全局规则类 → 移入 rules 且 importance≥2（project 填"全局"）；用户相关 → 移入 user；AI 自身 → 移入 soul。',
-  '12. memory_project 展示的是 project 层条目（todo 已完成只列最近 5 条）+ 项目特定 rules；上面的检查同样适用（todo 完成标 stale、过时标 archived、project 标签准确）。',
+  '13. memory_project 展示的是 project 层条目（todo 已完成只列最近 5 条）+ 项目特定 rules；上面的检查同样适用（todo 完成标 stale、过时标 archived、project 标签准确）。',
   '',
   '说明：',
+  '重要：务必逐条检查，把过时记忆、误导你的记忆归档，或者修改——两者优先选择归档。',
   '对于你认为非常重要的记忆，如果不确定事实到底如何，你可以直接翻项目文件来核实。仅对非常重要的记忆使用。',
   '完成后直接回复"本组整理完成"，不要调用其他工具。',
 ]
@@ -177,10 +194,22 @@ const TOPIC_GUIDE = [
   '7. 写/改topic时，同时总结该topic记忆的关键词（提取 8-13 个内容词供检索；"你希望在用户提及什么关键词时，AI能看到这条记忆"）。',
   '8. 要记录project信息（project名，或全局）、importance。',
   '9. 对于你认为非常重要的topic，如果不确定事实到底如何，你可以直接翻项目文件来核实。仅对非常重要的记忆使用。',
-  '10. 完成后直接回复"本组整理完成"，不要调用其他工具。',
+  '10. 重要：务必检查这些topic有没有过时的、被推翻的、被证明无效的、会误导你的内容——有则归档（status=archived）或重写（优先归档），绝不要让它们保持active；importance也别轻易标高：普通话题进展一般1、最多2，很严重的事才3。',
+  '11. 完成后直接回复"本组整理完成"，不要调用其他工具。',
 ]
 
-/** 构造一轮 dream 指令消息（两轮共用头部：封存时间戳 + 时间戳规则）。 */
+/** 第 3 轮（项目总结）指导（用户拍板 2026-08-22，prompt 以用户原话为主体）。 */
+const PROJECT_SUMMARY_GUIDE = [
+  '# 项目总结指导——',
+  '1. memory_project 返回的内容可能太啰嗦了。如果确实啰嗦冗杂，你必须把它们总结成新的精简的记忆条目（用 memory_remember 新建，level=project）；如果本来就很精炼，就不要强行动它。',
+  '2. 具体总结多少条由你决定，只总结你认为真正重要的东西。',
+  '3. 要明白：你总结的记忆会成为这个项目的长期记忆，以后其他窗口做这个项目时，他们会首先看到这一段。所以你的总结应对他们有指导意义——能帮助他们快速明白用户的要求，以及这个项目本身是要干什么、概况是什么、重要的架构和设计理念是什么。',
+  '4. 你依然应该总结成一条一条的记忆，每一条里面只讲一个要点；为每条选合适的 subcategory（overview=概况 / structure=架构 / decisions=设计决策 / ops=部署数据 / todo=待办），关键词 8-13 个，importance 不要虚标。',
+  '5. 总结完成后，你需要将 memory_project 返回的、已被你的新总结取代的旧记忆归档（memory_update 设 status=archived），不要让新旧两套描述并存。没有被你的总结覆盖、仍有独立价值的条目（例如还没做完的 todo、独特的教训）保留不动，不要为了归档而归档。',
+  '6. 完成后直接回复"本组整理完成"，不要调用其他工具。',
+]
+
+/** 构造一轮 dream 指令消息（各轮共用头部：封存时间戳 + 时间戳规则）。 */
 export function buildDreamMessage(
   db: ReturnType<typeof getDb>,
   sessionId: string,
@@ -200,20 +229,30 @@ export function buildDreamMessage(
     '因为你现在看到的是很长时间的完整上下文，所以"几小时前"这种相对时间戳其实一直在变，不值得参考。此时你需要看的是绝对时间戳来判断记忆信息的新旧。',
     '',
     '',
-    `第 ${idx + 1}/${rounds.length} 组 - ${round.kind === 'topic' ? 'topic记忆条目' : '原子记忆条目'}`,
+    `第 ${idx + 1}/${rounds.length} 组 - ${round.kind === 'topic' ? 'topic记忆条目' : round.kind === 'project-summary' ? '项目总结' : '原子记忆条目'}`,
     '',
   ]
-  if (round.kind === 'topic') lines.push(...TOPIC_INTRO, '')
-  lines.push('【本组记忆】：')
-  if (round.groups.length === 0) {
-    // topic 轮默认触发：空列表时提示 AI 回顾对话建新 topic（对应指导 2）。
-    lines.push('（本组暂无已建立的 topic 记忆——回顾对话历史，如有新 topic 请按下方指导 2 创建）')
+  if (round.kind === 'project-summary') {
+    // 项目总结轮：不带条目列表——AI 自己逐个调 memory_project 看当前项目描述（用户拍板 2026-08-22）。
+    lines.push(
+      '对于你一直在进行的项目，请再次使用 memory_project 工具，再看一眼记忆对项目的描述，然后请你精简它们。',
+      `本组涉及的项目：${(round.projects ?? []).join('、')}`,
+      '',
+      ...PROJECT_SUMMARY_GUIDE,
+    )
+  } else {
+    if (round.kind === 'topic') lines.push(...TOPIC_INTRO, '')
+    lines.push('【本组记忆】：')
+    if (round.groups.length === 0) {
+      // topic 轮默认触发：空列表时提示 AI 回顾对话建新 topic（对应指导 2）。
+      lines.push('（本组暂无已建立的 topic 记忆——回顾对话历史，如有新 topic 请按下方指导 2 创建）')
+    }
+    for (const g of round.groups) {
+      lines.push('', `【project：${g.name === '' ? '无项目 - 全局信息，或缺少项目标签' : g.name}】`)
+      for (const r of g.rows) lines.push(formatRow(r))
+    }
+    lines.push('', ...(round.kind === 'topic' ? TOPIC_GUIDE : ATOMIC_GUIDE))
   }
-  for (const g of round.groups) {
-    lines.push('', `【project：${g.name === '' ? '无项目 - 全局信息，或缺少项目标签' : g.name}】`)
-    for (const r of g.rows) lines.push(formatRow(r))
-  }
-  lines.push('', ...(round.kind === 'topic' ? TOPIC_GUIDE : ATOMIC_GUIDE))
   return createUserMessage({ content: [{ type: 'text', text: lines.join('\n') }], source: PLUGIN_SOURCE })
 }
 
@@ -353,7 +392,7 @@ export function abortDream(agent: unknown, dir = '.dsh-meow', onDreamState?: Dre
 export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback): ToolDefinition {
   return {
     name: 'memory_dream',
-    description: '立即为本窗口安排一次记忆整理（dream）：把本窗口建立过/提取过的记忆分两轮发给主 agent 整理封存（第 1 轮=原子记忆 project/fact/lesson/rules/soul/user，第 2 轮=topic 记忆）。通常夜间自动运行，此工具用于手动触发。',
+    description: '立即为本窗口安排一次记忆整理（dream）：把本窗口建立过/提取过的记忆逐轮发给主 agent 整理封存（第 1 轮=原子记忆 project/fact/lesson/rules/soul/user，第 2 轮=topic 记忆，第 3 轮=项目总结——仅当本窗口涉及具体项目时追加）。窗口空闲 3 小时以上自动触发（北京时间峰时 9-12 点/14-18 点及各自前 15 分钟不触发），此工具用于手动触发。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -416,12 +455,15 @@ export function recoverInterruptedDream(db: ReturnType<typeof getDb>, sessionId:
 
 export interface DreamConfig {
   enabled: boolean
-  windowStart: number // 目标时区小时
-  windowEnd: number
+  /** 窗口空闲多少分钟后允许 dream（用户拍板 2026-08-19：3 小时 = 180 分钟）。 */
   idleMinutes: number
-  minIntervalHours: number
   checkMinutes: number
-  /** 夜间窗口按此时区计算（默认 Asia/Shanghai——用户系统是美区时间，系统时区会算错）。 */
+  /** 抑制时段（目标时区，"HH:MM-HH:MM"）：这些时段内不触发 dream。
+   *  默认=API 峰谷电价峰时（09:00–12:00、14:00–18:00）。 */
+  suppressWindows: Array<{ start: string; end: string }>
+  /** 每个抑制时段开始前追加的不触发分钟数（峰时前 15 分钟也不触发）。 */
+  suppressLeadMinutes: number
+  /** 抑制时段按此时区计算（默认 Asia/Shanghai——用户系统是美区时间，系统时区会算错）。 */
   timeZone: string
 }
 
@@ -437,6 +479,53 @@ export function hourInTimeZone(timeZone: string, date = new Date()): number {
   return date.getHours()
 }
 
+/** 取指定时区的当前分钟（0-1439，日内的分钟数；无效时区回退系统时区）。
+ *  峰时抑制按分钟粒度判断（含 lead 前推，小时粒度不够）。 */
+export function minutesInTimeZone(timeZone: string, date = new Date()): number {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', minute: 'numeric', hour12: false }).formatToParts(date)
+    const h = parseInt(parts.find((p) => p.type === 'hour')?.value ?? 'NaN', 10)
+    const m = parseInt(parts.find((p) => p.type === 'minute')?.value ?? 'NaN', 10)
+    if (!Number.isNaN(h) && !Number.isNaN(m)) return (h % 24) * 60 + m
+  } catch {
+    /* 无效时区 */
+  }
+  const d = new Date(date)
+  return d.getHours() * 60 + d.getMinutes()
+}
+
+/** 解析 "HH:MM" → 日内分钟数；非法返回 null。 */
+function parseMinute(hhmm: string): number | null {
+  const mm = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm).trim())
+  if (!mm) return null
+  const h = parseInt(mm[1], 10)
+  const m = parseInt(mm[2], 10)
+  if (h < 0 || h > 23 || m < 0 || m > 59) return null
+  return h * 60 + m
+}
+
+/** 当前时刻是否处于 dream 抑制时段（用户拍板 2026-08-19）：
+ *  suppressWindows 内（默认北京时间 09:00–12:00、14:00–18:00，API 峰谷电价峰时），
+ *  以及每个峰时开始前 suppressLeadMinutes 分钟（默认 15）——此时不触发 dream，
+ *  等峰时结束后的下一个检查周期自然触发。支持跨午夜时段（start > end）。 */
+export function isDreamSuppressed(cfg: DreamConfig, date = new Date()): boolean {
+  const m = minutesInTimeZone(cfg.timeZone, date)
+  const lead = Math.max(0, Math.floor(cfg.suppressLeadMinutes))
+  for (const w of cfg.suppressWindows) {
+    const start = parseMinute(w.start)
+    const end = parseMinute(w.end)
+    if (start === null || end === null || start === end) continue // 非法/空时段跳过
+    const from = (start - lead + 1440) % 1440
+    if (from === end) return true // lead 覆盖整天
+    if (from < end) {
+      if (m >= from && m < end) return true
+    } else if (m >= from || m < end) {
+      return true // 前推或时段跨午夜
+    }
+  }
+  return false
+}
+
 /** 后台定时检查（全局 setInterval + dispose 清理；cordis 无内置定时器）。
  *  判定纯时间化（用户拍板）：窗口最后发言在 24h 内 且 最后动作不是 dream
  *  （last_dream_time < last_event_time）；不依赖 live agent 存在性。
@@ -445,9 +534,10 @@ export function hourInTimeZone(timeZone: string, date = new Date()): number {
 export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow', windowIndex: Map<string, string>, onDreamState?: DreamStateCallback): () => void {
   const timer = setInterval(() => {
     if (!cfg.enabled) return
-    const hour = hourInTimeZone(cfg.timeZone)
-    if (hour < cfg.windowStart || hour >= cfg.windowEnd) return
-    if (Date.now() - lastActivity() < cfg.idleMinutes * 60_000) return
+    // 峰时抑制（用户拍板 2026-08-19）：北京时间 09:00–12:00 / 14:00–18:00
+    // （API 峰谷电价峰时）及各自开始前 15 分钟不触发；峰时结束后本周期直接
+    // return，等下一个检查周期自然触发。进行中的 dream 不打断。
+    if (isDreamSuppressed(cfg)) return
     // 全局检查门（防多实例/多定时器叠加）：60 秒内只有一个实例真正执行检查。
     // 根因：热重载/多 fiber 并存时 dispose 未必清理旧 setInterval → 检查频率
     // 远高于 checkMinutes → 同一窗口被反复 start。用共享库的原子抢占做节流，
@@ -484,8 +574,9 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow',
         continue
       }
       // 窗口级 idle（用户拍板：session 最近 idleMinutes 无动作才 dream）：
-      // 用 db 持久化的 last_event_time 判定——不受模块实例/热重载影响
-      // （内存全局 lastActivity 只作快速路径，见上方 gate）。
+      // 用 db 持久化的 last_event_time 判定——不受模块实例/热重载影响。
+      // （空闲判定完全按窗口自身 last_event_time，与全局/其他窗口活动无关，
+      //   避免活跃窗口拖累已空闲窗口导致 dream 永不触发。）
       if (Date.now() - w.last_event_time < cfg.idleMinutes * 60_000) continue
       const agentsSvc = typeof ctx.get === 'function'
         ? (ctx.get('agents') as { get?: (id: unknown) => unknown } | undefined)
