@@ -30,6 +30,7 @@ import {
   abortDream,
   advanceDream,
   DREAM_MARKER,
+  dreamCommandDefinition,
   dreamTool,
   noteActivity,
   registerLiveAgent,
@@ -609,6 +610,34 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   }
   tryRegisterDreamRoutes(0)
 
+  // 5) 用户命令 /dream（dsh 命令平面，可选服务）：输入框敲 /dream 手动唤起本窗口
+  //    dream，斜杠菜单经 commands.list 自动列出（零客户端改动）。commands 服务可能
+  //    晚于本插件就绪（fiber 并发启动竞态，同 webServer 路由）→ 立即尝试 + 每 1s
+  //    重试（最多 20 次）；注册挂 ctx.effect：热重载/dispose 自动注销（裸注册在
+  //    热重载时残留 → 下次 apply duplicate 报错）。
+  const commandDisposers: Array<() => void> = []
+  let commandTimer = 0
+  const tryRegisterDreamCommand = (attempt: number): void => {
+    const commands = (ctx as { get?: (name: string) => unknown }).get?.('commands') as
+      | { register?: (definition: unknown) => unknown }
+      | undefined
+    if (commands !== undefined && typeof commands.register === 'function') {
+      try {
+        commandDisposers.push(ctx.effect(() => commands.register(dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState))))
+        ctx.logger.info('meow-memory: /dream user command registered')
+      } catch (e) {
+        ctx.logger.warn(`meow-memory: /dream 命令注册失败: ${e instanceof Error ? e.message : String(e)}`)
+      }
+      return
+    }
+    if (attempt < 20) {
+      commandTimer = setTimeout(() => tryRegisterDreamCommand(attempt + 1), 1000) as unknown as number
+    } else {
+      ctx.logger.warn('meow-memory: commands 服务 20s 内未就绪，/dream 用户命令未注册（memory_dream 工具不受影响）')
+    }
+  }
+  tryRegisterDreamCommand(0)
+
   ctx.on('dispose', () => {
     for (const dispose of toolDisposers) {
       try {
@@ -624,7 +653,15 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         /* 注销失败不阻塞 */
       }
     }
+    for (const dispose of commandDisposers) {
+      try {
+        dispose()
+      } catch {
+        /* 注销失败不阻塞 */
+      }
+    }
     clearTimeout(routeTimer)
+    clearTimeout(commandTimer)
     stopDream()
     broadcast.dispose()
     try {
@@ -706,4 +743,4 @@ export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, readSeen, markSearched, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, advanceDream, abortDream, recoverInterruptedDream } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition } from './dream.js'

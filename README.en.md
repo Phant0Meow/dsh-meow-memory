@@ -57,7 +57,8 @@ frozen at the last conversation timestamp.
   non-stale entries, todo section with latest 5 done + to-do list, plus memory-db &
   session-history pointers) / `memory_find_similar` (duplicate & conflict detection) /
   `memory_read` / `memory_update` (incl. status active/archived/stale, importance, goal,
-  manual keyword fixes) / `memory_dream` (manual trigger).
+  manual keyword fixes) / `memory_dream` (manual trigger; you can also just type the
+  `/dream` command in the composer).
 - **Memory timestamp** (`updated_at` = last update time): refreshed by dream stamping or
   any `memory_update`. Displayed timestamps are always `updated_at`; search (work view) shows
   relative time, hit-injection / memory_project (full-text view) show relative + absolute
@@ -77,6 +78,11 @@ frozen at the last conversation timestamp.
   `suppressLeadMinutes` (default 15) before each window — it fires on the next check cycle
   after the peak ends; a dream already in progress is never interrupted. Old windows (no live
   agent, >24h) and archived sessions are left alone.
+- **`/dream` command**: no need to wait for the idle trigger — type `/dream` in the composer
+  to start consolidating this window's memories right away (same semantics as the
+  `memory_dream` tool, immune to peak-hour suppression). Executed by the dsh command plane,
+  never sent to the model; shows up in the `/` autocomplete menu. A consolidation already in
+  progress is reported clearly instead of being started twice.
 - **Reflection**: after ≥7 consecutive tool steps within one task the plugin asks the
   model whether anything since the last consolidation is worth remembering. A turn whose
   last tool is a `memory_*` tool counts as already having consolidated (no re-reflection);

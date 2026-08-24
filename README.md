@@ -48,7 +48,8 @@
   最后更新时间戳、todo 输出「已完成：」最近 5 条 +「To do list：」，末尾附记忆库与
   会话历史定位说明）/
   `memory_find_similar`（查重与冲突检测）/ `memory_read` / `memory_update`（含 status
-  active/archived/stale、importance、goal、keywords 手动修正）/ `memory_dream`（手动触发）。
+  active/archived/stale、importance、goal、keywords 手动修正）/ `memory_dream`（手动触发；
+  用户也可以直接在输入框敲 `/dream` 命令）。
 - **记忆时间戳**（`updated_at` = 最后更新时间）：dream 封存或 `memory_update` 刷新时更新。
   展示的时间戳一律是 `updated_at`；search（工作视图）带相对时间戳，命中注入/memory_project
   （原文视图）带相对 + 绝对时间戳（如「2026-08-15 10:58 [2 天前]」）。
@@ -65,6 +66,9 @@
   及各自开始前 `suppressLeadMinutes`（默认 15）分钟内不触发，峰时结束后下一个检查
   周期自动触发；进行中的 dream 不打断。无 live agent 且超过 24h 的旧窗口、以及已归档
   的会话，均不处理。
+- **`/dream` 命令**：不想等空闲触发？在输入框敲 `/dream` 立即手动唤起本窗口的记忆整理
+  （与 `memory_dream` 工具同语义，不受峰时抑制）。dsh 命令平面执行、不发给模型，输入 `/`
+  的补全菜单里直接可见；已有整理在进行中会明确提示，不会重复启动。
 - **反思**：单次任务内连续 ≥7 个工具 step 后，插件询问模型自上次整理以来是否有值得记忆的内容。
   最后工具是 `memory_*` 视为已主动记忆、不重复反思；被取消的轮次绝不触发。
 - **注入折叠 UI（client 端）**：首轮长期记忆 / 每消息关键词命中的注入文本在前端

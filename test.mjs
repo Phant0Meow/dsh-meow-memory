@@ -28,6 +28,7 @@ import {
   advanceDream,
   abortDream,
   recoverInterruptedDream,
+  dreamCommandDefinition,
   findSimilar,
   markInjected,
   markSearched,
@@ -845,6 +846,76 @@ const steered3 = []
 const agentF = { session: { header: { cwd: ws, id: 's6' }, events: [events.turnStart(), events.userMsg('记住'), events.assistantWithTool('memory_remember')] }, steer: (m) => steered3.push(m) }
 stopping({ agent: agentF, turn: 1, signal: new AbortController().signal })
 check('no steer after memory_ tool', steered3.length === 0)
+
+// ═══════════════════════ /dream 用户命令（dsh 命令平面） ═══════════════════════
+
+// 定义形状 + handler 全路径。语义=手动触发：直接 startWindowDream，不吃峰时抑制/空闲检查。
+{
+  const def = dreamCommandDefinition({ logger: { info: () => {}, warn: () => {}, error: () => {} } }, '.dsh-meow')
+  check('/dream command shape', def.name === 'dream' && typeof def.description === 'string' && def.description.length > 0)
+
+  // 成功路径：本窗口有记忆 → steer 发出第 1 组 + 租约建立 + success 文案
+  const wsCmd = mkdtempSync(join(tmpdir(), 'mm-cmd-'))
+  const dbCmd = getDb(wsCmd, '.dsh-meow')
+  dbCmd.insert({ level: 'fact', content: '/dream 命令测试条目 特异词zz', project: 'dsh', source_session: 's-cmd' })
+  const steeredC = []
+  const agentC = { session: { header: { cwd: wsCmd, id: 's-cmd' } }, steer: (m) => steeredC.push(m) }
+  const r1 = await def.handler({ agent: agentC })
+  check('/dream starts window dream', r1.kind === 'success' && r1.text.includes('已安排'), JSON.stringify(r1))
+  check('/dream steers round 1 with marker', steeredC.length === 1 && JSON.stringify(steeredC[0]).includes('[meow-memory-dream]'))
+  check('/dream claims lease', dbCmd.getDreamLease('s-cmd') !== null)
+  // 占用中：第二次调用 → error 且不重复 steer
+  const r2 = await def.handler({ agent: agentC })
+  check('/dream busy → error', r2.kind === 'error' && r2.text.includes('进行中'), JSON.stringify(r2))
+  check('/dream busy no extra steer', steeredC.length === 1)
+  abortDream(agentC, '.dsh-meow')
+
+  // 空窗口：topic 轮恒触发（回顾建新）→ 也成功启动（与 memory_dream 工具行为一致）
+  const wsEmpty = mkdtempSync(join(tmpdir(), 'mm-cmd-empty-'))
+  const dbEmpty = getDb(wsEmpty, '.dsh-meow')
+  dbEmpty.touchWindow('s-empty', wsEmpty, Date.now())
+  const steeredE = []
+  const agentE2 = { session: { header: { cwd: wsEmpty, id: 's-empty' } }, steer: (m) => steeredE.push(m) }
+  const rNone = await def.handler({ agent: agentE2 })
+  check('/dream empty window still starts (topic round)', rNone.kind === 'success' && steeredE.length === 1, JSON.stringify(rNone))
+  abortDream(agentE2, '.dsh-meow')
+
+  // 守卫：子代理会话拒绝
+  const rSub = await def.handler({ agent: { session: { header: { cwd: wsCmd, id: 's-sub', origin: 'subagent', parentSession: 's-cmd' } } } })
+  check('/dream rejects subagent', rSub.kind === 'error' && rSub.text.includes('主会话'), JSON.stringify(rSub))
+  // 守卫：无 cwd
+  const rNoWs = await def.handler({ agent: { session: { header: { id: 's-nows' } } } })
+  check('/dream requires cwd', rNoWs.kind === 'error' && rNoWs.text.includes('工作区'), JSON.stringify(rNoWs))
+  // 守卫：无会话 id
+  const rNoId = await def.handler({ agent: { session: { header: { cwd: wsCmd } } } })
+  check('/dream requires session id', rNoId.kind === 'error' && rNoId.text.includes('会话 id'), JSON.stringify(rNoId))
+  // 守卫：invocation.agent 缺失
+  const rNoAgent = await def.handler({})
+  check('/dream requires agent', rNoAgent.kind === 'error', JSON.stringify(rNoAgent))
+
+  getDb(wsCmd, '.dsh-meow').close() // 显式关库：Windows 下 WAL 句柄未释放会挡住 rmSync（EBUSY）
+  getDb(wsEmpty, '.dsh-meow').close()
+  rmSync(wsCmd, { recursive: true, force: true })
+  rmSync(wsEmpty, { recursive: true, force: true })
+}
+
+// 注册接线：commands 服务就绪时 apply 自动注册 /dream（ctx.effect 包装，disposer 收集）
+{
+  const registeredC = []
+  const disposers = []
+  const { ctx: ctxCmd } = makeCtx()
+  ctxCmd.get = (name) => name === 'commands'
+    ? { register: (def) => { registeredC.push(def); return () => {} } }
+    : undefined
+  ctxCmd.effect = (fn) => {
+    const d = fn()
+    if (typeof d === 'function') disposers.push(d)
+    return d
+  }
+  await apply(ctxCmd, { enabled: true })
+  check('/dream auto-registered via commands service', registeredC.length === 1 && registeredC[0].name === 'dream',
+    JSON.stringify(registeredC.map((d) => d.name)))
+}
 
 // disabled
 const { ctx: ctxOff, tools: toolsOff, handlers: handlersOff } = makeCtx()

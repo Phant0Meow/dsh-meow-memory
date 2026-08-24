@@ -434,6 +434,58 @@ export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamS
   }
 }
 
+// ── 用户命令 /dream（dsh 命令平面） ─────────────────────────────────────────
+
+/** dsh 命令平面（宿主 @deepseek-ai/dsh-commands）的最小结构视图：只声明本插件
+ *  用到的成员，不 import 该包（保持零运行时依赖；实际类型由宿主运行时满足）。 */
+interface DreamCommandAgent {
+  session?: { header?: { id?: string; cwd?: string; origin?: unknown } }
+}
+
+export interface DreamCommandDefinition {
+  readonly name: 'dream'
+  readonly description: string
+  readonly handler: (invocation: { agent?: DreamCommandAgent }) =>
+    | { kind: 'success'; text?: string }
+    | { kind: 'error'; text: string }
+    | Promise<{ kind: 'success'; text?: string } | { kind: 'error'; text: string }>
+}
+
+/**
+ * /dream 用户命令定义（手动唤起本窗口 dream）：与 memory_dream 工具同语义——直接
+ * startWindowDream，不吃峰时抑制、不吃空闲检查。结果映射：启动成功 → success；
+ * 子代理会话 / 无 cwd / 无会话 id / 租约占用 / 无可整理记忆 → error（UI 按
+ * command-error 明确提示未启动原因，不会把 /dream 发给模型）。
+ * 注册由 index.ts 负责（ctx.get('commands') 可选服务 + 就绪重试 + ctx.effect 清理）。
+ */
+export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback): DreamCommandDefinition {
+  return {
+    name: 'dream',
+    description: '手动唤起一次记忆整理（dream）：逐轮回顾本窗口建立/提取过的跨会话记忆并封存。与 memory_dream 工具相同，手动触发不受峰时抑制。',
+    handler(invocation) {
+      const agent = invocation?.agent
+      if (!agent) return { kind: 'error', text: '/dream 无法确定当前窗口的会话。' }
+      const header = agent.session?.header
+      if (header?.origin === 'subagent') {
+        return { kind: 'error', text: '/dream 只能在主会话使用：子代理没有独立的记忆窗口。' }
+      }
+      const workspace = typeof header?.cwd === 'string' && header.cwd.length > 0 ? header.cwd : null
+      if (workspace === null) {
+        return { kind: 'error', text: '/dream 无法确定当前窗口的工作区（会话无 cwd）。' }
+      }
+      if (typeof header?.id !== 'string' || header.id.length === 0) {
+        return { kind: 'error', text: '/dream 无法确定当前窗口的会话 id。' }
+      }
+      const ok = startWindowDream(ctx, agent, workspace, dir, onDreamState)
+      if (ok) return { kind: 'success', text: '🧠 dream 已安排：整理指令已发出，逐组处理中。' }
+      const lease = getDb(workspace, dir).getDreamLease(header.id)
+      return lease !== null
+        ? { kind: 'error', text: '本窗口已有 dream 任务在进行中（或待补收尾），未重复启动。' }
+        : { kind: 'error', text: '本窗口没有需要整理的记忆（本窗口建立/提取过的记忆为空）。' }
+    },
+  }
+}
+
 /** 补收尾被打断的 dream（start 过但没 done：进程重启/热重载/跨进程打断）。
  *  视为已完成：封存该窗口条目 + 清 pending + 记 last_dream_time——不再重复 start。
  *  @returns 封存（stamped）的条目数。 */
