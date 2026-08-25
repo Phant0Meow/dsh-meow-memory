@@ -87,9 +87,10 @@ export class DreamStateBroadcast {
 
   /**
    * 广播一个状态变化事件：'dreamed'=整理完成加月亮、'dreaming'=dream 开始呼吸灯、
-   * 'active'=有新活动去月亮（client 端幂等忽略无变化）。
+   * 'active'=有新活动去月亮、'skip'/'unskip'=用户切换跳过自动 dream 标记
+   * （v0.16.0；dream-icon 端按未知状态幂等忽略，dream-skip 端据此同步本地集合）。
    */
-  broadcast(sessionId: string, state: 'dreamed' | 'dreaming' | 'active'): void {
+  broadcast(sessionId: string, state: 'dreamed' | 'dreaming' | 'active' | 'skip' | 'unskip'): void {
     const data = JSON.stringify({ sessionId, state })
     for (const res of this.clients) {
       try {

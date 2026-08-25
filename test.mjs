@@ -32,6 +32,8 @@ import {
   findSimilar,
   markInjected,
   markSearched,
+  markAccessed,
+  releaseSeen,
   readSeen,
   getCurrentProject,
   setCurrentProject,
@@ -124,6 +126,20 @@ check('window needs dream (new chat after dream)', windowNeedsDream({ last_event
 check('window no dream (dream after chat)', windowNeedsDream({ last_event_time: Date.now(), last_dream_time: Date.now() + 1000 }) === false)
 check('window no dream (older than 24h)', windowNeedsDream({ last_event_time: Date.now() - 25 * 3600_000, last_dream_time: null }) === false)
 
+// dream_skip 跳过表（v0.16.0：会话菜单「跳过梦境整理记忆」toggle 的持久层）
+check('dreamSkip off by default', dbW.isDreamSkipped('win-1') === false && dbW.listDreamSkips().length === 0)
+dbW.setDreamSkip('win-1', true)
+dbW.setDreamSkip('win-2', true)
+check('dreamSkip set + list', dbW.isDreamSkipped('win-1') === true && dbW.isDreamSkipped('win-2') === true &&
+  dbW.listDreamSkips().sort().join(',') === 'win-1,win-2')
+dbW.setDreamSkip('win-1', true) // 幂等重复 set
+check('dreamSkip idempotent set', dbW.listDreamSkips().length === 2)
+dbW.setDreamSkip('win-1', false)
+check('dreamSkip clear', dbW.isDreamSkipped('win-1') === false && dbW.listDreamSkips().join(',') === 'win-2')
+dbW.setDreamSkip('win-absent', false) // 对未标记会话清除不抛
+check('dreamSkip clear absent no-op', dbW.listDreamSkips().join(',') === 'win-2')
+dbW.setDreamSkip('win-2', false)
+
 // dream 抢占与收尾（租约：防重复 dream，跨进程/重启后状态一致）
 const LEASE = 60_000
 check('claimDream succeeds first', dbW.claimDream('win-1', 'o1', 1000, LEASE) === true)
@@ -188,6 +204,21 @@ check('dream round0 judgement + rules', d0.includes('如何判断该更新') && 
 check('dream round0 row full id + absolute timestamps', /\[fact [a-z0-9]{9}-[a-z0-9]{26} \d{4}-\d{2}-\d{2} \d{2}:\d{2}\]/.test(d0))
 check('dream round0 rows carry keywords line', d0.includes('关键词: 事实, 测试') && d0.includes('关键词: （无）'))
 check('dream round0 excludes topic rows', !d0.includes('话题X') && !d0.includes('外来话题'))
+
+// v0.17.0：accessed（memory_read 查阅留痕）进第一轮清单；rules 防 churn 时间过滤
+const readFact = dbD.insert({ level: 'fact', content: '查阅过的事实', project: 'dsh', source_session: 'win-other3', created_at: 800 })
+markAccessed(wsD, wid, [readFact.id], '.dsh-meow')
+const roundsAcc = collectDreamRounds(dbD, wid, wsD, '.dsh-meow')
+check('accessed rows included in round1', roundsAcc[0].groups.some((g) => g.rows.some((r) => r.content === '查阅过的事实')))
+check('seen set = injected(2)+accessed(1), nothing else tracked', readSeen(wsD, wid, '.dsh-meow').size === 3)
+const oldRule = dbD.insert({ level: 'rules', content: '陈年旧规则', project: 'dsh', source_session: wid })
+dbD.db.prepare('UPDATE rules SET updated_at = ? WHERE id = ?').run(Date.now() - 3 * 86_400_000, oldRule.id)
+dbD.insert({ level: 'rules', content: '新鲜规则', project: 'dsh', source_session: wid })
+const roundsFiltered = collectDreamRounds(dbD, wid, wsD, '.dsh-meow') // 默认 rulesReviewDays=2
+check('stale rule excluded by default 2d filter', !roundsFiltered[0].groups.some((g) => g.rows.some((r) => r.content === '陈年旧规则')))
+check('fresh rule still included', roundsFiltered[0].groups.some((g) => g.rows.some((r) => r.content === '新鲜规则')))
+const roundsNoFilter = collectDreamRounds(dbD, wid, wsD, '.dsh-meow', 0)
+check('rules filter off with 0', roundsNoFilter[0].groups.some((g) => g.rows.some((r) => r.content === '陈年旧规则')))
 const dreamMsg1 = buildDreamMessage(dbD, wid, 5000, rounds, 1)
 const d1 = dreamMsg1.content.map((b) => (b.type === 'text' ? b.text : '')).join('')
 check('dream round1 topic title + guide', d1.includes('第 2/3 组 - topic记忆条目') && d1.includes('topic记忆更新指导') && d1.includes('拆分') && d1.includes('本组整理完成'))
@@ -290,6 +321,17 @@ markSearched(wsR, 'win-a', ['seen-id-1'], '.dsh-meow')
 const seenSet = readSeen(wsR, 'win-a', '.dsh-meow')
 check('readSeen after markSearched', seenSet.has('seen-id-1'))
 check('readSeen empty for other session', readSeen(wsR, 'win-b', '.dsh-meow').size === 0)
+
+// accessed（v0.17.0）：memory_read 查阅留痕——进 dream 清单；压缩释放保留 accessed
+markInjected(wsR, 'win-a', ['inj-id-1'], '.dsh-meow')
+markAccessed(wsR, 'win-a', ['read-id-1'], '.dsh-meow')
+check('readSeen includes accessed', readSeen(wsR, 'win-a', '.dsh-meow').has('read-id-1'))
+releaseSeen(wsR, 'win-a', '.dsh-meow')
+const released = JSON.parse(readFileSync(join(wsR, '.dsh-meow', 'sessions', 'win-a.json'), 'utf8'))
+check('releaseSeen keeps accessed, clears injected/searched',
+  released.accessed.includes('read-id-1') && released.injected.length === 0 && released.searched.length === 0 &&
+  !readSeen(wsR, 'win-a', '.dsh-meow').has('inj-id-1') && !readSeen(wsR, 'win-a', '.dsh-meow').has('seen-id-1') &&
+  readSeen(wsR, 'win-a', '.dsh-meow').has('read-id-1'))
 dbR.close()
 
 // ── 会话列表 dream 图标：collectDreamStates 全量判定（dreamed / dreaming 双态） ─

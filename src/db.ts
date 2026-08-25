@@ -173,6 +173,10 @@ export class MemoryDb {
       key TEXT PRIMARY KEY,
       value INTEGER
     )`)
+    this.db.exec(`CREATE TABLE IF NOT EXISTS dream_skip (
+      session_id TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL
+    )`)
     this.upgrade()
   }
 
@@ -477,6 +481,30 @@ export class MemoryDb {
         )
         .run(now, sessionId, fromIdx, now - leaseMs).changes === 1
     )
+  }
+
+  // ── dream_skip 跳过表（v0.16.0：用户按会话跳过自动 dream；侧边栏菜单 toggle） ──
+
+  /** 设置/清除某会话的跳过标记。skip=true 写入，false 删除。 */
+  setDreamSkip(sessionId: string, skip: boolean): void {
+    if (skip) {
+      this.db
+        .prepare(`INSERT INTO dream_skip (session_id, created_at) VALUES (?, ?)
+          ON CONFLICT(session_id) DO UPDATE SET created_at = excluded.created_at`)
+        .run(sessionId, Date.now())
+    } else {
+      this.db.prepare(`DELETE FROM dream_skip WHERE session_id = ?`).run(sessionId)
+    }
+  }
+
+  /** 该会话是否被跳过自动 dream（只挡定时器自动触发；手动触发不受限）。 */
+  isDreamSkipped(sessionId: string): boolean {
+    return this.db.prepare(`SELECT 1 FROM dream_skip WHERE session_id = ?`).get(sessionId) !== undefined
+  }
+
+  /** 全部被跳过的会话 id（client 全量对账用）。 */
+  listDreamSkips(): string[] {
+    return (this.db.prepare(`SELECT session_id FROM dream_skip`).all() as Array<{ session_id: string }>).map((r) => r.session_id)
   }
 
   // ── 全局检查门（dream 定时器防叠加） ─────────────────────────────────────

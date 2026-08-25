@@ -97,24 +97,31 @@ function groupByProject(rows: MemoryRow[]): DreamGroup[] {
     .map(([name, rows]) => ({ name, rows }))
 }
 
-/** dream 记忆范围（用户拍板 2026-08-19）：本窗口建立的 ∪ 本窗口提取过的
- *  （sessions/<id>.json 的 injected+searched，readSeen）。
+/** dream 记忆范围（用户拍板 2026-08-19，v0.17.0 扩展）：本窗口建立的 ∪ 本窗口
+ *  提取过的（sessions/<id>.json：注入 injected + 检索 searched + 查阅 accessed）。
  *  分轮：第 1 轮=原子记忆（project/fact/lesson/rules/soul/user，不含 topic），空则跳过；
  *  第 2 轮=topic 记忆**默认触发**（用户拍板 2026-08-19：空也发——AI 回顾对话历史，
  *  可能有新 topic 要创建）；第 3 轮=项目总结（用户拍板 2026-08-22，本窗口涉及具体项目
- *  时追加——调 memory_project 复查并精简成新的项目长期记忆，被取代的旧条目归档）。 */
+ *  时追加——调 memory_project 复查并精简成新的项目长期记忆，被取代的旧条目归档）。
+ *  rules 防 churn（测评 2026-08-25）：updated_at 距今超 rulesReviewDays 天的稳定
+ *  准则不进第 1 轮清单（0=不过滤）——每轮重审是低价值劳动且易诱发无意义 update；
+ *  全局高 importance rules 每会话首轮都在注入，真矛盾会被当场 update、updated_at
+ *  刷新后自动回到审查队列。 */
 export function collectDreamRounds(
   db: ReturnType<typeof getDb>,
   sessionId: string,
   workspace: string,
   dir = '.dsh-meow',
+  rulesReviewDays = 2,
 ): DreamRound[] {
   const seen = readSeen(workspace, sessionId, dir)
   const atomic: MemoryRow[] = []
   const topic: MemoryRow[] = []
   for (const level of ['project', 'fact', 'lesson', 'rules', 'soul', 'user'] as const) {
     for (const r of db.list(level)) {
-      if (r.source_session === sessionId || seen.has(r.id)) atomic.push(r)
+      if (!(r.source_session === sessionId || seen.has(r.id))) continue
+      if (level === 'rules' && rulesReviewDays > 0 && Date.now() - r.updated_at > rulesReviewDays * 86_400_000) continue
+      atomic.push(r)
     }
   }
   for (const r of db.list('topic')) {
@@ -144,12 +151,13 @@ function formatRow(r: MemoryRow): string {
   return `- [${meta.join(' ')}] ${head}\n  关键词: ${kwLine}`
 }
 
-/** 第 1 轮（原子记忆）指南（用户拍板 2026-08-19 终稿）。 */
+/** 第 1 轮（原子记忆）指南（用户拍板 2026-08-19 终稿；v0.17.0 清单范围实指令化——
+ *  测评发现「顺便检查你看过的所有记忆」是无清单的空指令，改为明确以【本组记忆】为界）。 */
 const ATOMIC_GUIDE = [
-  '这些是你自己建立的记忆条目，以及你更新过的记忆。有没有你认为该整理、更新的？如有，请更新它。',
-  '顺便检查历史记录中所有你看到的记忆条目，有没有你认为该更新的，如有，请一并更新。',
+  '下面的【本组记忆】就是本窗口的全部整理范围：你自己建立的、以及本窗口注入/检索/查阅（memory_read）时看过的条目。范围到此为止——不要试图回忆清单之外"看过但没列出"的条目。',
+  '有没有你认为该整理、更新的？如有，请更新它。',
   '',
-  '## 如何判断该更新——回看之前建立和读到的记忆，你现在觉得：',
+  '## 如何判断该更新——逐条核查上面的清单，你现在觉得：',
   '1. 有没有当时记录错误或片面、过时、信息需要更新、用户改变决定、已有新进展的条目？ → 请及时更新内容，记忆库的信息应该吻合project进展的最新状态。',
   '2. 有没有被推翻的、被改掉的、被证明无效的设计和信息？ → 应设 status=archived 归档，绝不要让它们保持active或stale。stale只表示「完结」（todo做完、话题达成目标），不是「作废」；已被替代的旧方案旧结论继续留在库里，只会误导之后的会话。',
   '3. 有没有已完成的 todo 条目？ → 设 status = stale（视为done）；',
@@ -300,11 +308,11 @@ export type DreamStateCallback = (sessionId: string, state: 'dreaming' | 'dreame
  * 防重复：DB 原子抢占 dream_pending 标记（跨进程/重启一致）——抢占失败即不 start；
  * 抢占成功后即使本进程崩溃/被重载，下个检查周期也会补收尾而不是重复 start。
  */
-export function startWindowDream(ctx: Context, agent: { session?: { header?: { id?: string } } }, workspace: string, dir = '.dsh-meow', onDreamState?: DreamStateCallback): boolean {
+export function startWindowDream(ctx: Context, agent: { session?: { header?: { id?: string } } }, workspace: string, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays = 2): boolean {
   const sessionId = agent.session?.header?.id
   if (!sessionId) return false
   const db = getDb(workspace, dir)
-  const rounds = collectDreamRounds(db, sessionId, workspace, dir)
+  const rounds = collectDreamRounds(db, sessionId, workspace, dir, rulesReviewDays)
   if (rounds.length === 0) {
     // 无本窗口记忆（建立的 ∪ 提取过的都无）：也推进 last_dream_time（= 本窗口无可整理），避免 need=true 恒成立、每轮空扫到 24h
     db.finishDream(sessionId, Date.now())
@@ -328,7 +336,7 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
  * 状态完全从 DB 租约读：跨实例、热重载残留、中止都不影响推进正确性。
  * 推进按「sessionId + 租约未过期」判定，不校验 owner（owner 只用于抢占判断 + 诊断）。
  */
-export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: DreamStateCallback): void {
+export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays = 2): void {
   const sessionId = (agent as { session?: { header?: { id?: string } } })?.session?.header?.id
   const ws = (agent as { session?: { header?: { cwd?: string } } })?.session?.header?.cwd
   if (typeof sessionId !== 'string' || typeof ws !== 'string' || ws.length === 0) return
@@ -344,7 +352,7 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
     return
   }
 
-  const rounds = collectDreamRounds(db, sessionId, ws, dir) // 重查：前序轮 archive/merge 已落地
+  const rounds = collectDreamRounds(db, sessionId, ws, dir, rulesReviewDays) // 重查：前序轮 archive/merge 已落地
   const nextIdx = lease.group_idx + 1
   if (nextIdx < rounds.length) {
     // CAS 推进：多实例同收 turn-stopping 时只有一个成功，其余跳过
@@ -389,7 +397,7 @@ export function abortDream(agent: unknown, dir = '.dsh-meow', onDreamState?: Dre
 
 // ── 工具：memory_dream（手动触发本窗口 dream） ─────────────────────────────
 
-export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback): ToolDefinition {
+export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays = 2): ToolDefinition {
   return {
     name: 'memory_dream',
     description: '立即为本窗口安排一次记忆整理（dream）：把本窗口建立过/提取过的记忆逐轮发给主 agent 整理封存（第 1 轮=原子记忆 project/fact/lesson/rules/soul/user，第 2 轮=topic 记忆，第 3 轮=项目总结——仅当本窗口涉及具体项目时追加）。窗口空闲 3 小时以上自动触发（北京时间峰时 9-12 点/14-18 点及各自前 15 分钟不触发），此工具用于手动触发。',
@@ -417,7 +425,7 @@ export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamS
       const workspace = workspaceOf(exec)
       if (!workspace) throw new Error('memory_dream: 无法确定工作区（会话无 cwd）')
       if (!exec.agent) throw new Error('memory_dream: 无法确定当前 agent')
-      const ok = startWindowDream(ctx, exec.agent, workspace, dir, onDreamState)
+      const ok = startWindowDream(ctx, exec.agent, workspace, dir, onDreamState, rulesReviewDays)
       if (ok) return { ok, note: '整理指令已发出，逐个项目组处理中。' }
       const sessionId = exec.agent.session?.header?.id
       const lease = typeof sessionId === 'string' ? getDb(workspace, dir).getDreamLease(sessionId) : null
@@ -458,7 +466,7 @@ export interface DreamCommandDefinition {
  * command-error 明确提示未启动原因，不会把 /dream 发给模型）。
  * 注册由 index.ts 负责（ctx.get('commands') 可选服务 + 就绪重试 + ctx.effect 清理）。
  */
-export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback): DreamCommandDefinition {
+export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays = 2): DreamCommandDefinition {
   return {
     name: 'dream',
     description: '手动唤起一次记忆整理（dream）：逐轮回顾本窗口建立/提取过的跨会话记忆并封存。与 memory_dream 工具相同，手动触发不受峰时抑制。',
@@ -476,7 +484,7 @@ export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamS
       if (typeof header?.id !== 'string' || header.id.length === 0) {
         return { kind: 'error', text: '/dream 无法确定当前窗口的会话 id。' }
       }
-      const ok = startWindowDream(ctx, agent, workspace, dir, onDreamState)
+      const ok = startWindowDream(ctx, agent, workspace, dir, onDreamState, rulesReviewDays)
       if (ok) return { kind: 'success', text: '🧠 dream 已安排：整理指令已发出，逐组处理中。' }
       const lease = getDb(workspace, dir).getDreamLease(header.id)
       return lease !== null
@@ -517,6 +525,8 @@ export interface DreamConfig {
   suppressLeadMinutes: number
   /** 抑制时段按此时区计算（默认 Asia/Shanghai——用户系统是美区时间，系统时区会算错）。 */
   timeZone: string
+  /** rules 防 churn：updated_at 距今超该天数的稳定准则不进 dream 第 1 轮清单（0=不过滤，默认 2）。 */
+  rulesReviewDays: number
 }
 
 /** 取指定时区的当前小时（Intl 支持；无效时区回退系统时区）。 */
@@ -613,6 +623,10 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow',
     for (const [sessionId, workspace] of windowIndex) {
       if (archived.has(sessionId)) continue // 已归档 = 当不存在
       const db = getDb(workspace, dir)
+      // 用户跳过（v0.16.0 侧边栏菜单 toggle）：本窗口不自动 dream。
+      // 只挡自动触发——/dream 命令与 memory_dream 工具（手动=明确意愿）不受限；
+      // 租约过期补收尾也不受影响（清理语义，防僵尸租约堵死后续手动触发）。
+      if (db.isDreamSkipped(sessionId)) continue
       const w = db.getWindow(sessionId)
       if (!w || !windowNeedsDream(w)) continue
       const lease = db.getDreamLease(sessionId)
@@ -640,7 +654,7 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow',
         dreamLog(workspace, dir, `check agent-missing sid=${shortSessionId(sessionId)}`)
         continue // 进程内无该窗口 agent（重启后）：跳过
       }
-      const started = startWindowDream(ctx, agent as never, workspace, dir, onDreamState)
+      const started = startWindowDream(ctx, agent as never, workspace, dir, onDreamState, cfg.rulesReviewDays)
       if (started) return // 一轮一个窗口
     }
   }, cfg.checkMinutes * 60_000)

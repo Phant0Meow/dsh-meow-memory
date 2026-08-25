@@ -28,11 +28,14 @@ export function sessionsFile(workspace: string, sessionId: string, dir = '.dsh-m
   return join(workspace, dir, 'sessions', `${sessionId}.json`)
 }
 
-/** 会话记忆可见集：injected=注入过的，searched=search/find_similar 返回过的。
- *  两者都是"本会话上下文里已经出现过的记忆"，检索时应排除（省 token、扩大检索面）。 */
+/** 会话记忆可见集：injected=注入过的，searched=search/find_similar 返回过的，
+ *  accessed=memory_read 读过的（v0.17.0，dream 第一轮清单的"查阅"源）。
+ *  前两者是"本会话上下文里已经出现过的记忆"，检索时应排除（省 token、扩大检索面）；
+ *  accessed 只服务 dream 扫尾范围（读过的条目该被复查），不参与命中去重。 */
 export interface SessionSeen {
   injected: string[]
   searched: string[]
+  accessed: string[]
   /** 当前 project 锚定（最近一次带 project 参数的 memory 工具调用）：命中检索限定"全局+当前项目"。 */
   currentProject: string | null
 }
@@ -40,14 +43,15 @@ export interface SessionSeen {
 function readSeenFile(workspace: string, sessionId: string, dir: string): SessionSeen {
   try {
     const text = readFileSync(sessionsFile(workspace, sessionId, dir), 'utf8')
-    const parsed = JSON.parse(text) as { injected?: unknown; searched?: unknown; currentProject?: unknown }
+    const parsed = JSON.parse(text) as { injected?: unknown; searched?: unknown; accessed?: unknown; currentProject?: unknown }
     return {
       injected: Array.isArray(parsed.injected) ? parsed.injected.filter((x): x is string => typeof x === 'string') : [],
       searched: Array.isArray(parsed.searched) ? parsed.searched.filter((x): x is string => typeof x === 'string') : [],
+      accessed: Array.isArray(parsed.accessed) ? parsed.accessed.filter((x): x is string => typeof x === 'string') : [],
       currentProject: typeof parsed.currentProject === 'string' && parsed.currentProject.length > 0 ? parsed.currentProject : null,
     }
   } catch {
-    return { injected: [], searched: [], currentProject: null }
+    return { injected: [], searched: [], accessed: [], currentProject: null }
   }
 }
 
@@ -64,13 +68,13 @@ export function markInjected(workspace: string, sessionId: string, ids: string[]
   const seen = readSeenFile(workspace, sessionId, dir)
   const set = new Set(seen.injected)
   for (const id of ids) set.add(id)
-  writeFileSync(file, JSON.stringify({ injected: [...set], searched: seen.searched, currentProject: seen.currentProject }), 'utf8')
+  writeFileSync(file, JSON.stringify({ injected: [...set], searched: seen.searched, accessed: seen.accessed, currentProject: seen.currentProject }), 'utf8')
 }
 
-/** 本会话全部"已见" id（注入 + 检索），检索排除用。 */
+/** 本会话全部"已见" id（注入 + 检索 + 查阅），dream 第一轮清单范围 + 检索排除用。 */
 export function readSeen(workspace: string, sessionId: string, dir = '.dsh-meow'): Set<string> {
   const s = readSeenFile(workspace, sessionId, dir)
-  return new Set([...s.injected, ...s.searched])
+  return new Set([...s.injected, ...s.searched, ...s.accessed])
 }
 
 /** 追加已检索返回的 id（memory_search / memory_find_similar 命中后调用）。 */
@@ -81,17 +85,31 @@ export function markSearched(workspace: string, sessionId: string, ids: string[]
   const seen = readSeenFile(workspace, sessionId, dir)
   const set = new Set(seen.searched)
   for (const id of ids) set.add(id)
-  writeFileSync(file, JSON.stringify({ injected: seen.injected, searched: [...set], currentProject: seen.currentProject }), 'utf8')
+  writeFileSync(file, JSON.stringify({ injected: seen.injected, searched: [...set], accessed: seen.accessed, currentProject: seen.currentProject }), 'utf8')
+}
+
+/** 追加 memory_read 读过的 id（v0.17.0）：dream 第一轮"查阅过"源。
+ *  只由 memory_read 单条读取触发；memory_project 全景不标记（第三轮项目总结专门复查）。 */
+export function markAccessed(workspace: string, sessionId: string, ids: string[], dir = '.dsh-meow'): void {
+  if (ids.length === 0) return
+  const file = sessionsFile(workspace, sessionId, dir)
+  mkdirSync(dirname(file), { recursive: true })
+  const seen = readSeenFile(workspace, sessionId, dir)
+  const set = new Set(seen.accessed)
+  for (const id of ids) set.add(id)
+  writeFileSync(file, JSON.stringify({ injected: seen.injected, searched: seen.searched, accessed: [...set], currentProject: seen.currentProject }), 'utf8')
 }
 
 /** 释放本会话已见记录（收到会话压缩信号后调用）：清空 injected/searched，
  *  允许之前注入/检索过的记忆被再次命中提取——压缩后它们的内容已不在上下文里。
+ *  accessed 不清（用户拍板 2026-08-25）：它只服务 dream 扫尾范围、没有去重功能，
+ *  清掉纯丢信息——长窗口压缩前读过的条目恰恰最该被 dream 复查。
  *  当前 project 锚定保留（与可见性无关）。 */
 export function releaseSeen(workspace: string, sessionId: string, dir = '.dsh-meow'): void {
   const file = sessionsFile(workspace, sessionId, dir)
   mkdirSync(dirname(file), { recursive: true })
   const seen = readSeenFile(workspace, sessionId, dir)
-  writeFileSync(file, JSON.stringify({ injected: [], searched: [], currentProject: seen.currentProject }), 'utf8')
+  writeFileSync(file, JSON.stringify({ injected: [], searched: [], accessed: seen.accessed, currentProject: seen.currentProject }), 'utf8')
 }
 
 /** 读当前 project 锚定（最近一次带 project 参数的 memory 工具调用）；未锚定返回 null。 */
@@ -104,7 +122,7 @@ export function setCurrentProject(workspace: string, sessionId: string, project:
   const file = sessionsFile(workspace, sessionId, dir)
   mkdirSync(dirname(file), { recursive: true })
   const seen = readSeenFile(workspace, sessionId, dir)
-  writeFileSync(file, JSON.stringify({ injected: seen.injected, searched: seen.searched, currentProject: project }), 'utf8')
+  writeFileSync(file, JSON.stringify({ injected: seen.injected, searched: seen.searched, accessed: seen.accessed, currentProject: project }), 'utf8')
 }
 
 function toDocs(rows: MemoryRow[]): Doc[] {

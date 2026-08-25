@@ -25,7 +25,7 @@ import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { closeAllDbs, getDb } from './db.js'
+import { closeAllDbs, getDb, memoryDbPath } from './db.js'
 import {
   abortDream,
   advanceDream,
@@ -231,6 +231,8 @@ export const Config = z.object({
       checkMinutes: z.number().min(1).default(15),
       // 用户系统是美区时间（隐私设置），抑制时段按中国时区计算
       timeZone: z.string().default('Asia/Shanghai'),
+      /** rules 防 churn（测评 2026-08-25）：updated_at 距今超该天数的稳定准则不进 dream 第 1 轮清单；0=不过滤。 */
+      rulesReviewDays: z.number().min(0).default(2),
     })
     .default({}),
 })
@@ -264,6 +266,7 @@ function resolveConfig(config: unknown): ResolvedConfig {
       suppressLeadMinutes: d.suppressLeadMinutes ?? 15,
       checkMinutes: d.checkMinutes ?? 15,
       timeZone: d.timeZone ?? 'Asia/Shanghai',
+      rulesReviewDays: d.rulesReviewDays ?? 2,
     },
   }
 }
@@ -348,7 +351,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 完成推 dreamed、有新活动推 active。
   const broadcast = new DreamStateBroadcast(ctx.logger)
   const signalDreamState = (sessionId: string, state: 'dreaming' | 'dreamed'): void => broadcast.broadcast(sessionId, state)
-  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState))
+  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays))
   if (typeof disposeDreamTool === 'function') toolDisposers.push(disposeDreamTool)
   ctx.logger.info('meow-memory: memory_remember/search/read/update + memory_dream registered')
 
@@ -530,7 +533,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       return
     }
     if (dreamTurn) {
-      advanceDream(agent, resolved.projectDir, signalDreamState) // dream 轮：推进下一组或收尾（含孤儿收尾）
+      advanceDream(agent, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays) // dream 轮：推进下一组或收尾（含孤儿收尾）
       return
     }
 
@@ -551,7 +554,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 3) 空闲整理（按窗口；windowIndex 记录 sessionId → workspace）。
   const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex, signalDreamState)
   ctx.logger.info(
-    `meow-memory: dream scheduled (idle ${resolved.dream.idleMinutes}m, suppress ${resolved.dream.suppressWindows.map((w) => `${w.start}-${w.end}`).join(' ')} lead ${resolved.dream.suppressLeadMinutes}m, every ${resolved.dream.checkMinutes}m, tz ${resolved.dream.timeZone})`,
+    `meow-memory: dream scheduled (idle ${resolved.dream.idleMinutes}m, suppress ${resolved.dream.suppressWindows.map((w) => `${w.start}-${w.end}`).join(' ')} lead ${resolved.dream.suppressLeadMinutes}m, every ${resolved.dream.checkMinutes}m, tz ${resolved.dream.timeZone}, rules review ${resolved.dream.rulesReviewDays}d)`,
   )
 
   // 4) 会话列表"已 dream"图标数据面（仿 meow-eyes describe 路由，webServer 可选服务）：
@@ -599,7 +602,50 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         path: '/meow-memory/dream-events',
         handler: (req, res) => broadcast.handle(req as never, res as never),
       })
-      ctx.logger.info('meow-memory: dreamed-sessions snapshot + dream-events SSE routes registered')
+      // 跳过自动 dream（v0.16.0，侧边栏会话菜单 toggle 的数据面）：
+      //    - GET  /meow-memory/skip-dreams → { sessionIds }（全部已知工作区合并去重）；
+      //    - POST /meow-memory/skip-dreams { sessionId, skip } → { ok, skipped }，
+      //      写库后经既有 SSE 通道推 skip/unskip（同实例多标签页即时同步；
+      //      跨实例浏览器标签靠重连对账补齐——与 dream 图标同一限制）。
+      registerOne({
+        kind: 'exact',
+        path: '/meow-memory/skip-dreams',
+        handler: (req, res) => {
+          void (async () => {
+            try {
+              if ((req as { method?: string }).method === 'POST') {
+                const body = await readJsonBody(req) as { sessionId?: unknown; skip?: unknown }
+                const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+                const skip = body.skip === true
+                if (sessionId.length === 0) return writeJson(res, 400, { ok: false, error: 'sessionId required' })
+                const ws = await resolveWorkspaceForSession(ctx, sessionId)
+                if (ws === null) return writeJson(res, 404, { ok: false, error: 'unknown session (no workspace)' })
+                getDb(ws, resolved.projectDir).setDreamSkip(sessionId, skip)
+                broadcast.broadcast(sessionId, skip ? 'skip' : 'unskip')
+                ctx.logger.info(`meow-memory: dream skip ${skip ? 'on' : 'off'} for ${shortSessionId(sessionId)}`)
+                return writeJson(res, 200, { ok: true, skipped: skip })
+              }
+              const workspaces = new Set<string>()
+              for (const [, w] of windowIndex) {
+                if (typeof w === 'string' && w.length > 0) workspaces.add(w)
+              }
+              const ids = new Set<string>()
+              for (const w of workspaces) {
+                if (!existsSync(memoryDbPath(w, resolved.projectDir))) continue // 无记忆库不新建（collectDreamStates 同款）
+                try {
+                  for (const id of getDb(w, resolved.projectDir).listDreamSkips()) ids.add(id)
+                } catch {
+                  /* 单工作区库损坏：跳过 */
+                }
+              }
+              writeJson(res, 200, { sessionIds: [...ids] })
+            } catch (e) {
+              writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+            }
+          })()
+        },
+      })
+      ctx.logger.info('meow-memory: dreamed-sessions snapshot + dream-events SSE + skip-dreams routes registered')
       return
     }
     if (attempt < 20) {
@@ -623,7 +669,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       | undefined
     if (commands !== undefined && typeof commands.register === 'function') {
       try {
-        commandDisposers.push(ctx.effect(() => commands.register(dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState))))
+        commandDisposers.push(ctx.effect(() => commands.register(dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays))))
         ctx.logger.info('meow-memory: /dream user command registered')
       } catch (e) {
         ctx.logger.warn(`meow-memory: /dream 命令注册失败: ${e instanceof Error ? e.message : String(e)}`)
@@ -683,6 +729,62 @@ function writeJson(res: unknown, status: number, body: unknown): void {
   }
 }
 
+/** 读 POST JSON body（64KB 上限；空 body = {}）。 */
+function readJsonBody(req: unknown, maxBytes = 65_536): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const r = req as { on?: (ev: string, cb: (chunk?: unknown) => void) => void }
+    const chunks: Buffer[] = []
+    let size = 0
+    r.on?.('data', (chunk: Buffer | string) => {
+      const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk
+      size += buf.length
+      if (size > maxBytes) {
+        reject(new Error('request body too large'))
+        return
+      }
+      chunks.push(buf)
+    })
+    r.on?.('end', () => {
+      if (chunks.length === 0) {
+        resolve({})
+        return
+      }
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+      } catch (e) {
+        reject(e instanceof Error ? e : new Error(String(e)))
+      }
+    })
+    r.on?.('error', (e: unknown) => reject(e instanceof Error ? e : new Error(String(e))))
+  })
+}
+
+/**
+ * 解析会话 → 工作区：先查 windowIndex（模块级 sid→cwd 索引，apply 时已从
+ * 文件+windows 表恢复）；查不到再用 sessionPersistence.list() 按 cwd 兜底
+ * （覆盖从未产生过事件的全新会话），命中顺手回填索引。
+ * 都找不到返回 null（该会话不属于任何已知工作区，无法定位其记忆库）。
+ */
+async function resolveWorkspaceForSession(ctx: Context, sessionId: string): Promise<string | null> {
+  const direct = windowIndex.get(sessionId)
+  if (typeof direct === 'string' && direct.length > 0) return direct
+  try {
+    const sp = (ctx as { get?: (name: string) => unknown }).get?.('sessionPersistence') as
+      | { list?: () => Promise<Array<{ id: string; cwd?: string }>> }
+      | undefined
+    const sessions = typeof sp?.list === 'function' ? await sp.list() : []
+    const hit = sessions.find((s) => s.id === sessionId)
+    if (hit && typeof hit.cwd === 'string' && hit.cwd.length > 0) {
+      windowIndex.set(sessionId, hit.cwd)
+      persistWindowIndex()
+      return hit.cwd
+    }
+  } catch {
+    /* sessionPersistence 不可用 */
+  }
+  return null
+}
+
 // ── 模块级窗口索引（sessionId → workspace） ────────────────────────────────
 // 持久化到 homedir/.dsh-meow/window-index.json：热重载/重启会重置模块级 Map，
 // 若不恢复则旧窗口（reload 后无新事件）从 dream 检查中失联——有记忆也不 dream。
@@ -740,7 +842,7 @@ export { PLUGIN_SOURCE, REFLECT_MARKER }
 export { collectDreamStates } from './dream-signal.js'
 export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel } from './db.js'
 export { migrateLegacy } from './migrate.js'
-export { buildHitInjection, buildInjection, readSeen, markSearched, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject } from './inject.js'
+export { buildHitInjection, buildInjection, readSeen, markSearched, markAccessed, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition } from './dream.js'

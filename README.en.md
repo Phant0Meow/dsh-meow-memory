@@ -72,7 +72,10 @@ frozen at the last conversation timestamp.
   project/fact/lesson/rules/soul/user, then topic, then a project-summary round whenever the
   window touched concrete projects — it re-checks each project via memory_project, distills
   concise long-term entries and archives the superseded ones), project sub-headings, memories
-  it created plus ones it was shown — using its full conversation context. **Peak-hour suppression**
+  it created plus ones it was shown (injected / searched / read via memory_read) — using its
+  full conversation context; long-stable rules aren't re-reviewed every dream
+  (`dream.rulesReviewDays`, default 2 days, keeps churn-y no-op updates away).
+  **Peak-hour suppression**
   (in the configured `timeZone`, default Asia/Shanghai): no dream starts inside
   `suppressWindows` (default 09:00–12:00 & 14:00–18:00, API peak-tariff hours) nor within
   `suppressLeadMinutes` (default 15) before each window — it fires on the next check cycle
@@ -83,6 +86,12 @@ frozen at the last conversation timestamp.
   `memory_dream` tool, immune to peak-hour suppression). Executed by the dsh command plane,
   never sent to the model; shows up in the `/` autocomplete menu. A consolidation already in
   progress is reported clearly instead of being started twice.
+- **Skip dream consolidation (client)**: don't want a window's memories auto-consolidated?
+  Open the "…" menu on its sidebar row and click **"跳过梦境整理记忆" (skip dream
+  consolidation)**; click **"取消跳过梦境整理记忆" (un-skip)** to restore. Skipped windows are
+  never picked up by the idle timer again, while `/dream` and `memory_dream` keep working.
+  The skip flag persists across restarts and stays consistent across both instances (shared
+  memory database).
 - **Reflection**: after ≥7 consecutive tool steps within one task the plugin asks the
   model whether anything since the last consolidation is worth remembering. A turn whose
   last tool is a `memory_*` tool counts as already having consolidated (no re-reflection);

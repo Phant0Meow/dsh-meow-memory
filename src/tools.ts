@@ -11,7 +11,7 @@
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { findSimilar, search, tokenize, type RankedHit } from './bm25.js'
 import { getDb, getDreamWorkspace, memoryDbPath, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
-import { readSeen, markSearched, setCurrentProject } from './inject.js'
+import { readSeen, markAccessed, markSearched, setCurrentProject } from './inject.js'
 
 export type { Level }
 
@@ -530,6 +530,8 @@ function readTool(dir: string): ToolDefinition {
       const found = getDb(workspace, dir).findById(id)
       if (!found) return { found: false }
       const { row } = found
+      // 查阅留痕（v0.17.0）：dream 第一轮清单的"查阅过"源（memory_project 全景不标记，第三轮专门复查）。
+      markAccessed(workspace, sessionIdOf(exec) ?? 'unknown', [row.id], dir)
       return {
         found: true,
         id: row.id,

@@ -25,7 +25,7 @@ export const DREAM_ICON_ATTR = 'data-meow-dreamed'
 export const DREAMING_ATTR = 'data-meow-dreaming'
 
 /** 月牙 SVG（Lucide moon 路径，viewBox 24 缩放到 10px——矢量缩放，小尺寸也清晰）。 */
-const MOON_SVG = '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>'
+export const MOON_SVG = '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>'
 
 const ICON_CSS = `[${DREAM_ICON_ATTR}],
 [${DREAMING_ATTR}] {

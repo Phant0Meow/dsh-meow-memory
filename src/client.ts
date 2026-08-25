@@ -22,6 +22,7 @@ import type { InputZone } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { AssistantChatData, ChatNode, ToolChatData } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { blocksToText, computeFoldGroups, computeInjectionGroups, foldLabel, formatInjectionClock, toolCallDetail, type FoldGroup, type InjectionGroup } from './client-fold.ts'
 import { startDreamIconManager } from './client-dream-icon.ts'
+import { startDreamSkipManager } from './client-dream-skip.ts'
 
 /** 折叠行标记（CSS 规则隐藏）。 */
 const FOLDED_ATTR = 'data-meow-memory-folded'
@@ -528,6 +529,8 @@ export function apply(ctx: any): () => void {
   const disposers: Array<() => void> = []
   // 会话列表"已 dream"小月牙：独立于 slots，直接启动（host 路由不可用时静默降级）。
   disposers.push(startDreamIconManager())
+  // 会话「…」菜单「跳过梦境整理记忆」toggle（v0.16.0）：同上独立启动，静默降级。
+  disposers.push(startDreamSkipManager())
   // CSS 常驻全局（不随组件卸载移除：折叠行的隐藏由 data 属性驱动，规则在即生效）。
   // 热重载时 dispose 不删 style，直接 append 会堆积多代规则——旧代规则（如假气泡
   // 时代的 `[data-meow-injection-prompt] > div` 背景）会以同等/更高特异性命中新 DOM
