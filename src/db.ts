@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { fillTemplate, keyedValue } from './prompt-loader.js'
+import { fillTemplate, getPromptLang, keyedValue } from './prompt-loader.js'
 
 export type Level = 'soul' | 'user' | 'project' | 'fact' | 'lesson' | 'topic' | 'rules'
 export type Status = 'active' | 'archived' | 'stale'
@@ -56,6 +56,12 @@ export function relativeTime(ms: number | null | undefined): string {
 /** 全局标记的历史真值（zh 语言包的写法）。语言包切换后老库里存的仍是它，永远认。 */
 export const GLOBAL_PROJECT_CANON = '全局'
 
+/** 语言 → 全局标记的进程级缓存。此值走 projectCovers/projectList，命中链路每条
+ *  用户消息都要按它过滤整库（几百条），逐条读文件解析会把热路径拖到 10ms 量级——
+ *  这一个键按语言缓存（切语言即失效）。代价：改 labels.md 的 project.global 需要
+ *  切一次语言或重启才生效；它是语义标记不是可随手改的文案，这个取舍是划算的。 */
+let markerCache: { lang: string; marker: string } | null = null
+
 /** 当前语言包的全局标记（labels.md 的 project.global；en = "global"）。
  *  这是模型按 prompt 写进 project 字段的字面值，所以必须随语言走——否则
  *  英文包里模型写的 "global" 会被当成一个叫 global 的项目：全局 rules 不再
@@ -63,17 +69,26 @@ export const GLOBAL_PROJECT_CANON = '全局'
  *  取不到（实例覆盖层的 labels.md 是老版本、缺键）时回退真值：全局判定是检索
  *  热路径的语义，不能因为一个文案文件过期就 throw 掉整条注入链路。 */
 export function globalProjectMarker(): string {
+  const lang = getPromptLang()
+  if (markerCache !== null && markerCache.lang === lang) return markerCache.marker
+  let marker: string
   try {
-    return lbl('project.global')
+    marker = lbl('project.global')
   } catch {
-    return GLOBAL_PROJECT_CANON
+    marker = GLOBAL_PROJECT_CANON
   }
+  markerCache = { lang, marker }
+  return marker
 }
 
-/** 是否全局标记（认真值 + 当前语言包写法：跨语言切换后新旧条目都要认）。 */
+/** 是否全局标记（认真值 + 当前语言包写法：跨语言切换后新旧条目都要认）。
+ *  容忍首尾空白与大小写：模型照 prompt 写字面值，英文里 "Global"/"global " 都会出现，
+ *  漏认一次就是一条本该全局的记忆退化成一个假项目——宁可宽。 */
 export function isGlobalProject(field: string | null): boolean {
   if (field === null) return false
-  return field === GLOBAL_PROJECT_CANON || field === globalProjectMarker()
+  const trimmed = field.trim()
+  if (trimmed === GLOBAL_PROJECT_CANON) return true
+  return trimmed.toLowerCase() === globalProjectMarker().toLowerCase()
 }
 
 /** project 字段 → 项目名列表（逗号分隔多值，兼容单值；全局标记/空 = 无具体项目）。 */

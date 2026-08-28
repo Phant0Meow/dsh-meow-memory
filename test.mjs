@@ -587,6 +587,10 @@ check('global marker: en pack still recognizes legacy 全局 rows', (() => {
   setPromptLang('en')
   try { return isGlobalProject('全局') && projectCovers('全局', 'dsh') && projectLabel('全局') === 'global' } finally { setPromptLang('zh') }
 })())
+check('global marker: tolerates case and whitespace', (() => {
+  setPromptLang('en')
+  try { return isGlobalProject('Global') && isGlobalProject(' global ') && !isGlobalProject('globals') } finally { setPromptLang('zh') }
+})())
 check('global marker: en global is not a project name', (() => {
   setPromptLang('en')
   try { return projectList('global').length === 0 && projectCovers('global', 'dsh') && projectLabel('global') === 'global' } finally { setPromptLang('zh') }
