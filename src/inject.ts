@@ -13,7 +13,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Doc } from './bm25.js'
 import { keywordHitScore, search, tokenize } from './bm25.js'
-import { projectCovers, projectLabel, relativeTime, type MemoryDb, type MemoryRow } from './db.js'
+import { isGlobalProject, projectCovers, projectLabel, relativeTime, type MemoryDb, type MemoryRow } from './db.js'
 import { fillTemplate, keyedValue } from './prompt-loader.js'
 
 export interface InjectOptions {
@@ -227,7 +227,7 @@ function hitQuery(
     ...db.list('rules', { status: 'active' }),
     ...db.list('topic', { status: 'active' }),
   ].filter((r) =>
-    (r.project === null || r.project === '全局' || (currentProject !== null && projectCovers(r.project, currentProject)))
+    (r.project === null || isGlobalProject(r.project) || (currentProject !== null && projectCovers(r.project, currentProject)))
     && r.source_session !== sessionId, // 本 session 建立的记忆在上下文里，不命中
   )
   if (hitRows.length === 0) return []

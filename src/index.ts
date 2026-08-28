@@ -770,7 +770,7 @@ function persistWindowIndex(): void {
 // re-export 供测试/调试/其他插件
 export { PLUGIN_SOURCE, REFLECT_MARKER }
 export { collectDreamStates } from './dream-signal.js'
-export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel } from './db.js'
+export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, isGlobalProject, globalProjectMarker, GLOBAL_PROJECT_CANON } from './db.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, readSeen, markSearched, markAccessed, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'

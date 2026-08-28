@@ -26,6 +26,9 @@ import {
   newId,
   projectCovers,
   projectLabel,
+  projectList,
+  isGlobalProject,
+  globalProjectMarker,
   collectDreamRounds,
   buildDreamMessage,
   windowNeedsDream,
@@ -572,6 +575,25 @@ check('update importance unbounded (no clamp)', up5.ok === true && db.findById(k
 check('projectCovers multi-value includes', projectCovers('dsh,femwa', 'femwa') === true && projectCovers('dsh,femwa', 'meow-eyes') === false)
 check('projectCovers global/null covers all', projectCovers('全局', 'dsh') === true && projectCovers(null, 'dsh') === true)
 check('projectLabel multi-value/global/unmarked', projectLabel('dsh,femwa') === 'dsh/femwa' && projectLabel('全局') === '全局' && projectLabel(null) === '未标记')
+
+// 全局标记随语言包（labels.md 的 project.global）：英文包里模型写的是 "global"
+check('global marker: zh pack', globalProjectMarker() === '全局' && isGlobalProject('全局') && !isGlobalProject('global'))
+check('global marker: en pack recognizes its own word', (() => {
+  setPromptLang('en')
+  try { return globalProjectMarker() === 'global' && isGlobalProject('global') } finally { setPromptLang('zh') }
+})())
+check('global marker: en pack still recognizes legacy 全局 rows', (() => {
+  setPromptLang('en')
+  try { return isGlobalProject('全局') && projectCovers('全局', 'dsh') && projectLabel('全局') === 'global' } finally { setPromptLang('zh') }
+})())
+check('global marker: en global is not a project name', (() => {
+  setPromptLang('en')
+  try { return projectList('global').length === 0 && projectCovers('global', 'dsh') && projectLabel('global') === 'global' } finally { setPromptLang('zh') }
+})())
+check('global marker: real project names untouched under en', (() => {
+  setPromptLang('en')
+  try { return projectList('dsh, femwa').join('|') === 'dsh|femwa' && !projectCovers('dsh', 'femwa') } finally { setPromptLang('zh') }
+})())
 // memory_update 刷新记忆时间戳（updated_at = 最后更新时间）
 const beforeTs = db.findById(kwId).row.updated_at
 await new Promise((r) => setTimeout(r, 5))

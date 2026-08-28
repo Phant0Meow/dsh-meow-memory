@@ -11,6 +11,7 @@
 - inject.guideSearchLine: Use memory_search when you need something (query is required, never search empty) and memory_read to read an entry in full.
 - inject.guideProjectLine: When a task involves a project, start with memory_project for the project-wide picture (pass the project name, it cannot be empty) — that is how you get a whole-project understanding.
 - inject.guideProjects: All of the user's projects: {list}
+- project.global: global
 - inject.hitHeader: Possibly relevant memories, for reference only:
 - dream.title: Memory consolidation task (dream)
 - dream.round.atomic: atomic memory entries

@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { keyedValue } from './prompt-loader.js'
 
 export type Level = 'soul' | 'user' | 'project' | 'fact' | 'lesson' | 'topic' | 'rules'
 export type Status = 'active' | 'archived' | 'stale'
@@ -49,21 +50,44 @@ export function relativeTime(ms: number | null | undefined): string {
   return new Date(ms).toISOString().slice(0, 10)
 }
 
-/** project 字段 → 项目名列表（逗号分隔多值，兼容单值；'全局'/空 = 无具体项目）。 */
+/** 全局标记的历史真值（zh 语言包的写法）。语言包切换后老库里存的仍是它，永远认。 */
+export const GLOBAL_PROJECT_CANON = '全局'
+
+/** 当前语言包的全局标记（labels.md 的 project.global；en = "global"）。
+ *  这是模型按 prompt 写进 project 字段的字面值，所以必须随语言走——否则
+ *  英文包里模型写的 "global" 会被当成一个叫 global 的项目：全局 rules 不再
+ *  注入、项目列表里凭空多出一个项目。
+ *  取不到（实例覆盖层的 labels.md 是老版本、缺键）时回退真值：全局判定是检索
+ *  热路径的语义，不能因为一个文案文件过期就 throw 掉整条注入链路。 */
+export function globalProjectMarker(): string {
+  try {
+    return keyedValue('labels', 'project.global')
+  } catch {
+    return GLOBAL_PROJECT_CANON
+  }
+}
+
+/** 是否全局标记（认真值 + 当前语言包写法：跨语言切换后新旧条目都要认）。 */
+export function isGlobalProject(field: string | null): boolean {
+  if (field === null) return false
+  return field === GLOBAL_PROJECT_CANON || field === globalProjectMarker()
+}
+
+/** project 字段 → 项目名列表（逗号分隔多值，兼容单值；全局标记/空 = 无具体项目）。 */
 export function projectList(field: string | null): string[] {
-  if (!field || field === '全局') return []
+  if (!field || isGlobalProject(field)) return []
   return field.split(',').map((s) => s.trim()).filter((s) => s.length > 0)
 }
 
-/** project 字段是否覆盖某项目名（多值包含判断；null/'全局' = 全局适用任何项目）。 */
+/** project 字段是否覆盖某项目名（多值包含判断；null/全局标记 = 全局适用任何项目）。 */
 export function projectCovers(field: string | null, name: string): boolean {
-  if (field === null || field === '全局') return true
+  if (field === null || isGlobalProject(field)) return true
   return projectList(field).includes(name)
 }
 
-/** project 字段的展示标签：'全局'=真全局；null/''=未标记；多值 join '/'（如 dsh/femwa）。 */
+/** project 字段的展示标签：全局标记=真全局（按当前语言显示）；null/''=未标记；多值 join '/'（如 dsh/femwa）。 */
 export function projectLabel(field: string | null): string {
-  if (field === '全局') return '全局'
+  if (isGlobalProject(field)) return globalProjectMarker()
   if (field === null || field === '') return '未标记'
   return projectList(field).join('/')
 }
@@ -370,7 +394,7 @@ export class MemoryDb {
   }
 
   /** 全部出现过（含已过时）的项目名：project/fact/lesson/topic/rules 五表的 project 列并集
-   *  （多值逗号分隔展开；"全局"是全局标记不是项目，排除）。供记忆导引列出"用户的所有 project"。 */
+   *  （多值逗号分隔展开；全局标记不是项目，projectList 已排除）。供记忆导引列出"用户的所有 project"。 */
   listProjectNames(): string[] {
     const names = new Set<string>()
     for (const level of ['project', 'fact', 'lesson', 'topic', 'rules'] as const) {

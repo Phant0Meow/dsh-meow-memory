@@ -11,6 +11,7 @@
 - inject.guideSearchLine: 需要时用 memory_search 检索（必须传 query 检索词，不能空查）、memory_read 读取。
 - inject.guideProjectLine: 当有项目相关任务时，应先用 memory_project 查项目全景（记得带上项目名，不能空参），这样可以对项目有整体理解。
 - inject.guideProjects: 用户的所有 project：{list}
+- project.global: 全局
 - inject.hitHeader: 可能相关的记忆，仅供参考：
 - dream.title: 记忆整理任务（dream）
 - dream.round.atomic: 原子记忆条目

@@ -10,7 +10,7 @@
 
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { findSimilar, search, tokenize, type RankedHit } from './bm25.js'
-import { getDb, getDreamWorkspace, memoryDbPath, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
+import { getDb, getDreamWorkspace, isGlobalProject, memoryDbPath, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
 import { keyedValue } from './prompt-loader.js'
 
 /** tools.md 键值取用（prompt 文案外置 v0.19.0）：缺键时 keyedValue throw。 */
@@ -160,7 +160,7 @@ function rememberTool(dir: string): ToolDefinition {
       const db = getDb(workspace, dir)
       const source_session = sessionIdOf(exec)
       // 锚定当前 project：带 project 参数的 memory 调用更新会话状态（命中检索用它）；"全局"与多项目（逗号分隔）不锚定。
-      if (project && project !== '全局' && !project.includes(',')) setCurrentProject(workspace, source_session ?? 'unknown', project, dir)
+      if (project && !isGlobalProject(project) && !project.includes(',')) setCurrentProject(workspace, source_session ?? 'unknown', project, dir)
 
       // 去重：同 level 找相似条目 → 合并更新
       const existing = db.list(level)
@@ -297,7 +297,7 @@ function searchTool(dir: string): ToolDefinition {
         : []
       const project = projectList.length > 0 ? projectList : null
       // 锚定当前 project（命中检索限定"全局+当前项目"）；单值才锚定，"全局"不锚定。
-      if (projectList.length === 1 && projectList[0] !== '全局') setCurrentProject(workspace, sessionId ?? 'unknown', projectList[0], dir)
+      if (projectList.length === 1 && !isGlobalProject(projectList[0])) setCurrentProject(workspace, sessionId ?? 'unknown', projectList[0], dir)
       const statusList = typeof parsed.status === 'string' && parsed.status.trim()
         ? parsed.status.split(',').map((s) => s.trim()).filter((s) => s.length > 0)
         : []
@@ -591,7 +591,7 @@ function updateTool(dir: string): ToolDefinition {
         const cleared = parsed.project.trim() === ''
         patch.project = cleared ? null : parsed.project.trim()
         // 锚定当前 project（命中检索限定"全局+当前项目"）；"全局"、清空归属、多项目（逗号分隔）不锚定。
-        if (!cleared && patch.project !== '全局' && !String(patch.project).includes(',')) setCurrentProject(workspace, sessionId ?? 'unknown', patch.project, dir)
+        if (!cleared && !isGlobalProject(String(patch.project)) && !String(patch.project).includes(',')) setCurrentProject(workspace, sessionId ?? 'unknown', patch.project, dir)
       }
       if (Array.isArray(parsed.keywords)) {
         // 空数组 = 不更新（用户拍板：防 AI 幻觉"不想改关键词"却传 [] 把关键词全清空）。
@@ -674,7 +674,7 @@ function projectTool(dir: string): ToolDefinition {
       const db = getDb(workspace, dir)
       // 锚定当前 project：用户话题切到某项目时 AI 调 memory_project → 命中检索立即跟进；"全局"与多项目不锚定。
       const sessionId = sessionIdOf(exec)
-      if (project !== '全局' && !project.includes(',')) setCurrentProject(workspace, sessionId ?? 'unknown', project, dir)
+      if (!isGlobalProject(project) && !project.includes(',')) setCurrentProject(workspace, sessionId ?? 'unknown', project, dir)
       const rows = db.list('project', { project }).filter((r) => r.project === project)
       const active = rows.filter((r) => r.status === 'active')
       // todo 已完成：stale 且 updated_at 非空，按 updated_at 取最近 5 条（展示仍按旧→新）。
