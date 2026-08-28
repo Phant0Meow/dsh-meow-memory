@@ -1,16 +1,14 @@
 /**
  * meow-memory v2 — 检索层。
  *
- * 分词（语言分支 v0.19.0）：zh = 字符 bigram（中文稳定、零依赖）+ 英文/数字整词；
- * 其他语言 = ASCII 整词基线（stemming 扩展点见 prompts/README.md），语言随 promptLang。
+ * 分词（类别路由 v0.20.0，语言无关）：CJK（汉字+假名）连续段相邻 bigram + Unicode
+ * 字母/数字（\p{L}\p{N}）整词；NFKC 归一化；标点/符号/emoji 丢弃。stemming 扩展点见 prompts/README.md。
  * 打分：标准 BM25 × 艾宾浩斯近期权重；importance≥3 或超级匹配（≥0.85×本轮
  *       最高原始分）时豁免衰减。
  * 偏离信号：turn 文本向量 vs 各 topic 质心（title+goal+content+keywords 词频
  *       向量）的余弦相似度；top1 相似度过低 → "疑似新话题"提示。topic 数 < 3
  *       （冷启动）不提示。信号只提醒不拍板，归属判定由模型用目标句测试完成。
  */
-
-import { getPromptLang } from './prompt-loader.js'
 
 export interface Doc {
   id: string
@@ -24,41 +22,51 @@ export interface Doc {
   updated_at: number
 }
 
-const HAN = /[\u3400-\u9fff]/ // CJK 统一表意文字（zh 分支专用）
-const ASCII = /[a-zA-Z0-9]+/g
+// CJK 类：汉字（\p{Script=Han} 覆盖基本区+Ext A~I）+ 假名 + 日文词内符号（々 叠字 / ー
+// 长音符——script=Common，但必须随 CJK run，"人々/タワー"才能整体成词）
+const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\u3005\u30fc]/u
+// 字母/数字类：é ü ñ、西里尔、希腊、谚文、全角英数（NFKC 后）……一切语言的字母数字
+const WORD = /[\p{L}\p{N}]/u
 
-/** 切词（语言分支，v0.19.0）：
- * - promptLang === 'zh'（默认）：中文相邻 bigram（单字不成词）+ 英文/数字整词——零依赖中文适配；
- * - 其他语言：ASCII 整词基线——词形归一化/stemming 是各语言包贡献者的扩展点
- *   （就在本函数的通用路径上，见 prompts/README.md）。
- * 语言来自 promptLang config（getPromptLang 进程级动态读取，切换后下一次检索即生效）；
- * 打分本体（BM25/艾宾浩斯/余弦）语言无关，不分支。 */
+type CharClass = 'cjk' | 'word' | 'skip'
+
+/** 单字符分类：CJK → bigram 路径；字母/数字 → 整词路径；其余（标点/符号/emoji）→ 丢弃。 */
+function classify(cp: string): CharClass {
+  if (CJK.test(cp)) return 'cjk'
+  if (WORD.test(cp)) return 'word'
+  return 'skip'
+}
+
+/** 切词（类别路由，v0.20.0，语言无关——promptLang 不再影响分词）：
+ * - CJK 类（汉字+假名）：连续段相邻 bigram——中文稳定零依赖，日文 n-gram 基线；
+ *   run<2 单字不成词丢弃防噪音；汉字-假名交界不断 run，"行く/食べる"自然成词；
+ * - 字母/数字类（\p{L}\p{N}）：连续段整词 + 小写化（café/привет/한국어/全角英数…）；
+ * - 其余（标点/空白/符号/emoji）：跳过——信息量为零，不污染 IDF。
+ * 文本先 NFKC 归一化（全角ＢＭ２５→bm25、半角片假名→全角）；Array.from 按 code point
+ * 迭代，emoji/Ext B 汉字等 surrogate pair 不切半。词形归一化/stemming 仍是语言包
+ * 贡献者的扩展点（见 prompts/README.md）；打分本体（BM25/艾宾浩斯/余弦）语言无关。 */
 export function tokenize(text: string): string[] {
-  const zh = getPromptLang() === 'zh'
+  const cps = Array.from(text.normalize('NFKC'))
   const out: string[] = []
   let i = 0
-  const n = text.length
-  while (i < n) {
-    const ch = text[i]
-    if (zh && HAN.test(ch)) {
-      // 连续汉字 → bigram（单字不成词，避免噪音）
-      let j = i
-      while (j < n && HAN.test(text[j])) j++
-      if (j - i >= 2) {
-        for (let k = i; k + 1 < j; k++) out.push(text.slice(k, k + 2))
-      }
-      i = j
-    } else if (/[a-zA-Z0-9]/.test(ch)) {
-      const m = text.slice(i).match(ASCII)
-      if (m) {
-        out.push(m[0].toLowerCase())
-        i += m[0].length
-      } else {
-        i++
+  while (i < cps.length) {
+    const cls = classify(cps[i])
+    if (cls === 'skip') {
+      i++
+      continue
+    }
+    let j = i + 1
+    while (j < cps.length && classify(cps[j]) === cls) j++
+    const run = cps.slice(i, j)
+    if (cls === 'cjk') {
+      // 连续 CJK → 相邻 bigram（单字不成词，避免噪音）
+      if (run.length >= 2) {
+        for (let k = 0; k + 1 < run.length; k++) out.push(run[k] + run[k + 1])
       }
     } else {
-      i++
+      out.push(run.join('').toLowerCase())
     }
+    i = j
   }
   return out
 }

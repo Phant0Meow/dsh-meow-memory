@@ -746,17 +746,27 @@ check('prompt loader: reflect slot requires projectList param', (() => { try { r
 check('prompt loader: reflect fills projectList', resolveSlotText('reflect', { projectList: 'X / Y' }).includes('project：X / Y'))
 check('prompt loader: dream-atomic carries parallel-call note', resolveSlotText('dream-atomic', { list: '' }).includes('一轮可调用多个工具'))
 
-// promptLang（v0.19.0）：进程级语言状态 + BM25 分词语言分支
+// promptLang（v0.19.0）：进程级语言状态；v0.20.0 起 BM25 分词语言无关（类别路由）
 import { tokenize } from './lib/index.js'
-check('prompt loader: setPromptLang switches tokenize to word baseline', (() => {
+check('prompt loader: tokenize language-independent (cjk bigram under en too)', (() => {
   setPromptLang('en')
-  try { return JSON.stringify(tokenize('hello 世界 foo_bar 2024')) === JSON.stringify(['hello', 'foo', 'bar', '2024']) } finally { setPromptLang('zh') }
+  try { return JSON.stringify(tokenize('hello 世界 foo_bar 2024')) === JSON.stringify(['hello', '世界', 'foo', 'bar', '2024']) } finally { setPromptLang('zh') }
 })())
 check('prompt loader: zh tokenize keeps bigram', (() => {
   setPromptLang('zh')
   try { return JSON.stringify(tokenize('世界 hello')) === JSON.stringify(['世界', 'hello']) } finally { setPromptLang('zh') }
 })())
 check('prompt loader: getPromptLang defaults zh', getPromptLang() === 'zh')
+// v0.20.0 分词（类别路由）：CJK（汉字+假名）bigram / \p{L}\p{N} 整词 / 符号丢弃 / NFKC / surrogate 安全
+check('tokenize: mixed zh+latin, single han dropped', JSON.stringify(tokenize('用BM25打分')) === JSON.stringify(['bm25', '打分']))
+check('tokenize: han+kana cross-class verb', JSON.stringify(tokenize('行く')) === JSON.stringify(['行く']))
+check('tokenize: katakana run keeps prolonged mark', JSON.stringify(tokenize('東京タワー')) === JSON.stringify(['東京', '京タ', 'タワ', 'ワー']))
+check('tokenize: accented latin whole words', JSON.stringify(tokenize('café naïve')) === JSON.stringify(['café', 'naïve']))
+check('tokenize: cyrillic + hangul whole words', JSON.stringify(tokenize('привет 한국어')) === JSON.stringify(['привет', '한국어']))
+check('tokenize: NFKC fullwidth latin/digits', JSON.stringify(tokenize('ＢＭ２５')) === JSON.stringify(['bm25']))
+check('tokenize: NFKC halfwidth katakana voiced', JSON.stringify(tokenize('ﾃﾞｰﾓ')) === JSON.stringify(['デー', 'ーモ']))
+check('tokenize: ext-B surrogate-pair han bigram', JSON.stringify(tokenize('𠀀𠀁')) === JSON.stringify(['𠀀𠀁']))
+check('tokenize: emoji/punct dropped, comma/space split words', JSON.stringify(tokenize('好👍！hello, world')) === JSON.stringify(['hello', 'world']))
 
 const events = {
   userMsg: (text, source = { kind: 'user' }) => ({ type: 'user/message', data: { content: [{ type: 'text', text }], source } }),

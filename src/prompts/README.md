@@ -46,10 +46,10 @@ src/prompts/
 3. Self-check until green: `npm run check-lang -- <your-lang>`
 4. Open a PR 🎉
 
-## One more thing: the tokenizer / 分词器也是语言分支
+## One more thing: the tokenizer / 分词器（语言无关）
 
-`src/bm25.ts` → `tokenize()` branches on the same language: `zh` uses character bigrams (Chinese has no spaces); **every other language currently falls back to an ASCII word baseline** with no normalization. If your language needs stemming / lemmatization / its own segmentation, that function is yours to extend — PRs welcome. Keyword recall depends on query and memory entries being tokenized the same way, so this matters as much as the translations themselves.
+`src/bm25.ts` → `tokenize()` is **language-independent since v0.20.0** (category routing): CJK runs (Han + kana) become character bigrams; any Unicode letters/digits (`\p{L}\p{N}`) form lowercased whole words; punctuation/symbols/emoji are dropped; text is NFKC-normalized (fullwidth → halfwidth, halfwidth katakana → fullwidth). If your language needs stemming / lemmatization / smarter segmentation, that function is yours to extend — PRs welcome. Keyword recall depends on query and memory entries being tokenized the same way, so this matters as much as the translations themselves.
 
 ## Config / 用户配置
 
-`promptLang` (plugin config, default `zh`) selects the directory. **Set it on first use** — it decides the language of injected prompts, tool descriptions, the memory entries the model writes, **and** the BM25 tokenizer; a mismatch between entry language and tokenizer kills keyword recall.
+`promptLang` (plugin config, default `zh`) selects the directory. **Set it on first use** — it decides the language of injected prompts, tool descriptions and the memory entries the model writes. (Since v0.20.0 the BM25 tokenizer is language-independent: entries stay searchable regardless of `promptLang`.)
