@@ -48,7 +48,17 @@ src/prompts/
 
 ## One more thing: the tokenizer / 分词器也是语言分支
 
-`src/bm25.ts` → `tokenize()` branches on the same language: `zh` uses character bigrams (Chinese has no spaces); **every other language currently falls back to an ASCII word baseline** with no normalization. If your language needs stemming / lemmatization / its own segmentation, that function is yours to extend — PRs welcome. Keyword recall depends on query and memory entries being tokenized the same way, so this matters as much as the translations themselves.
+`src/bm25.ts` → `tokenize()` branches on the same language (on its base code, so `en-US` → `en`, `zh-CN` → `zh`):
+
+| lang | tokenizer |
+|---|---|
+| `zh` | character bigrams (Chinese has no spaces) + whole ASCII words |
+| `en` | whole words, lowercased → stopwords dropped → Porter stemmer (`stemEn`) |
+| anything else | **ASCII word baseline**, no normalization |
+
+If your language needs stemming / lemmatization / its own segmentation, that function is yours to extend — PRs welcome. Keyword recall depends on query and memory entries being tokenized the same way, so this matters as much as the translations themselves.
+
+Normalization lives **only** in `tokenize()`, so both sides of a match go through it and stay consistent; keywords are still stored verbatim, they are only normalized at match time. Anything language-specific you add belongs there too.
 
 ## Config / 用户配置
 

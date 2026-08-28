@@ -747,16 +747,37 @@ check('prompt loader: reflect fills projectList', resolveSlotText('reflect', { p
 check('prompt loader: dream-atomic carries parallel-call note', resolveSlotText('dream-atomic', { list: '' }).includes('一轮可调用多个工具'))
 
 // promptLang（v0.19.0）：进程级语言状态 + BM25 分词语言分支
-import { tokenize } from './lib/index.js'
-check('prompt loader: setPromptLang switches tokenize to word baseline', (() => {
-  setPromptLang('en')
-  try { return JSON.stringify(tokenize('hello 世界 foo_bar 2024')) === JSON.stringify(['hello', 'foo', 'bar', '2024']) } finally { setPromptLang('zh') }
-})())
-check('prompt loader: zh tokenize keeps bigram', (() => {
-  setPromptLang('zh')
-  try { return JSON.stringify(tokenize('世界 hello')) === JSON.stringify(['世界', 'hello']) } finally { setPromptLang('zh') }
-})())
+import { tokenize, stemEn, search } from './lib/index.js'
+const withLang = (lang, fn) => { setPromptLang(lang); try { return fn() } finally { setPromptLang('zh') } }
+const toks = (lang, text) => withLang(lang, () => JSON.stringify(tokenize(text)))
+check('prompt loader: setPromptLang switches tokenize to word baseline', toks('ja', 'hello 世界 foo_bar 2024') === JSON.stringify(['hello', 'foo', 'bar', '2024']))
+check('prompt loader: zh tokenize keeps bigram', toks('zh', '世界 hello') === JSON.stringify(['世界', 'hello']))
 check('prompt loader: getPromptLang defaults zh', getPromptLang() === 'zh')
+
+// en 分词（语言包贡献）：停用词过滤 + Porter 词干还原
+check('en tokenize: stopwords dropped', toks('en', 'the quick brown fox') === JSON.stringify(['quick', 'brown', 'fox']))
+check('en tokenize: plural and singular collapse', toks('en', 'caches') === toks('en', 'cache'))
+check('en tokenize: inflection collapses', toks('en', 'running') === toks('en', 'run'))
+check('en tokenize: apostrophe fragment dropped', toks('en', "the user's middle name") === JSON.stringify(['user', 'middl', 'name']))
+check('en tokenize: digits and mixed tokens untouched', toks('en', 'sha256 v0.19.0 2024') === JSON.stringify(['sha256', 'v0', '19', '0', '2024']))
+check('en tokenize: all-stopword text yields nothing', toks('en', 'is it the same as that') === '[]')
+check('en tokenize: region suffix maps to base language', toks('en-US', 'caches') === toks('en', 'cache'))
+check('zh tokenize: region suffix maps to base language', toks('zh-CN', '世界') === JSON.stringify(['世界']))
+check('en tokenize: baseline languages keep raw words', toks('ja', 'the caches') === JSON.stringify(['the', 'caches']))
+check('stemEn: Porter canonical cases', [
+  ['caresses', 'caress'], ['ponies', 'poni'], ['cats', 'cat'], ['agreed', 'agre'], ['motoring', 'motor'],
+  ['hopping', 'hop'], ['filing', 'file'], ['happy', 'happi'], ['sky', 'sky'], ['relational', 'relat'],
+  ['vietnamization', 'vietnam'], ['hopefulness', 'hope'], ['electrical', 'electr'], ['adjustment', 'adjust'],
+  ['adoption', 'adopt'], ['generalizations', 'gener'], ['oscillators', 'oscil'], ['rate', 'rate'], ['roll', 'roll'],
+].every(([w, want]) => stemEn(w) === want))
+check('en retrieval: inflected query still hits the stored entry', withLang('en', () => {
+  const docs = [
+    { id: 'a', level: 'fact', title: null, content: 'BM25 keyword retrieval degrades when memories are stored in another language', keywords: ['retrieval', 'tokenizer', 'language'], importance: 1, created_at: 0, updated_at: Date.now() },
+    { id: 'b', level: 'fact', title: null, content: 'The espresso machine is descaled monthly', keywords: ['espresso', 'machine', 'descale'], importance: 1, created_at: 0, updated_at: Date.now() },
+  ]
+  const hits = search('do tokenizers matter?', docs, { k: 2 })
+  return hits.length === 1 && hits[0].id === 'a'
+}))
 
 const events = {
   userMsg: (text, source = { kind: 'user' }) => ({ type: 'user/message', data: { content: [{ type: 'text', text }], source } }),

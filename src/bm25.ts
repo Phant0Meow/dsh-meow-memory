@@ -2,6 +2,7 @@
  * meow-memory v2 — 检索层。
  *
  * 分词（语言分支 v0.19.0）：zh = 字符 bigram（中文稳定、零依赖）+ 英文/数字整词；
+ * en = 整词 + 停用词过滤 + Porter 词干还原（英语有屈折变化，见下方 EN 段注释）；
  * 其他语言 = ASCII 整词基线（stemming 扩展点见 prompts/README.md），语言随 promptLang。
  * 打分：标准 BM25 × 艾宾浩斯近期权重；importance≥3 或超级匹配（≥0.85×本轮
  *       最高原始分）时豁免衰减。
@@ -29,12 +30,15 @@ const ASCII = /[a-zA-Z0-9]+/g
 
 /** 切词（语言分支，v0.19.0）：
  * - promptLang === 'zh'（默认）：中文相邻 bigram（单字不成词）+ 英文/数字整词——零依赖中文适配；
+ * - promptLang === 'en'：ASCII 整词 + 停用词过滤 + Porter 词干还原（英语屈折，见 stemEn）；
  * - 其他语言：ASCII 整词基线——词形归一化/stemming 是各语言包贡献者的扩展点
  *   （就在本函数的通用路径上，见 prompts/README.md）。
  * 语言来自 promptLang config（getPromptLang 进程级动态读取，切换后下一次检索即生效）；
+ * 取主语言码（'en-US' → 'en'，'zh-CN' → 'zh'），地区后缀不影响分词分支；
  * 打分本体（BM25/艾宾浩斯/余弦）语言无关，不分支。 */
 export function tokenize(text: string): string[] {
-  const zh = getPromptLang() === 'zh'
+  const lang = getPromptLang().toLowerCase().split(/[-_]/)[0]
+  const zh = lang === 'zh'
   const out: string[] = []
   let i = 0
   const n = text.length
@@ -60,7 +64,131 @@ export function tokenize(text: string): string[] {
       i++
     }
   }
+  return lang === 'en' ? normalizeEn(out) : out
+}
+
+// ── 英语归一化（en 分支） ────────────────────────────────────────────────────
+//
+// 检索命中要求 query 与记忆条目走同一套分词，所以归一化只做在 tokenize 里，
+// 写入侧与检索侧天然一致（关键词原文照旧原样存库，只有匹配时才归一）。
+//
+// 两步，都是英语特有、中文不需要的：
+// 1. 停用词过滤：英语功能词（the/of/is…）在每条记忆里都出现，BM25 的 idf 已经压得很低，
+//    但命中链路的覆盖率分母（keywordHitScore 的 coverage）会被它们稀释，且撇号切分
+//    （"user's" → user + s）会漏出 s/t/ll 这类碎片，一并在此丢弃。
+// 2. Porter 词干还原：英语有屈折变化，caches/caching/cached 必须归到同一词干，
+//    否则用户 prompt 写复数、记忆条目写单数就永远命中不了（中文无屈折，故 zh 分支不做）。
+//    含数字的 token（2024 / v0 / sha256）跳过——词干规则只对纯字母词有意义。
+
+/** 英语停用词（含撇号切分碎片 s/t/d/ll/ve/re/m）。功能词不承载检索意义。 */
+const EN_STOPWORDS = new Set<string>([
+  'a', 'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and', 'any', 'are', 'as', 'at',
+  'be', 'because', 'been', 'before', 'being', 'below', 'between', 'both', 'but', 'by',
+  'can', 'cannot', 'could', 'd', 'did', 'do', 'does', 'doing', 'don', 'down', 'during',
+  'each', 'few', 'for', 'from', 'further', 'had', 'has', 'have', 'having', 'he', 'her', 'here', 'hers',
+  'herself', 'him', 'himself', 'his', 'how', 'i', 'if', 'in', 'into', 'is', 'it', 'its', 'itself',
+  'just', 'll', 'm', 'me', 'more', 'most', 'my', 'myself', 'no', 'nor', 'not', 'now',
+  'of', 'off', 'on', 'once', 'only', 'or', 'other', 'ought', 'our', 'ours', 'ourselves', 'out', 'over', 'own',
+  're', 's', 'same', 'she', 'should', 'so', 'some', 'such', 't', 'than', 'that', 'the', 'their', 'theirs',
+  'them', 'themselves', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'to', 'too',
+  'under', 'until', 'up', 've', 'very', 'was', 'we', 'were', 'what', 'when', 'where', 'which', 'while',
+  'who', 'whom', 'why', 'will', 'with', 'would', 'you', 'your', 'yours', 'yourself', 'yourselves',
+])
+
+/** 停用词丢弃 + 词干还原（纯字母词才还原；数字/混合 token 原样保留）。 */
+function normalizeEn(tokens: string[]): string[] {
+  const out: string[] = []
+  for (const t of tokens) {
+    if (EN_STOPWORDS.has(t)) continue
+    out.push(/^[a-z]+$/.test(t) ? stemEn(t) : t)
+  }
   return out
+}
+
+// Porter stemmer（Porter 1980 原始算法，零依赖移植）。词干只用于匹配，不入库、不展示，
+// 所以"cach"这类非词形态无所谓——两侧同函数即可命中。
+const PORTER_STEP2: Record<string, string> = {
+  ational: 'ate', tional: 'tion', enci: 'ence', anci: 'ance', izer: 'ize', bli: 'ble',
+  alli: 'al', entli: 'ent', eli: 'e', ousli: 'ous', ization: 'ize', ation: 'ate',
+  ator: 'ate', alism: 'al', iveness: 'ive', fulness: 'ful', ousness: 'ous', aliti: 'al',
+  iviti: 'ive', biliti: 'ble', logi: 'log',
+}
+const PORTER_STEP3: Record<string, string> = {
+  icate: 'ic', ative: '', alize: 'al', iciti: 'ic', ical: 'ic', ful: '', ness: '',
+}
+
+const CONS = '[^aeiou]'
+const VOW = '[aeiouy]'
+const CONS_SEQ = `${CONS}[^aeiouy]*`
+const VOW_SEQ = `${VOW}[aeiou]*`
+const MGR0 = new RegExp(`^(${CONS_SEQ})?${VOW_SEQ}${CONS_SEQ}`)
+const MEQ1 = new RegExp(`^(${CONS_SEQ})?${VOW_SEQ}${CONS_SEQ}(${VOW_SEQ})?$`)
+const MGR1 = new RegExp(`^(${CONS_SEQ})?${VOW_SEQ}${CONS_SEQ}${VOW_SEQ}${CONS_SEQ}`)
+const HAS_VOWEL = new RegExp(`^(${CONS_SEQ})?${VOW}`)
+
+/** Porter 词干还原（小写纯字母词；长度 ≤2 原样返回）。 */
+export function stemEn(word: string): string {
+  let w = word
+  if (w.length <= 2) return w
+
+  // Step 1a — 复数
+  if (/(ss|i)es$/.test(w)) w = w.replace(/(ss|i)es$/, '$1')
+  else if (/([^s])s$/.test(w)) w = w.replace(/([^s])s$/, '$1')
+
+  // Step 1b — 过去式/进行时
+  if (/eed$/.test(w)) {
+    const stem = w.slice(0, -3)
+    if (MGR0.test(stem)) w = w.slice(0, -1)
+  } else if (/(ed|ing)$/.test(w)) {
+    const stem = w.replace(/(ed|ing)$/, '')
+    if (HAS_VOWEL.test(stem)) {
+      w = stem
+      if (/(at|bl|iz)$/.test(w)) w += 'e'
+      else if (/([^aeiouylsz])\1$/.test(w)) w = w.slice(0, -1) // 双写辅音还原
+      else if (new RegExp(`^${CONS_SEQ}${VOW}[^aeiouwxy]$`).test(w)) w += 'e' // *o 条件
+    }
+  }
+
+  // Step 1c — y → i
+  if (/y$/.test(w)) {
+    const stem = w.slice(0, -1)
+    if (HAS_VOWEL.test(stem)) w = `${stem}i`
+  }
+
+  // Step 2 / 3 — 派生后缀归并
+  for (const [suffix, repl] of Object.entries(PORTER_STEP2)) {
+    if (w.endsWith(suffix)) {
+      const stem = w.slice(0, -suffix.length)
+      if (MGR0.test(stem)) w = stem + repl
+      break
+    }
+  }
+  for (const [suffix, repl] of Object.entries(PORTER_STEP3)) {
+    if (w.endsWith(suffix)) {
+      const stem = w.slice(0, -suffix.length)
+      if (MGR0.test(stem)) w = stem + repl
+      break
+    }
+  }
+
+  // Step 4 — 剥离剩余派生后缀（m>1）
+  const step4 = /(al|ance|ence|er|ic|able|ible|ant|ement|ment|ent|ou|ism|ate|iti|ous|ive|ize)$/
+  if (step4.test(w)) {
+    const stem = w.replace(step4, '')
+    if (MGR1.test(stem)) w = stem
+  } else if (/(s|t)(ion)$/.test(w)) {
+    const stem = w.replace(/(s|t)(ion)$/, '$1')
+    if (MGR1.test(stem)) w = stem
+  }
+
+  // Step 5 — 收尾 e / 双写 l
+  if (/e$/.test(w)) {
+    const stem = w.slice(0, -1)
+    if (MGR1.test(stem) || (MEQ1.test(stem) && !new RegExp(`^${CONS_SEQ}${VOW}[^aeiouwxy]$`).test(stem))) w = stem
+  }
+  if (/ll$/.test(w) && MGR1.test(w)) w = w.slice(0, -1)
+
+  return w
 }
 
 function docText(d: Doc): string {

@@ -774,6 +774,6 @@ export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBC
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, readSeen, markSearched, markAccessed, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
-export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
+export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition } from './dream.js'
