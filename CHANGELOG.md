@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.19.0 (2026-08-28)
+
+### prompt 文案外置 + 语言开关（海外用户 issue 驱动）
+- **prompt 文案全部外置为数据文件**：`src/prompts/zh/` 9 个槽位（system-guide / reflect / dream-header / dream-atomic / dream-topic / dream-project-summary / welcome-guide / labels 23 键 / tools 43 键），运行时读取——改文案 = 改文件，下一轮反思/dream 即生效，无需改代码；新增 `prompt-loader`（逐槽位三级 fallback：实例覆盖 `homedir/.dsh-meow/prompts/<lang>/` → 内置语言包 → 内置 zh；占位符填充用 replaceAll 函数形式防 `$` 序列陷阱）。
+- **新增 config `promptLang`**（默认 zh；README 强调首次使用必须显式配置——记忆条目语言必须与 BM25 分词器一致，否则检索命中率崩）；传递链路归零：`setPromptLang` 进程级设一次，全部调用点签名零改动。
+- **BM25 分词语言分支**：zh = 汉字相邻 bigram（原逻辑不变），其他语言 = ASCII 整词基线——词形归一化/stemming 留给语言包贡献者（`src/prompts/README.md` 有扩展点指引）。
+- **首次欢迎引导**：promptLang 未配置时，插件生效后第一条真实用户消息注入 `welcome-guide` 设置任务——AI 只依据用户消息判断语言（防呆：明确禁止以 system prompt/工具描述/文件语言为依据，不确定必须问用户）→ 改 patch → 热重载 → 告知用户；记账走 sessions accessed 伪 id `__welcomeGuide__`（不被压缩释放清除，每会话至多一次），显式配置后永久短路。
+- **贡献者基建**：`npm run check-lang -- <lang>`（槽位/键集合/占位符与 zh 真源对齐自查）+ `src/prompts/README.md` 英文贡献指南（含语言包贡献流程与 tokenize 扩展点）。
+- 打包：npm files 白名单新增 `lib/prompts/**`。
+
+## v0.18.0 (2026-08-26)
+
+### 会话列表「跳过」图标：月牙+斜杠（用户拍板）
+- 左侧会话列表状态槽位新增第三态：被「跳过梦境整理记忆」的会话显示**静音灰「月牙+斜杠」**——macOS 勿扰图标同款：实心月牙被斜杠穿过并留缝（SVG mask 挖缝，单色下依然可读；每次生成随机 mask id，会话列表多图标并存互不污染）。取消跳过后自动回落回原淡黄小月牙。
+- 三态优先级：**呼吸灯（dream 进行中）> 跳过 > 已整理月牙**——进行中的 dream 不打断是既有语义，跳过只压过"已整理"的停驻月亮。
+- 数据零 host 改动：dream 图标管理器自己 GET `/meow-memory/skip-dreams` 对账 + 消费既有 SSE 的 `skip`/`unskip` 事件（此前这两个事件对它是"未知状态"会误删月亮，现改为独立分支处理）；新增 `mergeIconStates` 纯函数合并两路状态。
+- 「…」菜单里跳过项的小图标随状态翻转：菜单项是动作按钮，图标画「点击后将变成的状态」——「跳过梦境整理记忆」配月牙+斜杠（点下去就静音）、「取消跳过」配实心月牙（点下去就恢复），与标签动词呼应（首版画当前状态被用户实测纠正）。
+- **注入时灵时不灵根因修复（用户实测驱动）**：行选择器原来用 `[class$="_sessionRow"]` 结尾匹配——dsh 行类按 clsx 顺序拼接（`sessionRow, selected, menuOpen…`），当前选中会话常驻 `_selected` 尾随类，结尾匹配必然失配 → 对选中会话点「…」永远捕获不到 session id、注入被跳过。改为子串匹配 `[class*=`；注入身份升级为确定性锚点：菜单打开期间 dsh Rows 给行挂 `menuOpen` 类，直接读该行 fiber key 得 id（pointerdown 时间窗降级为兜底）；自愈从「仅标记过的菜单」扩展为「凡有菜单开着就收敛」（防抖），迟挂载/模板晚到/项被冲掉统一覆盖；portal 容器复用时发现绑定别会话的残留注入项即拆掉重注。dream 图标行扫描选择器同款修复（选中行不再暂时丢月亮）。
+- 新增测试：mergeIconStates 三态优先级 ×4 + skipped 图标放置/翻转/内联/移除 ×4 + SVG mask 唯一性 ×1 + 菜单图标方向 ×3 + 选择器语义/menuOpen 锚点/注入幂等与防串味 ×13。
+
 ## v0.17.0 (2026-08-25)
 
 ### dream 第一轮清单增强：查阅留痕 + rules 防 churn（隔壁窗口实测驱动）

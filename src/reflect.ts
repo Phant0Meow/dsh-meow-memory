@@ -11,6 +11,7 @@
 
 import { createUserMessage, type MessageSource } from '@deepseek-ai/dsh-llm'
 import { getDb } from './db.js'
+import { resolveSlotText } from './prompt-loader.js'
 
 const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'meow-memory' }
 
@@ -98,45 +99,17 @@ export function consecutiveToolSteps(events: readonly unknown[]): number {
   return best
 }
 
-function buildBasePrompt(projectNames: string[]): string {
-  const projectList = projectNames.length > 0 ? projectNames.join(' / ') : '（暂无）'
-  return [
-    '记忆反思任务',
-    '请回顾你的聊天历史。',
-    '',
-    '【一】从上次【记忆反思任务】，到现在，中间这么多轮次里，有值得跨会话记住的新记忆吗？使用memory_remember添加新记忆条目。',
-    `1. 当前记忆库中已有的 project：${projectList}。你认为是否有新的 project 需要添加？ → 请添加新 project 的记忆。`,
-    '2. 你是否记错、说错、想错了什么、是否被用户纠正过？',
-    '- 被用户纠正的一定要记，加入你认为合适的记忆层级（如project，rule，fact等）。',
-    '- 如果是写入 lesson层级，需保留 corrected 标记；',
-    '3. 如存在以下情况，你可以酌情添加记忆条目：',
-    '- 用户是否提出了交流/工作/代码偏好 → 全局偏好记录进user；项目特定偏好进 project。',
-    '- 用户是否提出了某些设计原则/行为准则？ → 记录进rules。',
-    '- 有没有用户介绍项目设计思路、框架、决策理由时说的话？ → 保留用户原话，记录进正确的层级。',
-    '- 有没有重要的事实、结论或决定？',
-    '- 你是否在完成任务的过程中踩过坑，有没有多次尝试才成功的时候？如果你认为值得记录，可作为lesson记录。',
-    '',
-    '【二】回看上下文中注入的所有记忆，结合你的最新进展，请你判断，是否有需要更新的记忆？',
-    '1. 是否有哪条记忆，你现在非常确定它的信息已经过时了（比如由用户亲口否定或改变主意）？ → 你应该及时更新它的内容，不要放着不管。',
-    '2. 你是否发现有哪条记忆信息是错的，甚至误导了你？ → 更新为正确信息，或者标 archived（视为 delete）；',
-    '3. 是否有哪些todo或topic已被完成？ → 标 stale（视为 done）；',
-    '4. 你是否发现有那条记忆注入时机非常不合理，和当前任务一点关系也没有？→ 这是因为关键词不准，更新它的关键词；',
-    '',
-    '【三】写记忆时的通用要求',
-    '1. 写记忆的规则见系统提示词。你应该把记忆归类在正确的level和标签之下。',
-    '2. 强调一下关键词拟定标准:',
-    '- 提取 8-13 个关键词供检索',
-    '- 反向思考："在用户prompt提及哪些词的时候，你希望这条记忆能被检索到？"',
-    '- 非项目名，针对记忆本身的细节。',
-    '- 优先提取核心实体、语义中心、专有名词。',
-    '3. 如果你认为没有什么重要信息，不需要添加和更新记忆，直接回复"无需记忆"即可，不要调用任何工具。',
-  ].join('\n')
-}
-
 export function buildReflectMessage(workspace: string, turnText: string, dir = '.dsh-meow'): ReturnType<typeof createUserMessage> {
   const db = getDb(workspace, dir)
-  const text = `${REFLECT_MARKER} ${buildBasePrompt(db.listProjectNames())}`
+  // 文案外置（v0.19.0）：prompts/zh/reflect.md，{projectList} 占位符填充；改文件下一次反思即生效。
+  const prompt = resolveSlotText('reflect', { projectList: projectNamesText(db.listProjectNames()) })
+  const text = `${REFLECT_MARKER} ${prompt}`
   return createUserMessage({ content: [{ type: 'text', text }], source: PLUGIN_SOURCE })
+}
+
+/** project 清单展示（原 buildBasePrompt 逻辑：空清单显示占位说明）。 */
+function projectNamesText(projectNames: string[]): string {
+  return projectNames.length > 0 ? projectNames.join(' / ') : '（暂无）'
 }
 
 export { PLUGIN_SOURCE }

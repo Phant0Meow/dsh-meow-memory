@@ -15,7 +15,7 @@ const { outputFiles } = await build({
 })
 const code = new TextDecoder().decode(outputFiles[0].contents)
 const modUrl = 'data:text/javascript;base64,' + Buffer.from(code).toString('base64')
-const { skipLabel, captureSessionIdFromTarget, retitleLeaf, SKIP_ITEM_ATTR, SKIP_MENU_ATTR } = await import(modUrl)
+const { skipLabel, captureSessionIdFromTarget, retitleLeaf, setMenuIcon, injectSkipItem, resolveMenuSessionId, SESSION_ROW_SEL, MENU_OPEN_ROW_SEL, SKIP_ITEM_ATTR } = await import(modUrl)
 
 let passed = 0
 let failed = 0
@@ -78,7 +78,87 @@ check('retitle returns false when no leaf has text', (() => {
   return retitleLeaf(node([empty1, blank2]), 'x') === false && blank2.textContent === '   '
 })())
 
-check('marker attrs exported', SKIP_ITEM_ATTR === 'data-meow-skip-item' && SKIP_MENU_ATTR === 'data-meow-skip-sid')
+// ── 选择器语义（2026-08-26 根因回归）─────────────────────────────────────────
+// 行类按 clsx 顺序拼接（sessionRow, selected, menuOpen…），`[class$=]` 对整个
+// class 属性串做结尾匹配——选中行/菜单打开行必然失配，导致注入时灵时不灵。
+check('session row selector uses substring match (not end match)', SESSION_ROW_SEL.includes('[class*="_sessionRow"]') && !SESSION_ROW_SEL.includes('class$='))
+check('menuOpen row selector uses substring match', MENU_OPEN_ROW_SEL.includes('[class*="_menuOpen"]'))
+
+// ── resolveMenuSessionId：menuOpen 行优先，点击捕获兜底 ──────────────────────
+function fakeDoc(openRow) {
+  return { querySelector: (sel) => (sel === MENU_OPEN_ROW_SEL ? openRow : null) }
+}
+const fiberRow = { '__reactFiber$abc': { key: 'sess-open', return: null } }
+check('resolve: menuOpen row wins with its fiber key', resolveMenuSessionId(fakeDoc(fiberRow), 'fallback') === 'sess-open')
+check('resolve: falls back to captured sid without open row', resolveMenuSessionId(fakeDoc(null), 'captured') === 'captured')
+check('resolve: null when neither anchor available', resolveMenuSessionId(fakeDoc(null), null) === null)
+check('resolve: unreadable row falls back too', resolveMenuSessionId(fakeDoc({}), 'captured') === 'captured')
+
+// ── setMenuIcon（v0.18.0 用户实测纠正）：图标画「点击后将变成的状态」──────────
+// 未跳过（当前=false）→ 标签「跳过…」→ 配斜杠月牙（点下去静音）；
+// 已跳过（当前=true）→ 标签「取消跳过…」→ 配实心月牙（点下去恢复）。
+function fakeItemWithSvg() {
+  const svg = { outerHTML: 'old' }
+  return {
+    svg,
+    querySelector(sel) { return sel === 'svg' ? svg : null },
+  }
+}
+const itemUnskipped = fakeItemWithSvg()
+setMenuIcon(itemUnskipped, false)
+check('menu icon: unskipped row gets slash moon (target state)', itemUnskipped.svg.outerHTML.includes('<mask'))
+const itemSkipped = fakeItemWithSvg()
+setMenuIcon(itemSkipped, true)
+check('menu icon: skipped row gets plain moon (target state)', itemSkipped.svg.outerHTML.includes('<path') && !itemSkipped.svg.outerHTML.includes('<mask'))
+const itemNoSvg = { querySelector: () => null }
+check('menu icon: no svg template stays text-only', (() => { setMenuIcon(itemNoSvg, false); return true })())
+
+// ── injectSkipItem：幂等 + 容器复用防串味 ────────────────────────────────────
+// 菜单项模板桩：node() 提供文本叶子协议；克隆体同构（简化 cloneNode）。
+function fakeMenuItem(labelText) {
+  const iconLeaf = node(null, '')
+  const labelLeaf = node(null, labelText)
+  const btn = Object.assign(node([iconLeaf, labelLeaf]), {
+    attrs: {},
+    setAttribute(k, v) { this.attrs[k] = String(v) },
+    getAttribute(k) { return this.attrs[k] ?? null },
+    removeAttribute() {},
+    remove() { this.removed = true },
+    addEventListener() {},
+    querySelector() { return null },
+    querySelectorAll() { return [] },
+    cloneNode() { return fakeMenuItem(labelText) }, // 克隆体同构
+  })
+  btn.labelLeaf = labelLeaf
+  return btn
+}
+function fakeMenu(existingItems) {
+  const template = fakeMenuItem('重命名')
+  const appended = []
+  return {
+    template,
+    appended,
+    existingItems,
+    querySelector(sel) { return sel === '[role="menuitem"]' ? template : null },
+    querySelectorAll(sel) { return sel.includes(SKIP_ITEM_ATTR) ? existingItems : [] },
+    appendChild(el) { appended.push(el) },
+  }
+}
+const noopHost = { onToggle() {} }
+// 同会话已注入 → 幂等放弃
+const itemA = fakeMenuItem('旧')
+itemA.setAttribute(SKIP_ITEM_ATTR, 'true')
+itemA.setAttribute('data-meow-session-id', 'A')
+const menuSameSid = fakeMenu([itemA])
+check('inject idempotent: same-sid item present → no-op', injectSkipItem(menuSameSid, 'A', noopHost) === null && menuSameSid.appended.length === 0 && itemA.removed !== true)
+// 别会话残留 → 拆掉重注（portal 容器复用串味防护）
+const menuStale = fakeMenu([itemA])
+const injected = injectSkipItem(menuStale, 'B', noopHost)
+check('inject stale: foreign-sid item removed and fresh one bound to B', itemA.removed === true && menuStale.appended.length === 1 && injected.getAttribute('data-meow-session-id') === 'B')
+check('inject fresh item carries skip attr + default label', injected.attrs[SKIP_ITEM_ATTR] === 'true' && injected.labelLeaf.textContent === '跳过梦境整理记忆')
+// 空菜单正常注入
+const menuEmpty = fakeMenu([])
+check('inject empty menu appends one item', injectSkipItem(menuEmpty, 'C', noopHost) !== null && menuEmpty.appended.length === 1)
 
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

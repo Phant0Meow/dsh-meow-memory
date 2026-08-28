@@ -29,6 +29,7 @@ import { closeAllDbs, getDb, memoryDbPath } from './db.js'
 import {
   abortDream,
   advanceDream,
+  DEFAULT_RULES_REVIEW_DAYS,
   DREAM_MARKER,
   dreamCommandDefinition,
   dreamTool,
@@ -38,10 +39,14 @@ import {
   shortSessionId,
   type DreamConfig,
 } from './dream.js'
-import { buildHitInjection, buildInjection, markSearched, readInjected, releaseSeen } from './inject.js'
+import { buildHitInjection, buildInjection, markAccessed, markSearched, readSeen, readInjected, releaseSeen } from './inject.js'
 import { migrateLegacy } from './migrate.js'
 import { buildReflectMessage, consecutiveToolSteps, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { registerMemoryTools } from './tools.js'
+import { resolveSlotText, setPromptLang } from './prompt-loader.js'
+
+/** 首次欢迎引导的 seen 记账 id（accessed 通道，非真实记忆 id；releaseSeen 不清除）。 */
+const WELCOME_GUIDE_SEEN_ID = '__welcomeGuide__'
 import { collectDreamStates, DreamStateBroadcast } from './dream-signal.js'
 
 export const name = 'meow-memory'
@@ -55,124 +60,14 @@ export const inject = ['tools']
  * 文本恒定、不随会话变化 → 前缀稳定，KV 缓存友好；动态记忆内容（soul/user/
  * 导引/命中）仍走首条消息注入。文案与 tools.ts 的工具 schema 保持一致。
  */
-export const MEMORY_GUIDE = `【记忆系统】meow-memory 提供跨会话记忆
-
-一、记忆数据总览
-1. 记忆level分类：
-- soul = 关于 AI 自身；
-- user = 用户基本信息、基础偏好、重要的设备网络环境、关于用户本人的重要的事；每session注入，所以不要太冗杂，只记最重要的。
-- rules = 设计原则/行为准则。全局准则 project 填"全局"，项目特定准则填 project 参数；
-- fact = 细碎的小事实（一句话直陈 ≤60 字）；
-- lesson = 错误与教训，踩过的坑，你从实践中学到的经验；
-- topic = 话题，描述一件事的前因后果、发展脉络，为AI提供更全局的、事件发展的视野。在事情有发展变化时可更新。
-- project = 项目，project记忆含子类：
-  overview：项目的目的、总览、元信息、概括信息、基础介绍存入这里。
-  structure：项目架构相关的信息存入这里。
-  decisions：重要的设计决策存入这里。
-  quotes：你认为重要的用户原话存入这里。
-  ops：部署与数据相关的信息存入这里（端口/路径/启动方式/数据库位置/运维操作）。
-  todo：你和用户的to do list，你认为即将要做的任务，记入这里。
-
-2. 记忆结构与要求：
-- 记忆都是分条目存入数据库，每条记忆不可过长（topic记忆除外）。
-- 每条记忆应聚焦于一件事或一个事实。如果事实繁多，应分为多条记忆。
-- 每条记忆必须要有关键词。
-- topic记忆是特殊的一类，可以稍长，但也是聚焦于一件事，不可以很多事件混在一起。
-- 发现某条记忆涉及信息太多，应主动将其拆分。
-- 记忆库中的记忆应时刻保持最新状态，如果事实状态、项目状态已更新，应及时更新记忆内容，或者修改记忆状态。
-
-3. 记忆注入说明
-- 你会时常收到相关记忆的自动注入（首轮长期记忆 + 每消息关键词命中），无需操作；
-- 注入的记忆仅供参考：
-   它可能与当前任务相关，也可能无关——若发现注入与当前话题无关，通常是该记忆关键词不准，可更新它。
-   它可能准确，也可能过时或错漏——若发现记忆内容有错漏、与事实不符、或已过时，请务必及时更新。
-- 记忆按"最后更新时间戳"排序，冲突以最新为准，旧的可作过程参考。
-
-
-二、你能用的记忆工具：
-
-【写记忆】
-
-1. 添加新记忆：memory_remember
-- 必填参数：content（内容）/ project/ keywords（8-13 个检索关键词）/ importance（重要性评估）。
-- 与已有条目高度重复应该用update合并，更新而非新增。
-- 已有条目信息太多需要拆解，可以用memory_remember新增条目。
-
-2. 更新已有记忆条目：memory_update
-- 必须有记忆 id 来准确指向某条记忆。
-- 如果你觉得 keywords/content/project/importance/status 信息不对，可用对应参数更新它。
-- 一次 update 可使用多个参数修改多项。
-- 参数按需，如果你不想改某一项，就不带那个参数。
-
-【查记忆】
-
-3. 查看项目全景：memory_project
-- 你要看哪个项目的信息？必须提供项目名称作为参数。
-- 提供关于项目的全局信息，可帮助你快速了解该项目。
-- 包含设计历史、技术决策、用户原话、项目进度等。
-
-4. 检索记忆：memory_search
-- query 必填：传关键词/句子（如 "记忆插件 部署"），不要空查。
-- 返回检索元数据视图，不含原文；你可以根据关键词判断那条记忆是否与你需要的信息有关。需要某条记忆的全文用 memory_read。
-- 默认 top 10 = 前 5 条按相关度取（不排除任何记忆，包括已注入/已检索/本 session 建立的）+ 后 5 条绕开已注入/已检索的记忆补齐。
-- 默认搜 fact/lesson/topic/rules；
-- 支持选择性搜索某个 level/project/status（可多选，逗号分割）。
-- 支持按时间检索，如 days: 30 = 只搜最近 30 天创建的。
-- 默认top k = 10，但可选择 k = 1-50。
-
-5. 读取单条记忆：memory_read
-- 按记忆 id 读完整内容（含 keywords/importance/状态等元数据）。
-
-6. 查重/找冲突：memory_find_similar
-- 按记忆 id 找内容相似条目。
-
-7. 可搜索源文件
-- 记忆数据存为 SQLite（路径具体见 memory_project 返回末尾说明）；memory_search 不好用时也可直接检索数据库。
-- 记忆库里找不到时可直接搜聊天记录原文。
-  聊天记录原文：$DSH_HOME/sessions/<工作区>/<会话id>/session.jsonl.zstd——Zstandard 压缩的 JSONL；
-  用 Node ≥22.13 的 node:zlib 一行解压搜索：
-  node -e "console.log(require('node:zlib').zstdDecompressSync(require('fs').readFileSync(process.argv[1])).toString())" <文件>
-- 尤其是，当用户问及细节信息，记忆搜不到，就参考用户描述和记忆里搜到的相关线索，直接去搜聊天记录原文。
-
-【整理记忆】
-
-8. 整理本窗口记忆：memory_dream
-- 窗口空闲 3 小时以上自动触发（北京时间峰时 9-12 点/14-18 点及各自前 15 分钟不触发），也可以手动调用。
-
-
-三、记忆写作准则（新建和更新记忆时都必须遵守）：
-1. content 准则
-- 不要太长，如果过长就分为多条记录。
-- 信息密度要大，不要啰嗦。
-- 如果用户提供了项目描述，应尽量保留用户原话——原话里包含用户的潜在逻辑，很珍贵。
-- 时刻保持最新，如发现错误或过时，应立即修改内容或归档。不可以允许错误或过时的记忆内容保持 active 状态。
-
-2. keywords 准则
-- 你要明白，关键词是供记忆系统检索用的，当用户 prompt 命中某条记忆的关键词，它就会被提取。
-- 所以你需要反向思考，"你希望在用户 prompt 提及哪些词的时候，这条记忆被检索到？"以此作为关键词的写入标准。
-- 每个记忆条目，提取 8-13 个关键词供检索。
-- 不要用项目名当关键词，用更加针对这条记忆本身的信息作为关键词。
-- 优先提取核心实体、语义中心、专有名词。
-- 如果某条记忆被注入的时机不合理，和你们聊的事完全无关，那应该是关键词总结的不好。你可以更新它。
-
-3. importance 准则
-- 非常重要、致命、犯错会很糟糕的决策/红线/教训，和健康、安全相关的准则 → 4；
-- 用户强调的，用户认为重要的，全局适用的准则，全局适用的通用信息 → 3；
-- 用户决策，跨越多个文件不好核实的抽象总结 → 2；
-- 琐碎的原子信息，适用性不广的信息，一些小信息想随手记一笔 → 1。
-
-4. status 准则
-- 新建记忆默认 active 状态。memory_update 可修改 status。
-- stale=完结（todo 完成 → stale 视为 done）；
-- archived=删除（过时信息、作废、重复、被替代的旧版本）；
-- 其他情况保持 active 不改标。
-
-5. project 准则
-- 如果用户在和你说一个全新的项目，你要建立新 project。
-- 如果是适用于某一个具体的项目的信息，你要在 remember 时写入该 project 名。
-- 如果是全局适用的信息，不局限于任何一个项目，project 填"全局"。
-- 如果并非适用于全局，但有多个项目都适用这一条信息，project 用英文逗号分隔多个项目名（如 "dsh, femwa"）。
-- 如果你认为某条记忆的 project 信息写错了，或者写的不全，应该及时更新它。`
+/** system prompt 手册（文案外置 v0.19.0）：prompts/zh/system-guide.md，运行时读取——
+ *  改 md 文件下一次 apply / 热重载后生效，无需改代码。文本恒定、不随会话变化 →
+ *  前缀稳定，KV 缓存友好；动态记忆内容（soul/user/导引/命中）仍走首条消息注入。
+ *  文案与 tools.md 的工具 schema 保持一致。
+ */
+export function getMemoryGuide(): string {
+  return resolveSlotText('system-guide')
+}
 
 // ── 性能诊断（perf.log，固定位置 ~/.dsh-meow/perf.log；卡死时查数据） ────────
 // 模块级计数器：模块只初始化一次；apply 每次执行 +1——若日志里 apply 编号异常
@@ -216,6 +111,13 @@ export const Config = z.object({
   reflectTurns: z.number().min(1).max(50).default(7),
   /** 首次打开库时自动迁移旧 PROJECT.md。 */
   autoMigrate: z.boolean().default(true),
+  /** prompt 语言（prompts/<lang>/ 语言包目录名）：决定注入/反思/dream 文案、工具
+   *  描述与 BM25 分词的语言。**首次使用建议显式配置**——记忆条目语言必须与 BM25
+   *  关键词语言一致，否则检索匹配率崩（详见 README）。zh=内置默认；en 等社区语言包
+   *  放 lib/prompts/（随包）或 homedir/.dsh-meow/prompts/（实例覆盖，可只覆盖部分槽位）。
+   *  不设置（undefined）：运行时按 zh 跑，且插件生效后的第一条真实用户消息会注入
+   *  「首次设置」引导任务（AI 判断用户语言并完成配置，每会话至多提醒一次）。 */
+  promptLang: z.string().required(false),
   /** 空闲整理（dream）。 */
   dream: z
     .object({
@@ -232,7 +134,7 @@ export const Config = z.object({
       // 用户系统是美区时间（隐私设置），抑制时段按中国时区计算
       timeZone: z.string().default('Asia/Shanghai'),
       /** rules 防 churn（测评 2026-08-25）：updated_at 距今超该天数的稳定准则不进 dream 第 1 轮清单；0=不过滤。 */
-      rulesReviewDays: z.number().min(0).default(2),
+      rulesReviewDays: z.number().min(0).default(DEFAULT_RULES_REVIEW_DAYS),
     })
     .default({}),
 })
@@ -245,6 +147,8 @@ interface ResolvedConfig {
   reflect: boolean
   reflectTurns: number
   autoMigrate: boolean
+  /** undefined = 用户未配置（首次设置引导的触发信号）；运行时语言兜底 zh。 */
+  promptLang: string | undefined
   dream: DreamConfig
 }
 
@@ -259,6 +163,7 @@ function resolveConfig(config: unknown): ResolvedConfig {
     reflect: c.reflect ?? true,
     reflectTurns: c.reflectTurns ?? 7,
     autoMigrate: c.autoMigrate ?? true,
+    promptLang: typeof c.promptLang === 'string' && c.promptLang.trim() ? c.promptLang.trim() : undefined,
     dream: {
       enabled: d.enabled ?? true,
       idleMinutes: d.idleMinutes ?? 180,
@@ -266,7 +171,7 @@ function resolveConfig(config: unknown): ResolvedConfig {
       suppressLeadMinutes: d.suppressLeadMinutes ?? 15,
       checkMinutes: d.checkMinutes ?? 15,
       timeZone: d.timeZone ?? 'Asia/Shanghai',
-      rulesReviewDays: d.rulesReviewDays ?? 2,
+      rulesReviewDays: d.rulesReviewDays ?? DEFAULT_RULES_REVIEW_DAYS,
     },
   }
 }
@@ -334,6 +239,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     ctx.logger.info('meow-memory: disabled by config')
     return
   }
+  // prompt 语言（实例常量）：setPromptLang 一次，loader/bm25 内部取用——链路零透传。
+  // 必须先于工具注册（tools.md 描述也吃这个语言）。未配置时运行时兜底 zh。
+  setPromptLang(resolved.promptLang ?? 'zh')
   applyCount++
   perf(`apply #${applyCount} pid=${process.pid}`)
   loadWindowIndex(resolved.projectDir) // 恢复窗口索引（热重载/重启后旧窗口不失联）
@@ -361,7 +269,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   const sp = (ctx as { get?: (name: string) => unknown }).get?.('systemPrompt') as
     | { section?: (section: { name: string; order: number; text: string }) => unknown }
     | undefined
-  sp?.section?.({ name: 'meow-memory:guide', order: 130, text: MEMORY_GUIDE })
+  sp?.section?.({ name: 'meow-memory:guide', order: 130, text: getMemoryGuide() })
 
   // 窗口表：只处理低频事件类型（流式 assistant/chunk 每块一个事件，绝不逐块写库）。
   // 节流：同一窗口 5 秒内最多落库一次（内存记 lastWrite，事件循环零阻塞）。
@@ -480,6 +388,28 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         return decision // 首条消息：不跑命中链路（首轮只注入长期记忆）
       }
       // 恢复的会话（日志已有历史消息）：首轮快照由上个进程注入过，只走命中链路。
+    }
+
+    // 首次设置引导（v0.19.0）：promptLang 未配置时，在插件生效后的第一条含真实用户
+    // 消息的请求前注入设置任务（AI 只依据用户消息判断语言 → 改 patch → 热重载）。
+    // 记账 = sessions/<id>.json 的 accessed 痕迹 '__welcomeGuide__'（per-session 至多一次；
+    // accessed 不被 releaseSeen 清除，上下文压缩后不会重注入；配置生效后 promptLang
+    // 有值 → 本分支永久短路）。首轮消息不进这里（首轮分支上方已 return——装插件场景
+    // 会话早已过首轮，且首轮用户往往还没好好说话，判断语言不可靠）。
+    if (resolved.promptLang === undefined && ws) {
+      const seen = readSeen(ws, sid, resolved.projectDir)
+      if (!seen.has(WELCOME_GUIDE_SEEN_ID)) {
+        const lastUser = [...decision.messages].reverse().find((m) => m.source?.kind === 'user')
+        if (lastUser !== undefined) {
+          markAccessed(ws, sid, [WELCOME_GUIDE_SEEN_ID], resolved.projectDir)
+          const guide = resolveSlotText('welcome-guide', { homePath: homedir() })
+          const rewritten = decision.messages.map((m) => m === lastUser
+            ? { ...m, content: [{ type: 'text', text: guide }, ...m.content] }
+            : m)
+          ctx.logger.info('meow-memory: first-run lang guide injected (promptLang unset)')
+          return { ...decision, messages: rewritten }
+        }
+      }
     }
 
     // 命中链路（从第二条用户消息起）：每条含真实用户消息的请求都跑关键词检索命中
@@ -845,4 +775,5 @@ export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, readSeen, markSearched, markAccessed, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
+export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition } from './dream.js'

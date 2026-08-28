@@ -1,0 +1,24 @@
+# meow-memory 短框架词（键值行：`- key: value`，首个半角冒号+空格为分隔符，value 原样保留；行首两格缩进为续行；{name} 占位符由代码填充。此注释行与空行会被解析器忽略）
+
+- inject.title: ===== 长期记忆 =====
+- inject.end: ===== 长期记忆结束 =====
+- inject.promptLabel: 本轮用户prompt：
+- inject.sectionFormat: 【{label}】
+- inject.aboutYou: 关于你
+- inject.aboutUser: 关于user
+- inject.rules: 设计原则
+- inject.guide: 记忆导引
+- inject.guideSearchLine: 需要时用 memory_search 检索（必须传 query 检索词，不能空查）、memory_read 读取。
+- inject.guideProjectLine: 当有项目相关任务时，应先用 memory_project 查项目全景（记得带上项目名，不能空参），这样可以对项目有整体理解。
+- inject.guideProjects: 用户的所有 project：{list}
+- inject.hitHeader: 可能相关的记忆，仅供参考：
+- dream.title: 记忆整理任务（dream）
+- dream.round.atomic: 原子记忆条目
+- dream.round.topic: topic记忆条目
+- dream.round.project-summary: 项目总结
+- dream.listHeader: 【本组记忆】：
+- dream.groupHeader: 【project：{name}】
+- dream.groupUnlabeled: 无项目 - 全局信息，或缺少项目标签
+- dream.row.keywordsLabel: 关键词:
+- dream.row.none: （无）
+- dream.topic.empty: （本组暂无已建立的 topic 记忆——回顾对话历史，如有新 topic 请按下方指导 2 创建）

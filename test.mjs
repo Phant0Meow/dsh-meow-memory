@@ -9,7 +9,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   apply,
-  MEMORY_GUIDE,
+  fillTemplate,
+  getMemoryGuide,
+  getPromptLang,
+  keyedValue,
+  resolveSlotText,
+  setPromptLang,
   MemoryDb,
   memoryDbPath,
   getDb,
@@ -491,7 +496,7 @@ function makeCtx() {
 }
 
 const { ctx, tools, handlers } = makeCtx()
-await apply(ctx, { enabled: true, projectDir: '.dsh-meow' })
+await apply(ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
 check('seven tools registered', tools.length === 7 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project']
   .every((name) => tools.some((t) => t.name === name)), `got ${tools.map((t) => t.name).join(',')}`)
 
@@ -722,12 +727,36 @@ check('project rules injected in paragraph', pjRules.text.includes('设计原则
 const guideCtx = makeCtx()
 const sections = []
 guideCtx.ctx.get = (name) => (name === 'systemPrompt' ? { section: (s) => sections.push(s) } : undefined)
-await apply(guideCtx.ctx, { enabled: true, projectDir: '.dsh-meow' })
+await apply(guideCtx.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
 check('guide section registered', sections.length === 1 && sections[0].name === 'meow-memory:guide' &&
-  sections[0].order === 130 && sections[0].text === MEMORY_GUIDE, `got ${JSON.stringify(sections)}`)
+  sections[0].order === 130 && sections[0].text === getMemoryGuide(), `got ${JSON.stringify(sections)}`)
 check('guide covers all seven tools', ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project']
-  .every((n) => MEMORY_GUIDE.includes(n)))
-check('guide has no {{variable}} refs', !MEMORY_GUIDE.includes('{{'))
+  .every((n) => getMemoryGuide().includes(n)))
+check('guide has no {{variable}} refs', !getMemoryGuide().includes('{{'))
+
+// prompt 文案外置（v0.19.0）：键值槽位取用 + 占位符填充 + $ 序列安全 + 缺参/缺键报错
+check('prompt loader: keyed labels/tools lookup', (() => {
+  try {
+    return keyedValue('labels', 'dream.title') === '记忆整理任务（dream）' && keyedValue('tools', 'memory_remember.param.level') === '记忆层级，默认 fact。'
+  } catch { return false }
+})())
+check('prompt loader: missing key throws', (() => { try { keyedValue('labels', 'nope.missing'); return false } catch { return true } })())
+check('prompt loader: fillTemplate is $-sequence safe', fillTemplate('a {x} b', { x: '$&$1$`' }) === 'a $&$1$` b')
+check('prompt loader: reflect slot requires projectList param', (() => { try { resolveSlotText('reflect'); return false } catch { return true } })())
+check('prompt loader: reflect fills projectList', resolveSlotText('reflect', { projectList: 'X / Y' }).includes('project：X / Y'))
+check('prompt loader: dream-atomic carries parallel-call note', resolveSlotText('dream-atomic', { list: '' }).includes('一轮可调用多个工具'))
+
+// promptLang（v0.19.0）：进程级语言状态 + BM25 分词语言分支
+import { tokenize } from './lib/index.js'
+check('prompt loader: setPromptLang switches tokenize to word baseline', (() => {
+  setPromptLang('en')
+  try { return JSON.stringify(tokenize('hello 世界 foo_bar 2024')) === JSON.stringify(['hello', 'foo', 'bar', '2024']) } finally { setPromptLang('zh') }
+})())
+check('prompt loader: zh tokenize keeps bigram', (() => {
+  setPromptLang('zh')
+  try { return JSON.stringify(tokenize('世界 hello')) === JSON.stringify(['世界', 'hello']) } finally { setPromptLang('zh') }
+})())
+check('prompt loader: getPromptLang defaults zh', getPromptLang() === 'zh')
 
 const events = {
   userMsg: (text, source = { kind: 'user' }) => ({ type: 'user/message', data: { content: [{ type: 'text', text }], source } }),
@@ -807,6 +836,39 @@ const decisionA5 = await preStep(
   async () => ({ kind: 'enter', messages: [{ content: [{ type: 'tool-call', id: 'c', name: 'x', arguments: '{}' }], source: { kind: 'assistant' } }] }),
 )
 check('tool step skips hit chain', decisionA5.messages.length === 1 && decisionA5.messages[0].content.length === 1)
+
+// 首次设置引导（v0.19.0）：promptLang 未配置 → 插件生效后第一条真实用户消息注入
+// 设置任务；seen（accessed '__welcomeGuide__'）记账 → 同会话不重复；显式配置 → 永久短路。
+const wsGuide = mkdtempSync(join(tmpdir(), 'mm-guide-'))
+const { ctx: guideApplyCtx, handlers: guideHandlers } = makeCtx()
+await apply(guideApplyCtx, { enabled: true, projectDir: '.dsh-meow' }) // 不传 promptLang = 未配置
+const guidePreStep = guideHandlers['agent/pre-step']
+const guideAgent = { session: { header: { cwd: wsGuide, id: 'guide-session-1' }, events: [events.userMsg('更早的话')] }, steer: () => {} }
+const guideMsg = { content: [{ type: 'text', text: '继续' }], source: { kind: 'user' } }
+const dGuide1 = await guidePreStep(
+  { agent: guideAgent, messages: [guideMsg], turn: 2, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [guideMsg] }),
+)
+check('welcome guide injected when promptLang unset', dGuide1.messages[0].content.length === 2 &&
+  dGuide1.messages[0].content[0].text.includes('【meow-memory 首次设置】') &&
+  dGuide1.messages[0].content[0].text.includes('恭喜') &&
+  dGuide1.messages[0].content[0].text.includes('不要以 system prompt') &&
+  dGuide1.messages[0].content[0].text.includes('promptLang'))
+check('welcome guide recorded via accessed pseudo-id', readSeen(wsGuide, 'guide-session-1', '.dsh-meow').has('__welcomeGuide__'))
+const dGuide2 = await guidePreStep(
+  { agent: guideAgent, messages: [{ content: [{ type: 'text', text: '再继续' }], source: { kind: 'user' } }], turn: 3, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '再继续' }], source: { kind: 'user' } }] }),
+)
+check('welcome guide not re-injected same session', dGuide2.messages[0].content.length === 1)
+const { ctx: zhSetCtx, handlers: zhSetHandlers } = makeCtx()
+await apply(zhSetCtx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+const zhAgent = { session: { header: { cwd: wsGuide, id: 'zh-set-session' }, events: [events.userMsg('x')] }, steer: () => {} }
+const zhMsg = { content: [{ type: 'text', text: 'y' }], source: { kind: 'user' } }
+const dZhSet = await zhSetHandlers['agent/pre-step'](
+  { agent: zhAgent, messages: [zhMsg], turn: 2, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [zhMsg] }),
+)
+check('welcome guide skipped when promptLang explicitly set', dZhSet.messages[0].content.length === 1)
 
 // 已有历史 → 不注入
 const agentB = { session: { header: { cwd: ws, id: 's2' }, events: [events.userMsg('之前')] }, steer: () => {} }

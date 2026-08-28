@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path'
 import type { Doc } from './bm25.js'
 import { keywordHitScore, search, tokenize } from './bm25.js'
 import { projectCovers, projectLabel, relativeTime, type MemoryDb, type MemoryRow } from './db.js'
+import { fillTemplate, keyedValue } from './prompt-loader.js'
 
 export interface InjectOptions {
   /** 关键词命中条数上限（fact/lesson 短条目）。 */
@@ -164,15 +165,17 @@ export function buildInjection(
   dir = '.dsh-meow',
 ): { text: string; injectedIds: string[] } | null {
   const o = { ...DEFAULT_OPTS, ...opts }
+  // 框架词外置（v0.19.0）：labels.md 的 inject.* 键；记忆条目正文本身是数据不是文案，不外置。
+  const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
   const soul = db.list('soul', { status: 'active' })
   const user = db.list('user', { status: 'active' })
 
-  const lines: string[] = ['===== 长期记忆 =====', '']
+  const lines: string[] = [lbl('inject.title'), '']
   const injected: string[] = []
 
   const pushEntries = (label: string, rows: MemoryRow[]) => {
     if (rows.length === 0) return
-    lines.push(`【${label}】`)
+    lines.push(lbl('inject.sectionFormat', { label }))
     for (const r of rows) {
       lines.push(`- ${r.content}`)
       injected.push(r.id) // 正文已注入 → 记入已见（命中链路不再重复注入）
@@ -180,26 +183,26 @@ export function buildInjection(
     lines.push('')
   }
 
-  pushEntries('关于你', soul)
-  pushEntries('关于user', user)
+  pushEntries(lbl('inject.aboutYou'), soul)
+  pushEntries(lbl('inject.aboutUser'), user)
 
   // 设计原则（rules）：只注入「全局（project 为空）且 importance≥2」的——少而精的命令式准则。
   const globalRules = db.list('rules', { status: 'active' }).filter((r) => r.project === null && r.importance >= 2)
-  pushEntries('设计原则', globalRules)
+  pushEntries(lbl('inject.rules'), globalRules)
 
   // 记忆导引：说明 + 项目列表（正文/标题一律自取，不列）。
   const projectNames = db.listProjectNames()
   if (projectNames.length > 0) {
-    lines.push('【记忆导引】')
-    lines.push('需要时用 memory_search 检索（必须传 query 检索词，不能空查）、memory_read 读取。')
-    lines.push('当有项目相关任务时，应先用 memory_project 查项目全景（记得带上项目名，不能空参），这样可以对项目有整体理解。')
-    lines.push(`用户的所有 project：${projectNames.join(' / ')}`)
+    lines.push(lbl('inject.sectionFormat', { label: lbl('inject.guide') }))
+    lines.push(lbl('inject.guideSearchLine'))
+    lines.push(lbl('inject.guideProjectLine'))
+    lines.push(lbl('inject.guideProjects', { list: projectNames.join(' / ') }))
     lines.push('')
   }
 
   if (lines.length <= 2) return null // 只有标题头，无任何内容
   const body = lines.join('\n').trimEnd()
-  const text = `${body}\n\n===== 长期记忆结束 =====\n\n本轮用户prompt：\n\n`
+  const text = `${body}\n\n${lbl('inject.end')}\n\n${lbl('inject.promptLabel')}\n\n`
   if (injected.length > 0) markInjected(workspace, sessionId, injected, dir)
   return { text, injectedIds: injected }
 }
@@ -265,7 +268,7 @@ export function buildHitInjection(
   const o = { ...DEFAULT_OPTS, ...opts }
   const fresh = hitQuery(db, workspace, sessionId, userText, o, dir)
   if (fresh.length === 0) return null
-  const lines = ['可能相关的记忆，仅供参考：']
+  const lines = [keyedValue('labels', 'inject.hitHeader')]
   for (const h of fresh) {
     // 原文视图：归属 + 完整 id + 绝对/相对时间戳（记忆时间戳=updated_at 最后更新时间；无时间戳不显示），第二行完整内容。
     const proj = projectLabel(h.project)
@@ -276,7 +279,7 @@ export function buildHitInjection(
     lines.push(h.content)
     lines.push('')
   }
-  const text = `${lines.join('\n')}------\n本轮用户prompt：\n\n`
+  const text = `${lines.join('\n')}------\n${keyedValue('labels', 'inject.promptLabel')}\n\n`
   const ids = fresh.map((h) => h.id)
   markInjected(workspace, sessionId, ids, dir)
   return { text, injectedIds: ids }

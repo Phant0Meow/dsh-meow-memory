@@ -73,8 +73,9 @@
   的补全菜单里直接可见；已有整理在进行中会明确提示，不会重复启动。
 - **跳过梦境整理（client 端）**：某个窗口的记忆不想被自动整理？左侧边栏该会话行的「…」
   菜单里点一下**「跳过梦境整理记忆」**即可，再点**「取消跳过梦境整理记忆」**恢复。被跳过
-  的窗口不再被空闲定时器自动 dream（`/dream` 与 `memory_dream` 手动触发不受影响）。
-  跳过状态持久保存、重启不丢；双实例共享同一记忆库，状态天然一致。
+  的窗口不再被空闲定时器自动 dream（`/dream` 与 `memory_dream` 手动触发不受影响），
+  会话列表里显示**静音灰「月牙+斜杠」**图标、一眼可辨。跳过状态持久保存、重启不丢；
+  双实例共享同一记忆库，状态天然一致。
 - **反思**：单次任务内连续 ≥7 个工具 step 后，插件询问模型自上次整理以来是否有值得记忆的内容。
   最后工具是 `memory_*` 视为已主动记忆、不重复反思；被取消的轮次绝不触发。
 - **注入折叠 UI（client 端）**：首轮长期记忆 / 每消息关键词命中的注入文本在前端
@@ -86,10 +87,12 @@
   卡片查看完整记录——卡片内 Think / tool call / 上下文注入均可点开查看细节。
 - **会话列表 dream 图标（client 端）**：左侧会话列表中，"dream 整理过记忆且之后无新对话
   新信息"的会话行显示**淡黄色小月牙 🌙**；dream 轮进行中显示**白→金呼吸灯月牙**（替换 dsh
-  的运行中蓝色动画，避免与正常工作混淆）；有新活动即移除。图标放进 dsh 会话行的状态槽位
+  的运行中蓝色动画，避免与正常工作混淆）；被**跳过梦境整理**的会话显示**静音灰「月牙+斜杠」**
+  （取消跳过自动回落；优先级：呼吸灯 > 跳过 > 月牙）；有新活动即移除。图标放进 dsh 会话行的状态槽位
   （替换槽内内容，标题零位移）。数据走事件驱动无轮询：`/meow-memory/dream-events` SSE
   长连接——dream 开始推 `state:'dreaming'`、完成推 `state:'dreamed'`、有新活动推
-  `state:'active'`；client 挂载/断线重连时对 `/meow-memory/dreamed-sessions` 全量对账一次。
+  `state:'active'`、跳过翻转推 `state:'skip'/'unskip'`；client 挂载/断线重连时对
+  `/meow-memory/dreamed-sessions` 与 `/meow-memory/skip-dreams` 全量对账一次。
   行定位零 dsh 改动：读 React 18 fiber（`__reactFiber$` 内部属性）拿会话行渲染 key =
   session id，不依赖标题匹配。
 - **dream 防重复**：check 门（DB 原子 60s 检查节流）+ start 幂等抢占（`dream_pending`）+
@@ -136,6 +139,7 @@ npm install meow-memory
   config:
     enabled: true          # 总开关
     projectDir: '.dsh-meow' # 记忆目录（相对工作区）
+    promptLang: 'zh'       # ⚠️ 首次使用建议显式配置（见下方说明）
     hitTopK: 2             # 每条用户消息关键词命中的条目数上限（fact/lesson/rules/topic）
     reflect: true          # 连续 ≥reflectTurns 轮工具调用后自动反思
     reflectTurns: 7        # 触发反思所需的连续工具轮数
@@ -152,6 +156,14 @@ npm install meow-memory
       timeZone: 'Asia/Shanghai'  # 用户机器时钟为美区时间；抑制时段必须
                                  # 按此固定时区计算
 ```
+
+### promptLang：prompt 与检索语言（重要）
+
+`promptLang` 决定三件事：①注入/反思/dream 文案的语言；②工具描述的语言；③**BM25 分词器的语言**。它同时影响模型写记忆条目用的语言——而检索命中依赖"查询与记忆条目被同一种方式分词"。
+
+**因此首次使用时请显式配置它**：`promptLang: 'zh'`（默认，中文 bigram 分词）或 `'en'`（英文整词分词）。如果你的对话语言和界面语言不一致（比如界面英文、说话中文），**以你说话的语言为准**——语言不一致会显著拉低关键词命中率。
+
+自定义 / 社区语言包：prompt 文案是数据文件（`src/prompts/`），一门语言一个子目录，改文件即生效、无需改代码——详见 [`src/prompts/README.md`](src/prompts/README.md)（含贡献指南与 `npm run check-lang` 自查）。实例级自定义：`<home>/.dsh-meow/prompts/<lang>/` 下放同名槽位文件即可覆盖（可只覆盖部分）。
 
 ## 🧠 工作原理
 

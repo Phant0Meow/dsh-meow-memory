@@ -13,6 +13,7 @@
  * client side (shell singleton, ModuleLoader resolves it).
  */
 import { build, context } from 'esbuild';
+import { cpSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const watch = process.argv.includes('--watch');
@@ -67,5 +68,13 @@ if (watch) {
   await (await context(clientOptions)).watch();
   console.log('[build] watching src/ for changes...');
 } else {
+  // prompt 文案外置（v0.19.0）：src/prompts/<lang>/*.md → lib/prompts/，运行时
+  // readFileSync 读取（prompt-loader.ts 以 import.meta.url 定位 lib/prompts），
+  // 不参与 esbuild bundle。语言包 = 一个子目录，新增语言不需要动构建脚本。
+  // filter：Delete_ 前缀文件（改名留痕协议产物）不进发布包。
+  cpSync(new URL('./src/prompts', import.meta.url), new URL('./lib/prompts', import.meta.url), {
+    recursive: true,
+    filter: (src) => !src.split(/[\\/]/).pop().startsWith('Delete_'),
+  });
   await Promise.all([build(hostOptions), build(clientOptions)]);
 }

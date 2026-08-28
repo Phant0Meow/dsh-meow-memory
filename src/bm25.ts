@@ -1,13 +1,16 @@
 /**
  * meow-memory v2 — 检索层。
  *
- * 分词：字符 bigram（中文稳定、零依赖）+ 英文/数字整词。
+ * 分词（语言分支 v0.19.0）：zh = 字符 bigram（中文稳定、零依赖）+ 英文/数字整词；
+ * 其他语言 = ASCII 整词基线（stemming 扩展点见 prompts/README.md），语言随 promptLang。
  * 打分：标准 BM25 × 艾宾浩斯近期权重；importance≥3 或超级匹配（≥0.85×本轮
  *       最高原始分）时豁免衰减。
  * 偏离信号：turn 文本向量 vs 各 topic 质心（title+goal+content+keywords 词频
  *       向量）的余弦相似度；top1 相似度过低 → "疑似新话题"提示。topic 数 < 3
  *       （冷启动）不提示。信号只提醒不拍板，归属判定由模型用目标句测试完成。
  */
+
+import { getPromptLang } from './prompt-loader.js'
 
 export interface Doc {
   id: string
@@ -21,17 +24,23 @@ export interface Doc {
   updated_at: number
 }
 
-const HAN = /[\u3400-\u9fff]/ // CJK 统一表意文字
+const HAN = /[\u3400-\u9fff]/ // CJK 统一表意文字（zh 分支专用）
 const ASCII = /[a-zA-Z0-9]+/g
 
-/** 切词：中文按相邻 bigram，英文/数字按整词。 */
+/** 切词（语言分支，v0.19.0）：
+ * - promptLang === 'zh'（默认）：中文相邻 bigram（单字不成词）+ 英文/数字整词——零依赖中文适配；
+ * - 其他语言：ASCII 整词基线——词形归一化/stemming 是各语言包贡献者的扩展点
+ *   （就在本函数的通用路径上，见 prompts/README.md）。
+ * 语言来自 promptLang config（getPromptLang 进程级动态读取，切换后下一次检索即生效）；
+ * 打分本体（BM25/艾宾浩斯/余弦）语言无关，不分支。 */
 export function tokenize(text: string): string[] {
+  const zh = getPromptLang() === 'zh'
   const out: string[] = []
   let i = 0
   const n = text.length
   while (i < n) {
     const ch = text[i]
-    if (HAN.test(ch)) {
+    if (zh && HAN.test(ch)) {
       // 连续汉字 → bigram（单字不成词，避免噪音）
       let j = i
       while (j < n && HAN.test(text[j])) j++

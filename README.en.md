@@ -89,8 +89,9 @@ frozen at the last conversation timestamp.
 - **Skip dream consolidation (client)**: don't want a window's memories auto-consolidated?
   Open the "…" menu on its sidebar row and click **"跳过梦境整理记忆" (skip dream
   consolidation)**; click **"取消跳过梦境整理记忆" (un-skip)** to restore. Skipped windows are
-  never picked up by the idle timer again, while `/dream` and `memory_dream` keep working.
-  The skip flag persists across restarts and stays consistent across both instances (shared
+  never picked up by the idle timer again, while `/dream` and `memory_dream` keep working,
+  and their session row shows a **muted-gray "moon with slash" icon** at a glance. The skip
+  flag persists across restarts and stays consistent across both instances (shared
   memory database).
 - **Reflection**: after ≥7 consecutive tool steps within one task the plugin asks the
   model whether anything since the last consolidation is worth remembering. A turn whose
@@ -107,11 +108,14 @@ frozen at the last conversation timestamp.
 - **Session-list dream icon (client)**: sessions that have been dream-consolidated with no
   new conversation activity since show a **pale-yellow crescent-moon icon 🌙**; while a dream
   turn is running the moon **breathes white→gold** (replacing dsh's running-blue animation so
-  it can't be mistaken for normal work); new activity removes the icon. The icon lives inside
+  it can't be mistaken for normal work); **skip-dreamed** sessions show a **muted-gray
+  "moon with slash"** instead (un-skipping falls back to the crescent; priority: breathing >
+  skipped > crescent); new activity removes the icon. The icon lives inside
   the dsh session row's status slot (replacing its content — no layout shift). Event-driven,
   no polling: the `/meow-memory/dream-events` SSE stream pushes `state:'dreaming'` when a
   dream starts, `state:'dreamed'` when it finishes, `state:'active'` when a session gets new
-  activity; the client reconciles once against `/meow-memory/dreamed-sessions` on
+  activity, and `state:'skip'/'unskip'` when the skip flag flips; the client reconciles once
+  against `/meow-memory/dreamed-sessions` and `/meow-memory/skip-dreams` on
   mount/reconnect. Row targeting needs zero dsh changes: it reads the React 18 fiber
   (`__reactFiber$` internal property) to get the row's render key = session id — no title
   matching.
@@ -161,6 +165,7 @@ All fields are optional (profile patch or `cordis.patch.yml`):
   config:
     enabled: true          # master switch
     projectDir: '.dsh-meow' # memory directory, relative to the workspace
+    promptLang: 'zh'       # ⚠️ set this on first use (see note below)
     hitTopK: 2             # max keyword-hit entries injected per user message (fact/lesson/rules/topic)
     reflect: true          # auto-reflection after ≥reflectTurns tool turns
     reflectTurns: 7        # consecutive tool turns before reflection triggers
@@ -177,6 +182,14 @@ All fields are optional (profile patch or `cordis.patch.yml`):
       timeZone: 'Asia/Shanghai'  # the user's machine clock is US time; suppression
                                  # windows must follow this fixed zone instead
 ```
+
+### promptLang: prompt & retrieval language (important)
+
+`promptLang` decides three things: ① the language of injected/reflection/dream prompts; ② the language of tool descriptions; ③ **the BM25 tokenizer language**. It also shapes the language the model writes memory entries in — and retrieval recall depends on queries and memory entries being tokenized the same way.
+
+**Set it explicitly on first use**: `'zh'` (default, Chinese bigram tokenizer) or `'en'` (English word tokenizer). If your chat language differs from your UI language, **go with your chat language** — a mismatch significantly degrades keyword-hit recall.
+
+Language packs are data files (one directory per language under `src/prompts/`, hot-read at runtime — no code changes needed). See [`src/prompts/README.md`](src/prompts/README.md) for the contributor guide and `npm run check-lang`. Instance-level overrides: drop same-named slot files into `<home>/.dsh-meow/prompts/<lang>/` (partial overrides welcome).
 
 ## 🧠 How it works
 
