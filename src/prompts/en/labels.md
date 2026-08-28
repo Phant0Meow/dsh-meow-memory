@@ -1,0 +1,24 @@
+# meow-memory short framework words (key-value lines: `- key: value`; the first ASCII colon+space is the separator, the value is kept verbatim; a line starting with two spaces continues the previous value; {name} placeholders are filled in by the code. This comment line and blank lines are ignored by the parser.)
+
+- inject.title: ===== LONG-TERM MEMORY =====
+- inject.end: ===== END OF LONG-TERM MEMORY =====
+- inject.promptLabel: This turn's user prompt:
+- inject.sectionFormat: [{label}]
+- inject.aboutYou: About you
+- inject.aboutUser: About the user
+- inject.rules: Design principles
+- inject.guide: Memory guide
+- inject.guideSearchLine: Use memory_search when you need something (query is required, never search empty) and memory_read to read an entry in full.
+- inject.guideProjectLine: When a task involves a project, start with memory_project for the project-wide picture (pass the project name, it cannot be empty) — that is how you get a whole-project understanding.
+- inject.guideProjects: All of the user's projects: {list}
+- inject.hitHeader: Possibly relevant memories, for reference only:
+- dream.title: Memory consolidation task (dream)
+- dream.round.atomic: atomic memory entries
+- dream.round.topic: topic memory entries
+- dream.round.project-summary: project summary
+- dream.listHeader: [Entries in this group]:
+- dream.groupHeader: [project: {name}]
+- dream.groupUnlabeled: no project - global information, or missing a project label
+- dream.row.keywordsLabel: keywords:
+- dream.row.none: (none)
+- dream.topic.empty: (no topic memories in this group yet — look back over the conversation, and if there is a new topic, create it following guideline 2 below)
