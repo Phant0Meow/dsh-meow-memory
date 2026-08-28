@@ -23,3 +23,24 @@
 - dream.row.keywordsLabel: keywords:
 - dream.row.none: (none)
 - dream.topic.empty: (no topic memories in this group yet — look back over the conversation, and if there is a new topic, create it following guideline 2 below)
+- project.unlabeled: unlabeled
+- project.header: [project: {name}]
+- project.empty: [project: {name}] No memory entries for this project yet.
+- project.section.overview: Overview
+- project.section.structure: Structure
+- project.section.decisions: Technical decisions
+- project.section.quotes: The user's own words
+- project.section.ops: Deployment and data
+- project.section.todo: Project progress
+- project.todoDone: Done:
+- project.todoOpen: To do list:
+- time.none: no timestamp
+- time.justNow: just now
+- time.minutes: {n} min ago
+- time.hours: {n} h ago
+- time.days: {n} d ago
+- reflect.noProjects: (none yet)
+- remember.error.content: memory_remember: content is required — add what you want remembered and try again
+- remember.error.project: memory_remember: project is required — use "{global}" for globally applicable information, or the project name (comma-separate several projects) — add it and try again
+- remember.error.keywords: memory_remember: keywords is required — give 8-13 content keywords for retrieval (don't use the project name as a keyword) — add them and try again
+- remember.error.importance: memory_remember: importance is required — rate it: 4=fatal red line / health and safety, 3=stressed by the user / globally applicable, 2=a user decision or abstract conclusion, 1=trivia — add it and try again

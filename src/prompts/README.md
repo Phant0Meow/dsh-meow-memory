@@ -25,12 +25,13 @@ src/prompts/
 | `dream-topic.md` | whole text | `{list}` |
 | `dream-project-summary.md` | whole text | `{projects}` |
 | `welcome-guide.md` | whole text | `{homePath}` |
-| `labels.md` | key-value lines | per key（e.g. `{label}` `{name}` `{list}`） |
+| `labels.md` | key-value lines | per key（e.g. `{label}` `{name}` `{list}` `{n}`） |
 | `tools.md` | key-value lines | — |
 
 - **`zh/` is the key-set source of truth**: every slot & key in `zh` must exist in your language — no missing, no extras.
 - **Whole-text slots**: translate freely; keep `{placeholders}` and place them where your grammar needs them.
 - **Key-value slots**: lines shaped `- key: value` — keep **keys exactly as-is** (the code looks them up), translate **values** only. A line starting with two spaces continues the previous value.
+- One value in `labels.md` is **not** decoration: `project.global` is the word the model writes into a memory's `project` field for globally applicable information, and the code matches on it. Pick a natural word in your language, keep it to one word, and don't reuse it as a real project name.
 - Lines starting with `#` are comments; blank lines are ignored.
 
 ## Resolution order / 读取顺序（per slot, 逐槽位）

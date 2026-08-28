@@ -10,11 +10,13 @@
 
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { findSimilar, search, tokenize, type RankedHit } from './bm25.js'
-import { getDb, getDreamWorkspace, isGlobalProject, memoryDbPath, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
-import { keyedValue } from './prompt-loader.js'
+import { getDb, getDreamWorkspace, globalProjectMarker, isGlobalProject, memoryDbPath, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
+import { fillTemplate, keyedValue } from './prompt-loader.js'
 
 /** tools.md 键值取用（prompt 文案外置 v0.19.0）：缺键时 keyedValue throw。 */
 const T = (key: string): string => keyedValue('tools', key)
+/** 框架词/报错文案（labels.md）：与工具描述同源，随语言包走。 */
+const L = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
 import { readSeen, markAccessed, markSearched, setCurrentProject } from './inject.js'
 
 export type { Level }
@@ -136,14 +138,14 @@ function rememberTool(dir: string): ToolDefinition {
       const parsed = args as { content?: unknown; level?: unknown; project?: unknown; subcategory?: unknown; goal?: unknown; importance?: unknown; corrected?: unknown; keywords?: unknown }
       const content = typeof parsed.content === 'string' ? parsed.content.trim() : ''
       // 四必填：缺失逐个报错并引导重填（用户拍板 2026-08-19）。
-      if (content.length === 0) throw new Error('memory_remember: content 参数必填，请补充要记住的内容后重试')
+      if (content.length === 0) throw new Error(L('remember.error.content'))
       const project = typeof parsed.project === 'string' && parsed.project.trim() ? parsed.project.trim() : null
-      if (project === null) throw new Error('memory_remember: project 参数必填——全局信息填"全局"，具体项目填项目名（多个项目用英文逗号分隔），请补充后重试')
+      if (project === null) throw new Error(L('remember.error.project', { global: globalProjectMarker() }))
       const keywords = Array.isArray(parsed.keywords)
         ? parsed.keywords.filter((k): k is string => typeof k === 'string').map((k) => k.trim()).filter((k) => k.length > 0)
         : []
-      if (keywords.length === 0) throw new Error('memory_remember: keywords 参数必填——请总结 8-13 个内容关键词供检索（不要用项目名当关键词），请补充后重试')
-      if (typeof parsed.importance !== 'number') throw new Error('memory_remember: importance 参数必填——请评估重要性：4=致命红线/健康安全，3=用户强调/全局适用，2=用户决策抽象总结，1=琐碎，请补充后重试')
+      if (keywords.length === 0) throw new Error(L('remember.error.keywords'))
+      if (typeof parsed.importance !== 'number') throw new Error(L('remember.error.importance'))
       const level: Level = typeof parsed.level === 'string' && (LEVELS as readonly string[]).includes(parsed.level)
         ? (parsed.level as Level)
         : 'fact'
@@ -610,15 +612,8 @@ function updateTool(dir: string): ToolDefinition {
   }
 }
 
-/** 子标签 → 注入段落标题。 */
-const PROJECT_SECTION_TITLES: Record<ProjectSubcategory, string> = {
-  overview: '项目概述',
-  structure: '项目结构',
-  decisions: '技术决策',
-  quotes: '用户原话',
-  ops: '部署与数据',
-  todo: '项目进度',
-}
+/** 子标签 → 注入段落标题（文案外置：labels.md 的 project.section.*）。 */
+const sectionTitle = (sub: ProjectSubcategory): string => L(`project.section.${sub}`)
 
 /** 组内排序：记忆时间戳（updated_at）旧→新，相同按创建时间；null 视为最旧。 */
 function sortByUpdatedAt(list: MemoryRow[]): MemoryRow[] {
@@ -697,34 +692,34 @@ function projectTool(dir: string): ToolDefinition {
         db.list('rules', { project }).filter((r) => r.project === project && r.status === 'active'),
       )
       if (projectRules.length > 0) {
-        sections.push(`设计原则\n${projectRules.map(fmtProjectRow).join('\n')}`)
+        sections.push(`${L('inject.rules')}\n${projectRules.map(fmtProjectRow).join('\n')}`)
       }
       for (const sub of PROJECT_SUBCATEGORIES) {
         if (sub === 'todo') {
           const todos = sortByUpdatedAt(bySub.get('todo') ?? [])
           if (todos.length === 0 && done.length === 0) continue
-          const lines = [PROJECT_SECTION_TITLES.todo]
+          const lines = [sectionTitle('todo')]
           if (done.length > 0) {
-            lines.push('已完成：')
+            lines.push(L('project.todoDone'))
             for (const r of done) lines.push(fmtProjectRow(r))
           }
           if (todos.length > 0) {
-            lines.push('To do list：')
+            lines.push(L('project.todoOpen'))
             for (const r of todos) lines.push(fmtProjectRow(r))
           }
           sections.push(lines.join('\n'))
         } else {
           const list = sortByUpdatedAt(bySub.get(sub) ?? [])
           if (list.length === 0) continue
-          sections.push(`${PROJECT_SECTION_TITLES[sub]}\n${list.map(fmtProjectRow).join('\n')}`)
+          sections.push(`${sectionTitle(sub)}\n${list.map(fmtProjectRow).join('\n')}`)
         }
       }
       if (sections.length === 0) {
-        return { project, text: `【项目：${project}】该项目暂无记忆条目。` }
+        return { project, text: L('project.empty', { name: project }) }
       }
       const dbPath = memoryDbPath(workspace, dir)
       const text = [
-        `【项目：${project}】`,
+        L('project.header', { name: project }),
         '',
         sections.join('\n\n'),
         '',

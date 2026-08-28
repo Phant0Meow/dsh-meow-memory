@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { keyedValue } from './prompt-loader.js'
+import { fillTemplate, keyedValue } from './prompt-loader.js'
 
 export type Level = 'soul' | 'user' | 'project' | 'fact' | 'lesson' | 'topic' | 'rules'
 export type Status = 'active' | 'archived' | 'stale'
@@ -39,14 +39,17 @@ export const LEVEL_LABELS: Record<Level, string> = {
   rules: '设计原则与行为准则',
 }
 
-/** 相对时间显示（"记忆时间戳"人性化）。 */
+/** 框架词（labels.md）：注入块与 memory_project 正文里的短词随语言包走。 */
+const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
+
+/** 相对时间显示（"记忆时间戳"人性化）。文案外置：labels.md 的 time.*。 */
 export function relativeTime(ms: number | null | undefined): string {
-  if (!ms) return '无时间戳'
+  if (!ms) return lbl('time.none')
   const diff = Date.now() - ms
-  if (diff < 60_000) return '刚刚'
-  if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`
-  if (diff < 86_400_000) return `${Math.floor(diff / 3600_000)} 小时前`
-  if (diff < 30 * 86_400_000) return `${Math.floor(diff / 86_400_000)} 天前`
+  if (diff < 60_000) return lbl('time.justNow')
+  if (diff < 3600_000) return lbl('time.minutes', { n: String(Math.floor(diff / 60_000)) })
+  if (diff < 86_400_000) return lbl('time.hours', { n: String(Math.floor(diff / 3600_000)) })
+  if (diff < 30 * 86_400_000) return lbl('time.days', { n: String(Math.floor(diff / 86_400_000)) })
   return new Date(ms).toISOString().slice(0, 10)
 }
 
@@ -61,7 +64,7 @@ export const GLOBAL_PROJECT_CANON = '全局'
  *  热路径的语义，不能因为一个文案文件过期就 throw 掉整条注入链路。 */
 export function globalProjectMarker(): string {
   try {
-    return keyedValue('labels', 'project.global')
+    return lbl('project.global')
   } catch {
     return GLOBAL_PROJECT_CANON
   }
@@ -88,7 +91,7 @@ export function projectCovers(field: string | null, name: string): boolean {
 /** project 字段的展示标签：全局标记=真全局（按当前语言显示）；null/''=未标记；多值 join '/'（如 dsh/femwa）。 */
 export function projectLabel(field: string | null): string {
   if (isGlobalProject(field)) return globalProjectMarker()
-  if (field === null || field === '') return '未标记'
+  if (field === null || field === '') return lbl('project.unlabeled')
   return projectList(field).join('/')
 }
 

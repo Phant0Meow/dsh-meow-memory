@@ -29,6 +29,7 @@ import {
   projectList,
   isGlobalProject,
   globalProjectMarker,
+  relativeTime,
   collectDreamRounds,
   buildDreamMessage,
   windowNeedsDream,
@@ -593,6 +594,13 @@ check('global marker: en global is not a project name', (() => {
 check('global marker: real project names untouched under en', (() => {
   setPromptLang('en')
   try { return projectList('dsh, femwa').join('|') === 'dsh|femwa' && !projectCovers('dsh', 'femwa') } finally { setPromptLang('zh') }
+})())
+
+// 注入正文里的框架词（labels.md）：zh 输出与外置前逐字节一致，en 走英文包
+check('framework words: zh output unchanged', relativeTime(Date.now() - 5 * 60_000) === '5 分钟前' && relativeTime(null) === '无时间戳' && projectLabel(null) === '未标记')
+check('framework words: en pack renders english', (() => {
+  setPromptLang('en')
+  try { return relativeTime(Date.now() - 5 * 60_000) === '5 min ago' && relativeTime(null) === 'no timestamp' && projectLabel(null) === 'unlabeled' } finally { setPromptLang('zh') }
 })())
 // memory_update 刷新记忆时间戳（updated_at = 最后更新时间）
 const beforeTs = db.findById(kwId).row.updated_at

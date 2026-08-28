@@ -23,3 +23,24 @@
 - dream.row.keywordsLabel: 关键词:
 - dream.row.none: （无）
 - dream.topic.empty: （本组暂无已建立的 topic 记忆——回顾对话历史，如有新 topic 请按下方指导 2 创建）
+- project.unlabeled: 未标记
+- project.header: 【项目：{name}】
+- project.empty: 【项目：{name}】该项目暂无记忆条目。
+- project.section.overview: 项目概述
+- project.section.structure: 项目结构
+- project.section.decisions: 技术决策
+- project.section.quotes: 用户原话
+- project.section.ops: 部署与数据
+- project.section.todo: 项目进度
+- project.todoDone: 已完成：
+- project.todoOpen: To do list：
+- time.none: 无时间戳
+- time.justNow: 刚刚
+- time.minutes: {n} 分钟前
+- time.hours: {n} 小时前
+- time.days: {n} 天前
+- reflect.noProjects: （暂无）
+- remember.error.content: memory_remember: content 参数必填，请补充要记住的内容后重试
+- remember.error.project: memory_remember: project 参数必填——全局信息填"{global}"，具体项目填项目名（多个项目用英文逗号分隔），请补充后重试
+- remember.error.keywords: memory_remember: keywords 参数必填——请总结 8-13 个内容关键词供检索（不要用项目名当关键词），请补充后重试
+- remember.error.importance: memory_remember: importance 参数必填——请评估重要性：4=致命红线/健康安全，3=用户强调/全局适用，2=用户决策抽象总结，1=琐碎，请补充后重试

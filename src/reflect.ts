@@ -11,7 +11,7 @@
 
 import { createUserMessage, type MessageSource } from '@deepseek-ai/dsh-llm'
 import { getDb } from './db.js'
-import { resolveSlotText } from './prompt-loader.js'
+import { keyedValue, resolveSlotText } from './prompt-loader.js'
 
 const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'meow-memory' }
 
@@ -109,7 +109,7 @@ export function buildReflectMessage(workspace: string, turnText: string, dir = '
 
 /** project 清单展示（原 buildBasePrompt 逻辑：空清单显示占位说明）。 */
 function projectNamesText(projectNames: string[]): string {
-  return projectNames.length > 0 ? projectNames.join(' / ') : '（暂无）'
+  return projectNames.length > 0 ? projectNames.join(' / ') : keyedValue('labels', 'reflect.noProjects')
 }
 
 export { PLUGIN_SOURCE }
