@@ -190,9 +190,11 @@ All fields are optional (profile patch or `cordis.patch.yml`):
 
 ### promptLang: prompt & retrieval language (important)
 
-`promptLang` decides three things: ① the language of injected/reflection/dream prompts; ② the language of tool descriptions; ③ **the BM25 tokenizer language**. It also shapes the language the model writes memory entries in — and retrieval recall depends on queries and memory entries being tokenized the same way.
+`promptLang` decides two things: ① the language of injected/reflection/dream prompts; ② the language of tool descriptions. It also shapes the language the model writes memory entries in — keywords are extracted in the entry's language, so **go with your chat language**.
 
-**Set it explicitly on first use**: `'zh'` (default, Chinese bigram tokenizer) or `'en'` (English word tokenizer). If your chat language differs from your UI language, **go with your chat language** — a mismatch significantly degrades keyword-hit recall.
+**Set it explicitly on first use**: `'zh'` (default) or `'en'` (built-in English language pack). If your chat language differs from your UI language, **go with your chat language**.
+
+On the retrieval side: the BM25 tokenizer is language-independent since v0.20.0 (category routing) — a language mismatch between queries and stored entries no longer degrades recall; `en` additionally enables English normalization (stopword filter + Porter stemmer), so inflected queries still hit stored entries (`tokenizers` matches `tokenizer`).
 
 Language packs are data files (one directory per language under `src/prompts/`, hot-read at runtime — no code changes needed). See [`src/prompts/README.md`](src/prompts/README.md) for the contributor guide and `npm run check-lang`. Instance-level overrides: drop same-named slot files into `<home>/.dsh-meow/prompts/<lang>/` (partial overrides welcome).
 

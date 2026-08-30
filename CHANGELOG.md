@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.22.0 (2026-08-30)
+
+### English language pack + English tokenizer（首个社区语言包，PR #6 by @daveycodez）
+
+- **内置 `en` 语言包**：9 个槽位全部英译（system-guide / reflect / dream-header / dream-atomic / dream-topic / dream-project-summary / welcome-guide / labels / tools），`promptLang: 'en'` 即用。阈值按英文习惯换算：fact/lesson ≤30 words、topic ≤180 words（zh 为 60/300 字）；关键词指南补充英文特有建议——词典原形入库（分词器已做词干还原，单复数各占一个槽位是浪费）、不要用停用词当关键词。
+- **英语分词归一化**（en 模式产出后追加；v0.20.0 类别路由主干语言无关，不回退）：①停用词过滤——英语功能词每条记忆都有，会稀释命中链路覆盖率分母，撇号切分残留的 s/t/ll 碎片一并丢弃；②Porter (1980) 词干还原（零依赖移植，论文 77 个规范用例全过）——caches/caching/cached 归并同一词干，query 写复数、条目存单数也能命中（`tokenizers` 命中 `tokenizer`）；含数字 token（2024/sha256）跳过还原。关键词仍原样存库，只在匹配时归一。
+- **全局标记语言感知（英文包真 blocker 修复）**：`全局` 不只是文案，代码拿它当语义哨兵比对（projectList/projectCovers/projectLabel/命中链路/锚定）。英文包让模型写 `"global"` 时，旧代码会造出一个叫 global 的假项目——全局 rules 不再注入、项目列表凭空多项。现在 `db.ts` 提供 `GLOBAL_PROJECT_CANON`（真值永远认，老库条目跨语言切换不失效）+ `globalProjectMarker()`（labels.md `project.global`，按语言缓存——检索热路径逐行读文件要 ~7ms/200 条）+ `isGlobalProject()`（容忍大小写与首尾空白，双认真值与当前语言写法）；inject/tools 全部「全局」字面量判断收敛到这一个入口，dream 走 projectList 天然语言感知。
+- **17 个框架词外置 labels.md**：相对时间（time.*）、memory_project 段落标题（project.section.* / 已完成 / To do list / 【项目：X】）、memory_remember 四必填报错（remember.error.*，project 报错带 `{global}` 插值——原硬编码会叫英文模型填「全局」）。zh 值逐字节不变（测试断言），段落构造落位在 v0.21.0 共用的 `buildProjectSectionText`，memory_project 与压缩重注入零分叉。
+- **README 修正**：promptLang 段落仍是 v0.19.0 旧描述（"分词器语言 / en=英文整词分词"），按 v0.20.0 类别路由现状改写——分词语言无关、语言不一致不再杀检索；`en` 模式额外启用英语归一化。
+- 测试：主套件 317 + client 45 全绿；新增 global marker 6 项 / en 分词 10 项 / Porter 19 规范用例 / 屈折端到端检索 / zh 框架词逐字节断言。`check-lang -- en` 绿（顺带抓出 PR 未见的 v0.21.0 键 `inject.reinjectSection`/`inject.reinjectIntro` 并补齐——缺键会让英文压缩重注入 throw）。
+
 ## v0.21.0 (2026-08-29)
 
 ### 压缩重注入：/compact 之后一个回合补回记性
