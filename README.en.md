@@ -48,6 +48,11 @@ frozen at the last conversation timestamp.
   fills the rest from the ranking while skipping already-seen entries; a session-compaction
   signal (`compaction/*`) releases the seen records so compressed-away
   memories can be hit again.
+- **Post-compaction re-injection**: after a session is compacted (manual `/compact` or
+  automatic token-pressure compaction), the next user-message turn automatically re-injects
+  the long-term memory snapshot plus the project overviews this session previously fetched
+  via `memory_project` (rebuilt from the latest data) — the memory compacted away comes
+  back within one turn, so the AI never suddenly goes amnesiac after compaction.
 - **Toolset**: `memory_remember` (write, dedup merge, returns read-back confirmation:
   keywords/project; accepts a `keywords` parameter — reflection/dream turns have the LLM
   summarize 5–10 content words, auto bigram extraction as fallback) / `memory_search`

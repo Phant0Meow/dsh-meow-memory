@@ -13,7 +13,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Doc } from './bm25.js'
 import { keywordHitScore, search, tokenize } from './bm25.js'
-import { projectCovers, projectLabel, relativeTime, type MemoryDb, type MemoryRow } from './db.js'
+import { memoryDbPath, projectCovers, projectLabel, relativeTime, PROJECT_SUBCATEGORIES, type MemoryDb, type MemoryRow, type ProjectSubcategory } from './db.js'
 import { fillTemplate, keyedValue } from './prompt-loader.js'
 
 export interface InjectOptions {
@@ -37,23 +37,49 @@ export interface SessionSeen {
   injected: string[]
   searched: string[]
   accessed: string[]
+  /** 本会话 AI 调 memory_project 查阅过的项目名（v0.21.0，按查询顺序、去重、
+   *  最多保留 MAX_REINJECT_PROJECTS 个最近项）：会话压缩后重注入项目全景的清单。
+   *  '全局' 不记（全局 soul/user/rules 已在快照层，非项目）；多项目参数按逗号拆开记。 */
+  projectsQueried: string[]
+  /** 压缩成功落地后置 true（v0.21.0）：下一个含真实用户消息的 pre-step 注入
+   *  压缩重注入块（长期记忆快照 + 项目全景），随后清回 false。 */
+  reinjectPending: boolean
   /** 当前 project 锚定（最近一次带 project 参数的 memory 工具调用）：命中检索限定"全局+当前项目"。 */
   currentProject: string | null
 }
 
+/** projectsQueried 保留上限：压缩重注入的项目全景个数上限（防极端会话注入膨胀）。 */
+export const MAX_REINJECT_PROJECTS = 8
+
 function readSeenFile(workspace: string, sessionId: string, dir: string): SessionSeen {
   try {
     const text = readFileSync(sessionsFile(workspace, sessionId, dir), 'utf8')
-    const parsed = JSON.parse(text) as { injected?: unknown; searched?: unknown; accessed?: unknown; currentProject?: unknown }
+    const parsed = JSON.parse(text) as Record<string, unknown>
     return {
       injected: Array.isArray(parsed.injected) ? parsed.injected.filter((x): x is string => typeof x === 'string') : [],
       searched: Array.isArray(parsed.searched) ? parsed.searched.filter((x): x is string => typeof x === 'string') : [],
       accessed: Array.isArray(parsed.accessed) ? parsed.accessed.filter((x): x is string => typeof x === 'string') : [],
+      projectsQueried: Array.isArray(parsed.projectsQueried) ? parsed.projectsQueried.filter((x): x is string => typeof x === 'string') : [],
+      reinjectPending: parsed.reinjectPending === true,
       currentProject: typeof parsed.currentProject === 'string' && parsed.currentProject.length > 0 ? parsed.currentProject : null,
     }
   } catch {
-    return { injected: [], searched: [], accessed: [], currentProject: null }
+    return { injected: [], searched: [], accessed: [], projectsQueried: [], reinjectPending: false, currentProject: null }
   }
+}
+
+/** 统一写 sessions/<id>.json（全部字段一次写全——新增字段只改这里，防散落漏写）。 */
+function writeSeenFile(workspace: string, sessionId: string, seen: SessionSeen, dir: string): void {
+  const file = sessionsFile(workspace, sessionId, dir)
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, JSON.stringify({
+    injected: seen.injected,
+    searched: seen.searched,
+    accessed: seen.accessed,
+    projectsQueried: seen.projectsQueried,
+    reinjectPending: seen.reinjectPending,
+    currentProject: seen.currentProject,
+  }), 'utf8')
 }
 
 /** 读本会话已注入 id 列表（文件不存在返回空数组）。 */
@@ -64,12 +90,11 @@ export function readInjected(workspace: string, sessionId: string, dir = '.dsh-m
 /** 追加写入已注入 id。 */
 export function markInjected(workspace: string, sessionId: string, ids: string[], dir = '.dsh-meow'): void {
   if (ids.length === 0) return
-  const file = sessionsFile(workspace, sessionId, dir)
-  mkdirSync(dirname(file), { recursive: true })
   const seen = readSeenFile(workspace, sessionId, dir)
   const set = new Set(seen.injected)
   for (const id of ids) set.add(id)
-  writeFileSync(file, JSON.stringify({ injected: [...set], searched: seen.searched, accessed: seen.accessed, currentProject: seen.currentProject }), 'utf8')
+  seen.injected = [...set]
+  writeSeenFile(workspace, sessionId, seen, dir)
 }
 
 /** 本会话全部"已见" id（注入 + 检索 + 查阅），dream 第一轮清单范围 + 检索排除用。 */
@@ -81,36 +106,75 @@ export function readSeen(workspace: string, sessionId: string, dir = '.dsh-meow'
 /** 追加已检索返回的 id（memory_search / memory_find_similar 命中后调用）。 */
 export function markSearched(workspace: string, sessionId: string, ids: string[], dir = '.dsh-meow'): void {
   if (ids.length === 0) return
-  const file = sessionsFile(workspace, sessionId, dir)
-  mkdirSync(dirname(file), { recursive: true })
   const seen = readSeenFile(workspace, sessionId, dir)
   const set = new Set(seen.searched)
   for (const id of ids) set.add(id)
-  writeFileSync(file, JSON.stringify({ injected: seen.injected, searched: [...set], accessed: seen.accessed, currentProject: seen.currentProject }), 'utf8')
+  seen.searched = [...set]
+  writeSeenFile(workspace, sessionId, seen, dir)
 }
 
 /** 追加 memory_read 读过的 id（v0.17.0）：dream 第一轮"查阅过"源。
  *  只由 memory_read 单条读取触发；memory_project 全景不标记（第三轮项目总结专门复查）。 */
 export function markAccessed(workspace: string, sessionId: string, ids: string[], dir = '.dsh-meow'): void {
   if (ids.length === 0) return
-  const file = sessionsFile(workspace, sessionId, dir)
-  mkdirSync(dirname(file), { recursive: true })
   const seen = readSeenFile(workspace, sessionId, dir)
   const set = new Set(seen.accessed)
   for (const id of ids) set.add(id)
-  writeFileSync(file, JSON.stringify({ injected: seen.injected, searched: seen.searched, accessed: [...set], currentProject: seen.currentProject }), 'utf8')
+  seen.accessed = [...set]
+  writeSeenFile(workspace, sessionId, seen, dir)
+}
+
+/** 记录 memory_project 查阅过的项目（v0.21.0）：压缩重注入清单。
+ *  '全局'/空串跳过；多项目参数按逗号拆开逐个记；重复查询移到末尾（最近优先）；
+ *  超过 MAX_REINJECT_PROJECTS 淘汰最旧的。 */
+export function markProjectQueried(workspace: string, sessionId: string, project: string, dir = '.dsh-meow'): void {
+  const names = project.split(',').map((p) => p.trim()).filter((p) => p.length > 0 && p !== '全局')
+  if (names.length === 0) return
+  const seen = readSeenFile(workspace, sessionId, dir)
+  const ordered = seen.projectsQueried.filter((p) => !names.includes(p))
+  ordered.push(...names)
+  seen.projectsQueried = ordered.slice(-MAX_REINJECT_PROJECTS)
+  writeSeenFile(workspace, sessionId, seen, dir)
+}
+
+/** 读本会话查阅过的项目清单（压缩重注入用；文件不存在返回空数组）。 */
+export function readProjectQueried(workspace: string, sessionId: string, dir = '.dsh-meow'): string[] {
+  return readSeenFile(workspace, sessionId, dir).projectsQueried
+}
+
+/** 压缩成功落地后置位（compaction/end 无 error 时调用）：下一个含真实用户消息的
+ *  pre-step 注入压缩重注入块。 */
+export function markReinjectPending(workspace: string, sessionId: string, dir = '.dsh-meow'): void {
+  const seen = readSeenFile(workspace, sessionId, dir)
+  if (seen.reinjectPending) return
+  seen.reinjectPending = true
+  writeSeenFile(workspace, sessionId, seen, dir)
+}
+
+/** 清除重注入待办（重注入块注入完成后调用；幂等）。 */
+export function clearReinjectPending(workspace: string, sessionId: string, dir = '.dsh-meow'): void {
+  const seen = readSeenFile(workspace, sessionId, dir)
+  if (!seen.reinjectPending) return
+  seen.reinjectPending = false
+  writeSeenFile(workspace, sessionId, seen, dir)
+}
+
+/** 读重注入待办标记。 */
+export function isReinjectPending(workspace: string, sessionId: string, dir = '.dsh-meow'): boolean {
+  return readSeenFile(workspace, sessionId, dir).reinjectPending
 }
 
 /** 释放本会话已见记录（收到会话压缩信号后调用）：清空 injected/searched，
  *  允许之前注入/检索过的记忆被再次命中提取——压缩后它们的内容已不在上下文里。
  *  accessed 不清（用户拍板 2026-08-25）：它只服务 dream 扫尾范围、没有去重功能，
  *  清掉纯丢信息——长窗口压缩前读过的条目恰恰最该被 dream 复查。
- *  当前 project 锚定保留（与可见性无关）。 */
+ *  当前 project 锚定保留（与可见性无关）；projectsQueried/reinjectPending 保留
+ *  （它们正是压缩重注入的数据源，见 buildReinjection）。 */
 export function releaseSeen(workspace: string, sessionId: string, dir = '.dsh-meow'): void {
-  const file = sessionsFile(workspace, sessionId, dir)
-  mkdirSync(dirname(file), { recursive: true })
   const seen = readSeenFile(workspace, sessionId, dir)
-  writeFileSync(file, JSON.stringify({ injected: [], searched: [], accessed: seen.accessed, currentProject: seen.currentProject }), 'utf8')
+  seen.injected = []
+  seen.searched = []
+  writeSeenFile(workspace, sessionId, seen, dir)
 }
 
 /** 读当前 project 锚定（最近一次带 project 参数的 memory 工具调用）；未锚定返回 null。 */
@@ -120,10 +184,9 @@ export function getCurrentProject(workspace: string, sessionId: string, dir = '.
 
 /** 锚定当前 project：memory 工具调用带 project 参数时更新会话状态（命中检索用它，免扫历史）。 */
 export function setCurrentProject(workspace: string, sessionId: string, project: string, dir = '.dsh-meow'): void {
-  const file = sessionsFile(workspace, sessionId, dir)
-  mkdirSync(dirname(file), { recursive: true })
   const seen = readSeenFile(workspace, sessionId, dir)
-  writeFileSync(file, JSON.stringify({ injected: seen.injected, searched: seen.searched, accessed: seen.accessed, currentProject: project }), 'utf8')
+  seen.currentProject = project
+  writeSeenFile(workspace, sessionId, seen, dir)
 }
 
 function toDocs(rows: MemoryRow[]): Doc[] {
@@ -149,22 +212,16 @@ function shortTitle(row: MemoryRow, max: number): string {
 void shortTitle
 
 /**
- * 构造首轮长期记忆注入块（用户拍板格式）：
- *   顶格「===== 长期记忆 =====」→ 【关于你】(soul) / 【关于user】/ 【设计原则】/ 【记忆导引】(两行)
- *   →「===== 长期记忆结束 =====」+「本轮用户prompt：」。
- * 首轮只注入长期记忆，不做关键词命中（命中链路从第二轮起，见 buildHitInjection）；
- * 正文注入的 id 记入已见（命中链路不再重复注入它们）。
- * @returns { text, injectedIds }；无任何可注入内容返回 null。
+ * 构造长期记忆快照正文（buildInjection / buildReinjection 共用）：
+ *   顶格「===== 长期记忆 =====」→ 【关于你】(soul) / 【关于user】/ 【设计原则】/ 【记忆导引】(两行)。
+ * 不含结束标记与「本轮用户prompt：」尾巴（两链路各自拼装），也不做已见记账（调用方负责）。
+ * @returns null = 只有标题头，无任何可注入内容。
  */
-export function buildInjection(
+function buildInjectionBody(
   db: MemoryDb,
-  workspace: string,
-  sessionId: string,
-  _firstUserText: string,
-  opts: Partial<InjectOptions> = {},
-  dir = '.dsh-meow',
-): { text: string; injectedIds: string[] } | null {
-  const o = { ...DEFAULT_OPTS, ...opts }
+  o: InjectOptions,
+): { body: string; injectedIds: string[] } | null {
+  void o // 导引不再截断标题；保留参数位以维持两链路签名对称
   // 框架词外置（v0.19.0）：labels.md 的 inject.* 键；记忆条目正文本身是数据不是文案，不外置。
   const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
   const soul = db.list('soul', { status: 'active' })
@@ -201,10 +258,163 @@ export function buildInjection(
   }
 
   if (lines.length <= 2) return null // 只有标题头，无任何内容
-  const body = lines.join('\n').trimEnd()
-  const text = `${body}\n\n${lbl('inject.end')}\n\n${lbl('inject.promptLabel')}\n\n`
-  if (injected.length > 0) markInjected(workspace, sessionId, injected, dir)
-  return { text, injectedIds: injected }
+  return { body: lines.join('\n').trimEnd(), injectedIds: injected }
+}
+
+/**
+ * 构造首轮长期记忆注入块（用户拍板格式）：
+ *   顶格「===== 长期记忆 =====」→ 【关于你】(soul) / 【关于user】/ 【设计原则】/ 【记忆导引】(两行)
+ *   →「===== 长期记忆结束 =====」+「本轮用户prompt：」。
+ * 首轮只注入长期记忆，不做关键词命中（命中链路从第二轮起，见 buildHitInjection）；
+ * 正文注入的 id 记入已见（命中链路不再重复注入它们）。
+ * @returns { text, injectedIds }；无任何可注入内容返回 null。
+ */
+export function buildInjection(
+  db: MemoryDb,
+  workspace: string,
+  sessionId: string,
+  _firstUserText: string,
+  opts: Partial<InjectOptions> = {},
+  dir = '.dsh-meow',
+): { text: string; injectedIds: string[] } | null {
+  const o = { ...DEFAULT_OPTS, ...opts }
+  const built = buildInjectionBody(db, o)
+  if (built === null) return null
+  const text = `${built.body}\n\n${keyedValue('labels', 'inject.end')}\n\n${keyedValue('labels', 'inject.promptLabel')}\n\n`
+  if (built.injectedIds.length > 0) markInjected(workspace, sessionId, built.injectedIds, dir)
+  return { text, injectedIds: built.injectedIds }
+}
+
+/** 子标签 → 注入段落标题。 */
+const PROJECT_SECTION_TITLES: Record<ProjectSubcategory, string> = {
+  overview: '项目概述',
+  structure: '项目结构',
+  decisions: '技术决策',
+  quotes: '用户原话',
+  ops: '部署与数据',
+  todo: '项目进度',
+}
+
+/** 组内排序：记忆时间戳（updated_at）旧→新，相同按创建时间；null 视为最旧。 */
+function sortByUpdatedAt(list: MemoryRow[]): MemoryRow[] {
+  return [...list].sort((a, b) => (a.updated_at ?? 0) - (b.updated_at ?? 0) || a.created_at - b.created_at)
+}
+
+/** 项目全景条目行（原文视图）：归属 + 完整 id + 绝对/相对时间戳，第二行完整内容。
+ *  归属显示：'全局'=真全局；null=未标记（可能是数据 bug）；多值 join '/'。 */
+function fmtProjectRow(r: MemoryRow): string {
+  const abs = new Date(r.updated_at).toISOString().slice(0, 16).replace('T', ' ')
+  return `[${projectLabel(r.project)} : ${r.level}] [${r.id}] ${abs} [${relativeTime(r.updated_at)}]\n${r.content}`
+}
+
+/**
+ * 构造项目全景注入段落（memory_project 工具与压缩重注入共用，v0.21.0 从 tools.ts 迁入）：
+ * 【项目：X】+ 项目设计原则(rules，放最前——规则优先于事实) + 各子标签分组
+ * （组内按记忆时间戳旧→新；todo 含已完成最近 5 条）+ 检索说明尾注。
+ * 非 todo 子标签只取 active；条目正文本身是数据，不做文案外置。
+ * @returns null = 项目无任何可注入段落（active 条目与已完成 todo 皆空）。
+ */
+export function buildProjectSectionText(db: MemoryDb, workspace: string, project: string, dir = '.dsh-meow'): string | null {
+  const rows = db.list('project', { project }).filter((r) => r.project === project)
+  const active = rows.filter((r) => r.status === 'active')
+  // todo 已完成：stale 且 updated_at 非空，按 updated_at 取最近 5 条（展示仍按旧→新）。
+  const done = sortByUpdatedAt(
+    rows
+      .filter((r) => r.subcategory === 'todo' && r.status === 'stale' && r.updated_at !== null)
+      .sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0))
+      .slice(0, 5),
+  )
+  const bySub = new Map<ProjectSubcategory, MemoryRow[]>()
+  for (const r of active) {
+    const sub = r.subcategory ?? 'overview' // 早期无子类条目归概述组
+    const list = bySub.get(sub) ?? []
+    list.push(r)
+    bySub.set(sub, list)
+  }
+  const sections: string[] = []
+  // 项目设计原则（rules，project 特定）：放最前——规则优先于事实。
+  const projectRules = sortByUpdatedAt(
+    db.list('rules', { project }).filter((r) => r.project === project && r.status === 'active'),
+  )
+  if (projectRules.length > 0) {
+    sections.push(`设计原则\n${projectRules.map(fmtProjectRow).join('\n')}`)
+  }
+  for (const sub of PROJECT_SUBCATEGORIES) {
+    if (sub === 'todo') {
+      const todos = sortByUpdatedAt(bySub.get('todo') ?? [])
+      if (todos.length === 0 && done.length === 0) continue
+      const lines = [PROJECT_SECTION_TITLES.todo]
+      if (done.length > 0) {
+        lines.push('已完成：')
+        for (const r of done) lines.push(fmtProjectRow(r))
+      }
+      if (todos.length > 0) {
+        lines.push('To do list：')
+        for (const r of todos) lines.push(fmtProjectRow(r))
+      }
+      sections.push(lines.join('\n'))
+    } else {
+      const list = sortByUpdatedAt(bySub.get(sub) ?? [])
+      if (list.length === 0) continue
+      sections.push(`${PROJECT_SECTION_TITLES[sub]}\n${list.map(fmtProjectRow).join('\n')}`)
+    }
+  }
+  if (sections.length === 0) return null
+  const dbPath = memoryDbPath(workspace, dir)
+  return [
+    `【项目：${project}】`,
+    '',
+    sections.join('\n\n'),
+    '',
+    '——',
+    '说明：此处只提供 active 的记忆。',
+    `如果你想看非 active 条目（archived=删除 / stale=完结），或某条记忆的具体时间戳（记忆时间戳=该窗口 dream 封存时刻）、记忆来源（source_session）、重要性、关键词等元数据，可以直接去搜记忆库 SQLite：${dbPath}`,
+    '（库内结构：七层表 soul/user/project/fact/lesson/topic/rules，字段含 id/title/content/importance/keywords/status/corrected/project/subcategory/goal/source_session/created_at/updated_at（记忆时间戳=最后更新时间）/last_accessed_at；另有 dream_log 整理留痕表、windows 窗口时间表；也可按 id 用 memory_read 看单条完整元数据）',
+    `如果你想了解未被记录的更多细节，可以直接去搜会话历史目录（dsh 的 session 日志，位置由 DSH_HOME 决定，默认 ~/.dsh/sessions，喵版为 dsh-home/sessions），按会话 id 查原始记录。`,
+  ].join('\n')
+}
+
+/**
+ * 构造压缩重注入块（v0.21.0）：长期记忆快照正文（与首轮 buildInjection 同款）+
+ * 【会话已压缩】说明 + 本会话此前查阅过的项目全景（按当前库最新数据重新构造，
+ * 空项目跳过；项目全景条目按现行原则不标记已见）。尾注与首轮一致
+ * （「===== 长期记忆结束 =====」+「本轮用户prompt：」）。
+ * 快照条目 id 重新记入 injected——压缩后内容重新进入上下文，去重语义随之恢复。
+ * @returns null = 无任何可注入内容（库无快照正文且项目全空）；调用方仍应清除
+ *          reinjectPending，避免每个用户消息轮空转重查。
+ */
+export function buildReinjection(
+  db: MemoryDb,
+  workspace: string,
+  sessionId: string,
+  projects: readonly string[],
+  opts: Partial<InjectOptions> = {},
+  dir = '.dsh-meow',
+): { text: string; injectedIds: string[] } | null {
+  const o = { ...DEFAULT_OPTS, ...opts }
+  const snapshot = buildInjectionBody(db, o)
+  const projectTexts: string[] = []
+  for (const project of projects) {
+    const text = buildProjectSectionText(db, workspace, project, dir)
+    if (text !== null) projectTexts.push(text)
+  }
+  if (snapshot === null && projectTexts.length === 0) return null
+  const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
+  const lines: string[] = []
+  if (snapshot !== null) {
+    lines.push(snapshot.body)
+    lines.push('')
+  }
+  if (projectTexts.length > 0) {
+    lines.push(lbl('inject.sectionFormat', { label: lbl('inject.reinjectSection') }))
+    lines.push(lbl('inject.reinjectIntro'))
+    lines.push('')
+    lines.push(projectTexts.join('\n\n'))
+    lines.push('')
+  }
+  const text = `${lines.join('\n').trimEnd()}\n\n${keyedValue('labels', 'inject.end')}\n\n${keyedValue('labels', 'inject.promptLabel')}\n\n`
+  if (snapshot !== null && snapshot.injectedIds.length > 0) markInjected(workspace, sessionId, snapshot.injectedIds, dir)
+  return { text, injectedIds: snapshot !== null ? snapshot.injectedIds : [] }
 }
 
 /** 关键词命中查询（首轮与每条消息链路共用）：active 的 fact/lesson/rules/topic，

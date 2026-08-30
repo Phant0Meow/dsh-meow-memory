@@ -39,6 +39,9 @@
   按会话记录（`.dsh-meow/sessions/<id>.json`）：注入绝不重复；`memory_search` 前 5 条按相关度
   无脑取（不排除已见/本 session 建立的记忆），其余从排名后续绕开已见补齐；收到会话压缩
   信号（`compaction/*`）时释放已见记录，允许压缩后被再次命中提取。
+- **压缩后重注入**：会话被压缩（手动 `/compact` 或 token 压力自动触发）后，下一个用户
+  消息轮自动重新注入长期记忆快照 + 本会话此前用 `memory_project` 查阅过的项目全景
+  （按最新数据重新整理）——压缩甩掉的"记性"一个回合就补回来，AI 不会因为压缩突然失忆。
 - **工具集**：`memory_remember`（写入，必填 content/project/keywords/importance 且缺失报错引导重填，
   自动去重合并，返回读回确认：关键词/项目归属）/
   `memory_search`（BM25 × 近期权重，支持 level/project/status/days 过滤，默认 top10 = 前 5 条

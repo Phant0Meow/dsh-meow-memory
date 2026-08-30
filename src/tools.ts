@@ -10,12 +10,12 @@
 
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { findSimilar, search, tokenize, type RankedHit } from './bm25.js'
-import { getDb, getDreamWorkspace, memoryDbPath, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
+import { getDb, getDreamWorkspace, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
 import { keyedValue } from './prompt-loader.js'
 
 /** tools.md 键值取用（prompt 文案外置 v0.19.0）：缺键时 keyedValue throw。 */
 const T = (key: string): string => keyedValue('tools', key)
-import { readSeen, markAccessed, markSearched, setCurrentProject } from './inject.js'
+import { buildProjectSectionText, markProjectQueried, readSeen, markAccessed, markSearched, setCurrentProject } from './inject.js'
 
 export type { Level }
 
@@ -610,33 +610,12 @@ function updateTool(dir: string): ToolDefinition {
   }
 }
 
-/** 子标签 → 注入段落标题。 */
-const PROJECT_SECTION_TITLES: Record<ProjectSubcategory, string> = {
-  overview: '项目概述',
-  structure: '项目结构',
-  decisions: '技术决策',
-  quotes: '用户原话',
-  ops: '部署与数据',
-  todo: '项目进度',
-}
-
-/** 组内排序：记忆时间戳（updated_at）旧→新，相同按创建时间；null 视为最旧。 */
-function sortByUpdatedAt(list: MemoryRow[]): MemoryRow[] {
-  return [...list].sort((a, b) => (a.updated_at ?? 0) - (b.updated_at ?? 0) || a.created_at - b.created_at)
-}
-
-/** memory_project 条目行（原文视图）：归属 + 完整 id + 绝对/相对时间戳，第二行完整内容。
- *  归属显示：'全局'=真全局；null=未标记（可能是数据 bug）；多值 join '/'。 */
-function fmtProjectRow(r: MemoryRow): string {
-  const abs = new Date(r.updated_at).toISOString().slice(0, 16).replace('T', ' ')
-  return `[${projectLabel(r.project)} : ${r.level}] [${r.id}] ${abs} [${relativeTime(r.updated_at)}]\n${r.content}`
-}
-
 /**
  * memory_project：取回某项目的完整注入段落（用户拍板规格）。
  * - 非 todo 子标签：active 条目全部；
  * - todo 子标签：active 全部为「To do list：」+ stale（已完成）按 updated_at 取最近 5 条为「已完成：」；
  * - 组内按记忆时间戳旧→新；只拼 content 纯文本，不写复杂格式。
+ * 段落构造与压缩重注入共用 buildProjectSectionText（v0.21.0，inject.ts）。
  */
 function projectTool(dir: string): ToolDefinition {
   return {
@@ -675,65 +654,14 @@ function projectTool(dir: string): ToolDefinition {
       // 锚定当前 project：用户话题切到某项目时 AI 调 memory_project → 命中检索立即跟进；"全局"与多项目不锚定。
       const sessionId = sessionIdOf(exec)
       if (project !== '全局' && !project.includes(',')) setCurrentProject(workspace, sessionId ?? 'unknown', project, dir)
-      const rows = db.list('project', { project }).filter((r) => r.project === project)
-      const active = rows.filter((r) => r.status === 'active')
-      // todo 已完成：stale 且 updated_at 非空，按 updated_at 取最近 5 条（展示仍按旧→新）。
-      const done = sortByUpdatedAt(
-        rows
-          .filter((r) => r.subcategory === 'todo' && r.status === 'stale' && r.updated_at !== null)
-          .sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0))
-          .slice(0, 5),
-      )
-      const bySub = new Map<ProjectSubcategory, MemoryRow[]>()
-      for (const r of active) {
-        const sub = r.subcategory ?? 'overview' // 早期无子类条目归概述组
-        const list = bySub.get(sub) ?? []
-        list.push(r)
-        bySub.set(sub, list)
-      }
-      const sections: string[] = []
-      // 项目设计原则（rules，project 特定）：放最前——规则优先于事实。
-      const projectRules = sortByUpdatedAt(
-        db.list('rules', { project }).filter((r) => r.project === project && r.status === 'active'),
-      )
-      if (projectRules.length > 0) {
-        sections.push(`设计原则\n${projectRules.map(fmtProjectRow).join('\n')}`)
-      }
-      for (const sub of PROJECT_SUBCATEGORIES) {
-        if (sub === 'todo') {
-          const todos = sortByUpdatedAt(bySub.get('todo') ?? [])
-          if (todos.length === 0 && done.length === 0) continue
-          const lines = [PROJECT_SECTION_TITLES.todo]
-          if (done.length > 0) {
-            lines.push('已完成：')
-            for (const r of done) lines.push(fmtProjectRow(r))
-          }
-          if (todos.length > 0) {
-            lines.push('To do list：')
-            for (const r of todos) lines.push(fmtProjectRow(r))
-          }
-          sections.push(lines.join('\n'))
-        } else {
-          const list = sortByUpdatedAt(bySub.get(sub) ?? [])
-          if (list.length === 0) continue
-          sections.push(`${PROJECT_SECTION_TITLES[sub]}\n${list.map(fmtProjectRow).join('\n')}`)
-        }
-      }
-      if (sections.length === 0) {
+      // 查阅留痕（v0.21.0）：本会话查阅过的项目记入 sessions/<id>.json——会话压缩成功后
+      // 按此清单重注入项目全景。'全局' 不记（markProjectQueried 内部过滤，全局层走快照）；
+      // 多项目参数按逗号拆开逐个记（重注入按单项目段落拼装）。
+      markProjectQueried(workspace, sessionId ?? 'unknown', project, dir)
+      const text = buildProjectSectionText(db, workspace, project, dir)
+      if (text === null) {
         return { project, text: `【项目：${project}】该项目暂无记忆条目。` }
       }
-      const dbPath = memoryDbPath(workspace, dir)
-      const text = [
-        `【项目：${project}】`,
-        '',
-        sections.join('\n\n'),
-        '',
-        '——',
-        '说明：此处只提供 active 的记忆。',
-        `如果你想看非 active 条目（archived=删除 / stale=完结），或某条记忆的具体时间戳（记忆时间戳=该窗口 dream 封存时刻）、记忆来源（source_session）、重要性、关键词等元数据，可以直接去搜记忆库 SQLite：${dbPath}`,
-        '（库内结构：七层表 soul/user/project/fact/lesson/topic/rules，字段含 id/title/content/importance/keywords/status/corrected/project/subcategory/goal/source_session/created_at/updated_at（记忆时间戳=最后更新时间）/last_accessed_at；另有 dream_log 整理留痕表、windows 窗口时间表；也可按 id 用 memory_read 看单条完整元数据）',
-        `如果你想了解未被记录的更多细节，可以直接去搜会话历史目录（dsh 的 session 日志，位置由 DSH_HOME 决定，默认 ~/.dsh/sessions，喵版为 dsh-home/sessions），按会话 id 查原始记录。`,
-      ].join('\n')
       return { project, text }
     },
     presentCall(args: unknown): { card: 'generic'; title: string; kind: 'read' } {

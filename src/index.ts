@@ -39,7 +39,7 @@ import {
   shortSessionId,
   type DreamConfig,
 } from './dream.js'
-import { buildHitInjection, buildInjection, markAccessed, markSearched, readSeen, readInjected, releaseSeen } from './inject.js'
+import { buildHitInjection, buildInjection, buildReinjection, clearReinjectPending, isReinjectPending, markAccessed, markReinjectPending, markSearched, readProjectQueried, readSeen, readInjected, releaseSeen } from './inject.js'
 import { migrateLegacy } from './migrate.js'
 import { buildReflectMessage, consecutiveToolSteps, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { registerMemoryTools } from './tools.js'
@@ -293,6 +293,18 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       }
       return
     }
+    // 压缩成功落地（compaction/end 无 error = 表层已替换，v0.21.0）：置重注入待办——
+    // 下一个含真实用户消息的 pre-step 重新注入「长期记忆快照 + 本会话查阅过的项目全景」。
+    // /compact 手动压缩与 token 压力自动压缩走同一生命周期，都覆盖。
+    // 带 error 的 end = 压缩失败、表层未变（原上下文还在），不打标记。
+    if (t === 'compaction/end') {
+      const err = (event.data as { error?: unknown } | undefined)?.error
+      if ((err === undefined || err === null || err === '') && typeof sid === 'string' && typeof cwd === 'string') {
+        markReinjectPending(cwd, sid, resolved.projectDir)
+        ctx.logger.info(`meow-memory: compaction finished, memory re-injection armed for session ${shortSessionId(sid)}`)
+      }
+      return
+    }
     if (typeof sid === 'string') {
       if (t === 'turn/start') {
         isPluginTurn.set(sid, false) // 新轮重置
@@ -347,6 +359,28 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     // 真实用户消息（跳过插件通知等，source.kind='plugin' 的进不来）。
     const userMsgs = decision.messages.filter((m) => m.source?.kind === 'user')
     if (userMsgs.length === 0) return decision // 工具轮/纯插件消息：不注入
+
+    // 压缩重注入（v0.21.0）：compaction/end 成功后置位的待办——下一个含真实用户
+    // 消息的请求在消息前注入「长期记忆快照 + 本会话此前查阅过的项目全景」，然后清待办。
+    // 本轮不跑命中链路（等同新首轮：快照先行，命中从下一轮起）。待办置位但无可注入
+    // 内容（库空且项目全空）也一并清除，避免每个用户消息轮空转重查。
+    if (ws && isReinjectPending(ws, sid, resolved.projectDir)) {
+      const lastUser = userMsgs[userMsgs.length - 1]
+      const db = getDb(ws, resolved.projectDir)
+      const reinj = buildReinjection(db, ws, sid, readProjectQueried(ws, sid, resolved.projectDir), {
+        hitTopK: resolved.hitTopK,
+        titleMax: resolved.titleMax,
+      }, resolved.projectDir)
+      clearReinjectPending(ws, sid, resolved.projectDir)
+      if (reinj !== null) {
+        const rewritten = decision.messages.map((m) => m === lastUser
+          ? { ...m, content: [{ type: 'text', text: reinj.text }, ...m.content] }
+          : m)
+        ctx.logger.info(`meow-memory: post-compaction memory re-injected (${reinj.text.length} chars)`)
+        return { ...decision, messages: rewritten }
+      }
+      return decision
+    }
 
     // 首条用户消息（本进程内每个会话只判定一次）。
     if (!firstUserHandled.has(sid)) {
@@ -772,7 +806,7 @@ export { PLUGIN_SOURCE, REFLECT_MARKER }
 export { collectDreamStates } from './dream-signal.js'
 export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel } from './db.js'
 export { migrateLegacy } from './migrate.js'
-export { buildHitInjection, buildInjection, readSeen, markSearched, markAccessed, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
+export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'

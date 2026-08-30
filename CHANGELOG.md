@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.21.0 (2026-08-29)
+
+### 压缩重注入：/compact 之后一个回合补回记性
+
+- **压缩成功自动重注入**：会话压缩生命周期走到 `compaction/end` 且无 error（= 表层已被替换，`/compact` 手动压缩与 token 压力自动压缩同覆盖）时，给 `sessions/<id>.json` 置 `reinjectPending` 待办——下一个含真实用户消息的请求注入「长期记忆快照 + 本会话此前查阅过的项目全景」，随后清待办。重注入轮等同新首轮：不跑命中链路，命中从下一轮起。压缩失败的 `end`（带 error，表层未变）不打标记。
+- **项目查阅留痕**：`memory_project` 每次成功调用把项目名记入 `sessions/<id>.json` 新字段 `projectsQueried`（'全局' 不记——全局层走快照；多项目参数按逗号拆开记；去重 + 最近优先，上限 `MAX_REINJECT_PROJECTS`=8 个）。重注入时按**当前库最新数据**重新构造项目全景（空项目跳过），不是缓存旧文本。
+- **快照 id 重新记账**：重注入的 soul/user/全局 rules 条目 id 重新记入 injected——压缩后内容重新进入上下文，去重语义随之恢复；`releaseSeen` 照旧清 injected/searched，但保留 `projectsQueried`/`reinjectPending`（它们正是重注入的数据源）。
+- **工具轮不消耗待办**：pending 置位期间的工具轮/纯插件消息轮不注入也不清标记，等下一个真实用户消息轮；子代理照旧不参与。无可注入内容（库空且项目全空）时仍清待办，防每轮空转。
+- **注入格式**：长期记忆快照（与首轮同格式，顶格 `===== 长期记忆 =====`）+ `【会话已压缩】` 说明段 + 各项目全景段 + 结束标记 + `本轮用户prompt：`；快照条目与项目全景段落构造共用同一实现（`buildProjectSectionText` 从 tools.ts 迁入 inject.ts，memory_project 工具与重注入零分叉）。
+- **工程**：sessions 文件 5 处散写收敛为统一 `writeSeenFile`（新增字段只改一处，防漏写）；新增模块级 + apply 级测试（查阅留痕/全局过滤/多项目拆分/LRU 上限/end 成功置待办/end 失败不打标/重注入内容与命中链路让位/待办清理/工具轮与子代理边界）。
+
+## v0.20.0（未单独发版，随 v0.21.0 同发）
+
+### tokenize 重设计：类别路由、语言无关
+
+- 旧版 zh=汉字 bigram、其他语言=ASCII 整词、其余字符全丢（非 zh 模式中文 0 token 检索不到）。新版按字符类别路由、语言无关：①CJK 类（\p{Script=Han}+平假名+片假名+々+ー）连续段相邻 bigram 常开，不随 promptLang 关闭，汉字假名交界不断 run；②`\p{L}\p{N}` 整词+小写（café/привет/한국어）；③NFKC 归一化（全角ＢＭ２５→bm25）；④`Array.from` 按 code point 迭代（surrogate pair 不切半，Ext B~I 汉字入 bigram）；⑤标点/符号/emoji 丢弃（防 IDF 污染）。promptLang 不再影响分词，只管文案语言；README/welcome-guide 的"语言不一致杀检索"警告已改写。stemming 仍是语言包扩展点。
+
 ## v0.19.0 (2026-08-28)
 
 ### prompt 文案外置 + 语言开关（海外用户 issue 驱动）

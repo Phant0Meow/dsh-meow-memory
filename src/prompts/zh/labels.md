@@ -12,6 +12,8 @@
 - inject.guideProjectLine: 当有项目相关任务时，应先用 memory_project 查项目全景（记得带上项目名，不能空参），这样可以对项目有整体理解。
 - inject.guideProjects: 用户的所有 project：{list}
 - inject.hitHeader: 可能相关的记忆，仅供参考：
+- inject.reinjectSection: 会话已压缩
+- inject.reinjectIntro: 本会话此前的上下文已被压缩。上面是长期记忆快照，下面是你此前用 memory_project 查阅过的项目记忆（已按最新数据重新整理）：
 - dream.title: 记忆整理任务（dream）
 - dream.round.atomic: 原子记忆条目
 - dream.round.topic: topic记忆条目

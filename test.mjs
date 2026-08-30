@@ -22,7 +22,11 @@ import {
   migrateLegacy,
   buildInjection,
   buildHitInjection,
+  buildReinjection,
   buildReflectMessage,
+  markProjectQueried,
+  readProjectQueried,
+  isReinjectPending,
   newId,
   projectCovers,
   projectLabel,
@@ -606,6 +610,44 @@ const reHit = await searchTool.execute({ query: '重新命中', project: 'dsh' }
 check('search re-hits after compaction', reHit.hits.some((h) => h.content.includes('压缩后应能重新命中')))
 dbSeen.close()
 
+// ── 压缩重注入（v0.21.0）：查阅留痕 / compaction/end 置待办 / buildReinjection ──
+const wsReinj = mkdtempSync(join(tmpdir(), 'mm-reinj-'))
+const dbReinj = new MemoryDb(memoryDbPath(wsReinj))
+dbReinj.insert({ level: 'soul', content: '重注入测试 soul 条目' })
+dbReinj.insert({ level: 'user', content: '重注入测试 user 条目' })
+dbReinj.insert({ level: 'project', content: 'femwa 项目重注入全景条目', project: 'femwa', subcategory: 'overview' })
+const reinjProjectTool = tools.find((t) => t.name === 'memory_project')
+const reinjProjCtx = { agent: { session: { header: { cwd: wsReinj, id: 's-reinj' } } } }
+await reinjProjectTool.execute({ project: 'femwa' }, reinjProjCtx)
+check('memory_project records projectsQueried', JSON.stringify(readProjectQueried(wsReinj, 's-reinj', '.dsh-meow')) === JSON.stringify(['femwa']))
+await reinjProjectTool.execute({ project: '全局' }, reinjProjCtx)
+check('memory_project 全局 not recorded', JSON.stringify(readProjectQueried(wsReinj, 's-reinj', '.dsh-meow')) === JSON.stringify(['femwa']))
+// markProjectQueried：多项目拆分 / 去重最近优先 / 上限淘汰 / 全局过滤
+markProjectQueried(wsReinj, 's-lru', 'x, y', '.dsh-meow')
+check('markProjectQueried splits multi-project param', JSON.stringify(readProjectQueried(wsReinj, 's-lru', '.dsh-meow')) === JSON.stringify(['x', 'y']))
+markProjectQueried(wsReinj, 's-lru2', 'a', '.dsh-meow')
+markProjectQueried(wsReinj, 's-lru2', 'b', '.dsh-meow')
+markProjectQueried(wsReinj, 's-lru2', '全局', '.dsh-meow')
+check('markProjectQueried skips 全局', JSON.stringify(readProjectQueried(wsReinj, 's-lru2', '.dsh-meow')) === JSON.stringify(['a', 'b']))
+markProjectQueried(wsReinj, 's-lru2', 'a', '.dsh-meow')
+check('markProjectQueried moves repeat to end', JSON.stringify(readProjectQueried(wsReinj, 's-lru2', '.dsh-meow')) === JSON.stringify(['b', 'a']))
+for (let i = 2; i <= 9; i++) markProjectQueried(wsReinj, 's-lru2', `p${i}`, '.dsh-meow')
+const lruList = readProjectQueried(wsReinj, 's-lru2', '.dsh-meow')
+check('markProjectQueried caps at MAX_REINJECT_PROJECTS', lruList.length === 8 && !lruList.includes('a') && !lruList.includes('b'))
+// buildReinjection：无可注入内容 → null（空库 + 项目全空）
+const wsReinjNull = mkdtempSync(join(tmpdir(), 'mm-reinj-null-'))
+const dbReinjNull = new MemoryDb(memoryDbPath(wsReinjNull))
+check('reinjection null when nothing to inject', buildReinjection(dbReinjNull, wsReinjNull, 's-x', ['nope'], {}, '.dsh-meow') === null)
+check('reinjection null with empty project list', buildReinjection(dbReinjNull, wsReinjNull, 's-x', [], {}, '.dsh-meow') === null)
+dbReinjNull.close()
+// compaction/end 成功（无 error）→ 置待办；releaseSeen 保留 projectsQueried/reinjectPending
+await handlers['session/event']({ id: 's-reinj', header: { cwd: wsReinj } }, { type: 'compaction/summary', time: Date.now() })
+await handlers['session/event']({ id: 's-reinj', header: { cwd: wsReinj } }, { type: 'compaction/end', time: Date.now(), data: { compactionId: 'c1', turn: null } })
+check('compaction/end success arms reinjection', isReinjectPending(wsReinj, 's-reinj', '.dsh-meow') === true)
+check('releaseSeen keeps projectsQueried for reinjection', JSON.stringify(readProjectQueried(wsReinj, 's-reinj', '.dsh-meow')) === JSON.stringify(['femwa']))
+await handlers['session/event']({ id: 's-reinj2', header: { cwd: wsReinj } }, { type: 'compaction/end', time: Date.now(), data: { compactionId: 'c2', turn: null, error: 'provider failed' } })
+check('compaction/end with error does not arm', isReinjectPending(wsReinj, 's-reinj2', '.dsh-meow') === false)
+
 // 插件注入轮（反思/dream steer 消息轮）内的事件不刷新窗口活跃度（防 dream 反复触发）
 const wsWin = mkdtempSync(join(tmpdir(), 'mm-win-'))
 const evtHandler = handlers['session/event']
@@ -846,6 +888,48 @@ const decisionA5 = await preStep(
   async () => ({ kind: 'enter', messages: [{ content: [{ type: 'tool-call', id: 'c', name: 'x', arguments: '{}' }], source: { kind: 'assistant' } }] }),
 )
 check('tool step skips hit chain', decisionA5.messages.length === 1 && decisionA5.messages[0].content.length === 1)
+
+// 压缩重注入（v0.21.0）：pending 会话的用户消息轮 → 注入快照+项目全景；不跑命中链路；pending 清除
+const reinjAgent = { session: { header: { cwd: wsReinj, id: 's-reinj' }, events: [events.userMsg('更早')] }, steer: () => {} }
+const reinjMsg = { content: [{ type: 'text', text: '压缩后的第一条消息' }], source: { kind: 'user' } }
+const dReinj = await preStep(
+  { agent: reinjAgent, messages: [reinjMsg], turn: 9, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [reinjMsg] }),
+)
+check('post-compaction reinjection injects snapshot + projects', dReinj.kind === 'enter' &&
+  dReinj.messages[0].content.length === 2 &&
+  dReinj.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
+  dReinj.messages[0].content[0].text.includes('【会话已压缩】') &&
+  dReinj.messages[0].content[0].text.includes('【项目：femwa】') &&
+  dReinj.messages[0].content[0].text.includes('femwa 项目重注入全景条目') &&
+  dReinj.messages[0].content[0].text.includes('本轮用户prompt：'))
+check('reinjection preserves user text', dReinj.messages[0].content[1].text === '压缩后的第一条消息')
+check('reinjection does not run hit chain', !dReinj.messages[0].content[0].text.includes('可能相关的记忆，仅供参考：'))
+check('reinjection clears pending', isReinjectPending(wsReinj, 's-reinj', '.dsh-meow') === false)
+check('reinjection re-marks snapshot ids as injected', readSeen(wsReinj, 's-reinj', '.dsh-meow').size >= 2)
+// 下一轮恢复正常：无重复重注入，命中链路照跑（库内无 fact/lesson → 无命中、无注入）
+const dReinj2 = await preStep(
+  { agent: reinjAgent, messages: [{ content: [{ type: 'text', text: '压缩后的第二条消息' }], source: { kind: 'user' } }], turn: 10, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '压缩后的第二条消息' }], source: { kind: 'user' } }] }),
+)
+check('turn after reinjection back to normal', dReinj2.messages[0].content.length === 1)
+// pending 置位但工具轮（无用户消息）→ 不注入、不清待办
+await handlers['session/event']({ id: 's-reinj3', header: { cwd: wsReinj } }, { type: 'compaction/end', time: Date.now(), data: { compactionId: 'c3', turn: null } })
+const reinjAgent3 = { session: { header: { cwd: wsReinj, id: 's-reinj3' }, events: [] }, steer: () => {} }
+const dToolPending = await preStep(
+  { agent: reinjAgent3, messages: [{ content: [{ type: 'tool-call', id: 'c2', name: 'x', arguments: '{}' }], source: { kind: 'assistant' } }], turn: 2, step: 2, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [{ content: [{ type: 'tool-call', id: 'c2', name: 'x', arguments: '{}' }], source: { kind: 'assistant' } }] }),
+)
+check('pending kept on tool-only step, no injection', dToolPending.messages[0].content.length === 1 && isReinjectPending(wsReinj, 's-reinj3', '.dsh-meow') === true)
+// 子代理不参与压缩重注入
+await handlers['session/event']({ id: 's-reinj4', header: { cwd: wsReinj } }, { type: 'compaction/end', time: Date.now(), data: { compactionId: 'c4', turn: null } })
+const reinjAgentSub = { session: { header: { cwd: wsReinj, id: 's-reinj4', origin: 'subagent' }, events: [] }, steer: () => {} }
+const dSubPending = await preStep(
+  { agent: reinjAgentSub, messages: [{ content: [{ type: 'text', text: '子代理消息' }], source: { kind: 'user' } }], turn: 1, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '子代理消息' }], source: { kind: 'user' } }] }),
+)
+check('no reinjection for subagent, pending kept', dSubPending.messages[0].content.length === 1 && isReinjectPending(wsReinj, 's-reinj4', '.dsh-meow') === true)
+dbReinj.close()
 
 // 首次设置引导（v0.19.0）：promptLang 未配置 → 插件生效后第一条真实用户消息注入
 // 设置任务；seen（accessed '__welcomeGuide__'）记账 → 同会话不重复；显式配置 → 永久短路。
