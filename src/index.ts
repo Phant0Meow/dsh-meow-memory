@@ -804,10 +804,10 @@ function persistWindowIndex(): void {
 // re-export 供测试/调试/其他插件
 export { PLUGIN_SOURCE, REFLECT_MARKER }
 export { collectDreamStates } from './dream-signal.js'
-export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel } from './db.js'
+export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, globalProjectMarker, GLOBAL_PROJECT_CANON } from './db.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
-export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
+export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition } from './dream.js'

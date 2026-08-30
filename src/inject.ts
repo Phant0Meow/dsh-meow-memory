@@ -13,7 +13,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Doc } from './bm25.js'
 import { keywordHitScore, search, tokenize } from './bm25.js'
-import { memoryDbPath, projectCovers, projectLabel, relativeTime, PROJECT_SUBCATEGORIES, type MemoryDb, type MemoryRow, type ProjectSubcategory } from './db.js'
+import { isGlobalProject, memoryDbPath, projectCovers, projectLabel, relativeTime, PROJECT_SUBCATEGORIES, type MemoryDb, type MemoryRow, type ProjectSubcategory } from './db.js'
 import { fillTemplate, keyedValue } from './prompt-loader.js'
 
 export interface InjectOptions {
@@ -125,10 +125,10 @@ export function markAccessed(workspace: string, sessionId: string, ids: string[]
 }
 
 /** 记录 memory_project 查阅过的项目（v0.21.0）：压缩重注入清单。
- *  '全局'/空串跳过；多项目参数按逗号拆开逐个记；重复查询移到末尾（最近优先）；
- *  超过 MAX_REINJECT_PROJECTS 淘汰最旧的。 */
+ *  全局标记（isGlobalProject，语言感知）/空串跳过；多项目参数按逗号拆开逐个记；
+ *  重复查询移到末尾（最近优先）；超过 MAX_REINJECT_PROJECTS 淘汰最旧的。 */
 export function markProjectQueried(workspace: string, sessionId: string, project: string, dir = '.dsh-meow'): void {
-  const names = project.split(',').map((p) => p.trim()).filter((p) => p.length > 0 && p !== '全局')
+  const names = project.split(',').map((p) => p.trim()).filter((p) => p.length > 0 && !isGlobalProject(p))
   if (names.length === 0) return
   const seen = readSeenFile(workspace, sessionId, dir)
   const ordered = seen.projectsQueried.filter((p) => !names.includes(p))
@@ -285,15 +285,10 @@ export function buildInjection(
   return { text, injectedIds: built.injectedIds }
 }
 
-/** 子标签 → 注入段落标题。 */
-const PROJECT_SECTION_TITLES: Record<ProjectSubcategory, string> = {
-  overview: '项目概述',
-  structure: '项目结构',
-  decisions: '技术决策',
-  quotes: '用户原话',
-  ops: '部署与数据',
-  todo: '项目进度',
-}
+/** 框架词（labels.md）：项目全景段落里的短词随语言包走（PR #6 外置，zh 值逐字不变）。 */
+const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
+/** 子标签 → 注入段落标题（文案外置：labels.md 的 project.section.*）。 */
+const sectionTitle = (sub: ProjectSubcategory): string => lbl(`project.section.${sub}`)
 
 /** 组内排序：记忆时间戳（updated_at）旧→新，相同按创建时间；null 视为最旧。 */
 function sortByUpdatedAt(list: MemoryRow[]): MemoryRow[] {
@@ -337,32 +332,32 @@ export function buildProjectSectionText(db: MemoryDb, workspace: string, project
     db.list('rules', { project }).filter((r) => r.project === project && r.status === 'active'),
   )
   if (projectRules.length > 0) {
-    sections.push(`设计原则\n${projectRules.map(fmtProjectRow).join('\n')}`)
+    sections.push(`${lbl('inject.rules')}\n${projectRules.map(fmtProjectRow).join('\n')}`)
   }
   for (const sub of PROJECT_SUBCATEGORIES) {
     if (sub === 'todo') {
       const todos = sortByUpdatedAt(bySub.get('todo') ?? [])
       if (todos.length === 0 && done.length === 0) continue
-      const lines = [PROJECT_SECTION_TITLES.todo]
+      const lines = [sectionTitle('todo')]
       if (done.length > 0) {
-        lines.push('已完成：')
+        lines.push(lbl('project.todoDone'))
         for (const r of done) lines.push(fmtProjectRow(r))
       }
       if (todos.length > 0) {
-        lines.push('To do list：')
+        lines.push(lbl('project.todoOpen'))
         for (const r of todos) lines.push(fmtProjectRow(r))
       }
       sections.push(lines.join('\n'))
     } else {
       const list = sortByUpdatedAt(bySub.get(sub) ?? [])
       if (list.length === 0) continue
-      sections.push(`${PROJECT_SECTION_TITLES[sub]}\n${list.map(fmtProjectRow).join('\n')}`)
+      sections.push(`${sectionTitle(sub)}\n${list.map(fmtProjectRow).join('\n')}`)
     }
   }
   if (sections.length === 0) return null
   const dbPath = memoryDbPath(workspace, dir)
   return [
-    `【项目：${project}】`,
+    lbl('project.header', { name: project }),
     '',
     sections.join('\n\n'),
     '',
@@ -399,7 +394,6 @@ export function buildReinjection(
     if (text !== null) projectTexts.push(text)
   }
   if (snapshot === null && projectTexts.length === 0) return null
-  const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
   const lines: string[] = []
   if (snapshot !== null) {
     lines.push(snapshot.body)
@@ -437,7 +431,7 @@ function hitQuery(
     ...db.list('rules', { status: 'active' }),
     ...db.list('topic', { status: 'active' }),
   ].filter((r) =>
-    (r.project === null || r.project === '全局' || (currentProject !== null && projectCovers(r.project, currentProject)))
+    (r.project === null || isGlobalProject(r.project) || (currentProject !== null && projectCovers(r.project, currentProject)))
     && r.source_session !== sessionId, // 本 session 建立的记忆在上下文里，不命中
   )
   if (hitRows.length === 0) return []

@@ -25,12 +25,13 @@ src/prompts/
 | `dream-topic.md` | whole text | `{list}` |
 | `dream-project-summary.md` | whole text | `{projects}` |
 | `welcome-guide.md` | whole text | `{homePath}` |
-| `labels.md` | key-value lines | per key（e.g. `{label}` `{name}` `{list}`） |
+| `labels.md` | key-value lines | per key（e.g. `{label}` `{name}` `{list}` `{n}`） |
 | `tools.md` | key-value lines | — |
 
 - **`zh/` is the key-set source of truth**: every slot & key in `zh` must exist in your language — no missing, no extras.
 - **Whole-text slots**: translate freely; keep `{placeholders}` and place them where your grammar needs them.
 - **Key-value slots**: lines shaped `- key: value` — keep **keys exactly as-is** (the code looks them up), translate **values** only. A line starting with two spaces continues the previous value.
+- One value in `labels.md` is **not** decoration: `project.global` is the word the model writes into a memory's `project` field for globally applicable information, and the code matches on it. Pick a natural word in your language, keep it to one word, and don't reuse it as a real project name.
 - Lines starting with `#` are comments; blank lines are ignored.
 
 ## Resolution order / 读取顺序（per slot, 逐槽位）
@@ -48,7 +49,9 @@ src/prompts/
 
 ## One more thing: the tokenizer / 分词器（语言无关）
 
-`src/bm25.ts` → `tokenize()` is **language-independent since v0.20.0** (category routing): CJK runs (Han + kana) become character bigrams; any Unicode letters/digits (`\p{L}\p{N}`) form lowercased whole words; punctuation/symbols/emoji are dropped; text is NFKC-normalized (fullwidth → halfwidth, halfwidth katakana → fullwidth). If your language needs stemming / lemmatization / smarter segmentation, that function is yours to extend — PRs welcome. Keyword recall depends on query and memory entries being tokenized the same way, so this matters as much as the translations themselves.
+`src/bm25.ts` → `tokenize()` is **language-independent since v0.20.0** (category routing): CJK runs (Han + kana) become character bigrams; any Unicode letters/digits (`\p{L}\p{N}`) form lowercased whole words; punctuation/symbols/emoji are dropped; text is NFKC-normalized (fullwidth → halfwidth, halfwidth katakana → fullwidth). The `en` language pack adds an English-only normalization pass on top of the shared tokenizer (stopword filter + Porter stemmer, `stemEn`): under `promptLang: en`, inflected queries match stored entries (`tokenizers` hits `tokenizer`).
+
+Normalization lives **only** in `tokenize()`, so both sides of a match go through it and stay consistent; keywords are still stored verbatim, they are only normalized at match time. Anything language-specific you add belongs there too. If your language needs stemming / lemmatization / its own segmentation, that function is yours to extend — PRs welcome. Keyword recall depends on query and memory entries being tokenized the same way, so this matters as much as the translations themselves.
 
 ## Config / 用户配置
 
