@@ -46,8 +46,8 @@ export function scanTurn(events: readonly unknown[]): {
       }
     }
     if (e?.type === 'user/message') {
-      const src = e.data?.source
-      if (src?.kind === 'plugin' && src.plugin === 'meow-memory') sawReflect = true
+      const src = e.data?.source as { kind?: string; plugin?: string; form?: string } | undefined
+      if (src?.kind === 'plugin' && src.plugin === 'meow-memory' && src.form !== 'snapshot') sawReflect = true
       else {
         for (const b of e.data?.content ?? []) if (b.type === 'text' && b.text) texts.push(b.text)
       }

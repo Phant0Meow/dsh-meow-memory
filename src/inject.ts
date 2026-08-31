@@ -273,14 +273,14 @@ export function buildInjection(
   db: MemoryDb,
   workspace: string,
   sessionId: string,
-  _firstUserText: string,
+  _firstUserText: string = '',
   opts: Partial<InjectOptions> = {},
   dir = '.dsh-meow',
 ): { text: string; injectedIds: string[] } | null {
   const o = { ...DEFAULT_OPTS, ...opts }
   const built = buildInjectionBody(db, o)
   if (built === null) return null
-  const text = `${built.body}\n\n${keyedValue('labels', 'inject.end')}\n\n${keyedValue('labels', 'inject.promptLabel')}\n\n`
+  const text = built.body
   if (built.injectedIds.length > 0) markInjected(workspace, sessionId, built.injectedIds, dir)
   return { text, injectedIds: built.injectedIds }
 }
@@ -406,7 +406,7 @@ export function buildReinjection(
     lines.push(projectTexts.join('\n\n'))
     lines.push('')
   }
-  const text = `${lines.join('\n').trimEnd()}\n\n${keyedValue('labels', 'inject.end')}\n\n${keyedValue('labels', 'inject.promptLabel')}\n\n`
+  const text = lines.join('\n').trimEnd()
   if (snapshot !== null && snapshot.injectedIds.length > 0) markInjected(workspace, sessionId, snapshot.injectedIds, dir)
   return { text, injectedIds: snapshot !== null ? snapshot.injectedIds : [] }
 }
@@ -457,8 +457,8 @@ function hitQuery(
  * 每条用户消息的关键词命中注入（独立于首轮注入的链路）：
  * 检索 active 的 fact/lesson/rules/topic（全局+当前锚定项目），top-K 命中注入，
  * 命中 id 记入本会话已见（之后不再命中；压缩释放 seen 后恢复）。
- * 格式（用户拍板）：顶格「可能相关的记忆，仅供参考：」→ 条目（- [id] 换行接内容、
- * 条目间空行）→ 分割线 + 「本轮用户prompt：」；前面都是注入，后面是用户消息。
+ * 格式：顶格「可能相关的记忆，仅供参考：」→ 条目（- [id] 换行接内容、
+ * 条目间空行）。返回文本作为独立 plugin snapshot 消息的正文。
  * @returns 命中注入块；无命中返回 null。
  */
 export function buildHitInjection(
@@ -483,7 +483,7 @@ export function buildHitInjection(
     lines.push(h.content)
     lines.push('')
   }
-  const text = `${lines.join('\n')}------\n${keyedValue('labels', 'inject.promptLabel')}\n\n`
+  const text = lines.join('\n').trimEnd()
   const ids = fresh.map((h) => h.id)
   markInjected(workspace, sessionId, ids, dir)
   return { text, injectedIds: ids }

@@ -21,6 +21,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -53,6 +54,19 @@ export const name = 'meow-memory'
 
 /** tools 是硬依赖（注册 memory_*）；systemPrompt 为可选服务（ctx.get 兜底）。 */
 export const inject = ['tools']
+
+/** 把动态记忆作为独立上下文消息交给模型，不改写人类 user 消息。 */
+function createMemorySnapshotMessage(text: string): ReturnType<typeof createUserMessage> {
+  return createUserMessage({
+    content: [{ type: 'text', text }],
+    source: {
+      kind: 'plugin',
+      plugin: 'meow-memory',
+      form: 'snapshot',
+      sections: [{ name: '长期记忆', text }],
+    },
+  })
+}
 
 /**
  * 记忆系统静态手册 —— 挂进 system prompt（order 130 = 工具指南区间末尾，
@@ -311,8 +325,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         return
       }
       if (t === 'user/message') {
-        const src = (event.data as { source?: { kind?: string; plugin?: string } } | undefined)?.source
-        if (src?.kind === 'plugin' && src.plugin === 'meow-memory') {
+        const src = (event.data as { source?: { kind?: string; plugin?: string; form?: string } } | undefined)?.source
+        if (src?.kind === 'plugin' && src.plugin === 'meow-memory' && src.form !== 'snapshot') {
           isPluginTurn.set(sid, true) // 反思/dream 指令轮
           return // 指令消息本身也不刷新活跃度
         }
@@ -373,9 +387,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       }, resolved.projectDir)
       clearReinjectPending(ws, sid, resolved.projectDir)
       if (reinj !== null) {
-        const rewritten = decision.messages.map((m) => m === lastUser
-          ? { ...m, content: [{ type: 'text', text: reinj.text }, ...m.content] }
-          : m)
+        const rewritten = [...decision.messages]
+        rewritten.splice(rewritten.indexOf(lastUser), 0, createMemorySnapshotMessage(reinj.text))
         ctx.logger.info(`meow-memory: post-compaction memory re-injected (${reinj.text.length} chars)`)
         return { ...decision, messages: rewritten }
       }
@@ -387,7 +400,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       firstUserHandled.add(sid)
       let priorUser = 0
       for (const e of agent.session.events) {
-        if ((e as { type?: string })?.type === 'user/message') priorUser++
+        const evt = e as { type?: string; data?: { source?: { kind?: string } } }
+        if (evt?.type === 'user/message' && evt.data?.source?.kind !== 'plugin') priorUser++
       }
       if (ws) {
         try {
@@ -412,10 +426,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
             titleMax: resolved.titleMax,
           }, resolved.projectDir)
           if (injected) {
-            const rewritten = decision.messages.map((m) => m === firstUser
-              ? { ...m, content: [{ type: 'text', text: injected.text }, ...m.content] }
-              : m)
-            ctx.logger.info(`meow-memory: injected memory block (${injected.text.length} chars) before first user message`)
+            const rewritten = [...decision.messages]
+            rewritten.splice(rewritten.indexOf(firstUser), 0, createMemorySnapshotMessage(injected.text))
+            ctx.logger.info(`meow-memory: inserted memory snapshot (${injected.text.length} chars) before first user message`)
             return { ...decision, messages: rewritten }
           }
         }
@@ -465,9 +478,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           appendFileSync(join(ws, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] hit-chain pid=${process.pid} sid=${shortSessionId(sid)} text=${text.slice(0, 40).replace(/\n/g, ' ')} hit=${hit === null ? 'null' : 'yes'}\n`)
         } catch { /* 日志失败不阻塞 */ }
         if (hit !== null) {
-          const rewritten = decision.messages.map((m) => m === lastUser
-            ? { ...m, content: [{ type: 'text', text: hit.text }, ...m.content] }
-            : m)
+          const rewritten = [...decision.messages]
+          rewritten.splice(rewritten.indexOf(lastUser), 0, createMemorySnapshotMessage(hit.text))
           return { ...decision, messages: rewritten }
         }
       }

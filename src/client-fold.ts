@@ -63,19 +63,22 @@ function turnOf(node: ChatNode): number | undefined {
   return undefined
 }
 
+function contextText(node: ChatNode): string {
+  return blocksToText((node.data as ContextLike).content ?? [])
+}
+
 /** 判定节点是否 meow-memory 注入的反思/dream prompt。 */
 function isMemoryPrompt(node: ChatNode): boolean {
   if (node.kind !== 'context') return false
   const source = (node.data as ContextLike).source as { kind?: string; plugin?: string } | undefined
-  return source?.kind === 'plugin' && source.plugin === PLUGIN_NAME
+  if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) return false
+  const text = contextText(node)
+  return text.includes(REFLECT_MARKER) || text.includes(DREAM_MARKER)
 }
 
 /** 从 prompt 文本判定轮次类型（reflect / dream）。 */
 function variantOf(node: ChatNode): FoldVariant {
-  const text = ((node.data as ContextLike).content ?? [])
-    .filter((block) => block.type === 'text' && typeof block.text === 'string')
-    .map((block) => block.text ?? '')
-    .join('\n')
+  const text = contextText(node)
   return text.includes(DREAM_MARKER) ? 'dream' : 'reflect'
 }
 
@@ -174,31 +177,44 @@ export const PROMPT_SEPARATOR = '本轮用户prompt：'
 
 export type InjectionKind = 'first' | 'hit'
 
-/** 一个含注入前缀的用户消息（前端折叠成横条，只显示用户 prompt）。 */
+/** 一个可折叠的记忆注入（新格式为独立 context，旧格式为 user 前缀）。 */
 export interface InjectionGroup {
-  /** user 节点的 key（快照 chat 节点 key）。 */
+  /** 要隐藏并在其原位放置横条的节点 key。 */
   readonly id: string
   readonly kind: InjectionKind
-  /** 注入的完整文本（含分隔标记）。 */
+  /** 注入的完整文本。 */
   readonly injectedText: string
-  /** 用户 prompt 原文（分隔标记之后）。 */
-  readonly userText: string
+  /** 仅旧格式存在：从被污染 user 消息中拆出的 prompt 原文。 */
+  readonly userText?: string
   /** 消息事件时间（Unix epoch ms）；缺失时操作行不显示时钟。 */
   readonly time?: number
 }
 
 /**
- * 识别含注入前缀的用户消息（首轮长期记忆 / 关键词命中）。
- * pre-step 把注入文本 prepend 到用户消息的 text block，两者以
- * 「本轮用户prompt：」分隔——前端据此折叠注入、只显示用户 prompt。
- * 仅折叠纯文本消息（content 全是 text block）——带附件/图片的消息保持原样
- * （前端折叠会重建文本气泡，附件会丢）。
+ * 新格式识别 source.form='snapshot' 的独立 meow-memory context 消息；
+ * 旧格式继续识别含注入前缀和「本轮用户prompt：」分隔符的 user 消息。
+ * 旧格式仅折叠纯文本消息，避免重建气泡时丢失附件。
  */
 export function computeInjectionGroups(snapshot: ConversationSnapshot): InjectionGroup[] {
   const groups: InjectionGroup[] = []
   for (const key of snapshot.chat.order) {
     const node = snapshot.chat.nodes.get(key)
-    if (node === undefined || node.kind !== 'user') continue
+    if (node === undefined) continue
+    if (node.kind === 'context') {
+      const source = (node.data as ContextLike).source as {
+        kind?: string
+        plugin?: string
+        form?: string
+      } | undefined
+      if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME || source.form !== 'snapshot') continue
+      const injectedText = contextText(node)
+      let kind: InjectionKind | null = null
+      if (injectedText.startsWith(FIRST_INJECTION_MARKER)) kind = 'first'
+      else if (injectedText.startsWith(HIT_INJECTION_MARKER)) kind = 'hit'
+      if (kind !== null) groups.push({ id: key, kind, injectedText })
+      continue
+    }
+    if (node.kind !== 'user') continue
     const content = (node.data as { content?: readonly { type?: string; text?: string }[] }).content ?? []
     if (content.length === 0 || content.some((b) => b.type !== 'text')) continue // 带附件不折叠
     const text = blocksToText(content)

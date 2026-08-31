@@ -386,8 +386,13 @@ function applyInjectionFold(
       } else {
         body.style.display = 'none'
       }
-      // 用户 prompt 气泡 + 操作行（纯文本气泡；带附件的消息不折叠——computeInjectionGroups 已过滤）。
+      // 旧格式把记忆和 prompt 粘在同一 user 消息里，需重建纯净 prompt 气泡。
+      // 新格式只隐藏独立 plugin 行，真实 user 行由 DSH 原生渲染。
       let prompt = anchor.querySelector<HTMLElement>(`:scope > [${INJ_PROMPT_ATTR}]`)
+      if (group.userText === undefined) {
+        prompt?.remove()
+        continue
+      }
       if (prompt === null) {
         prompt = document.createElement('div')
         prompt.setAttribute(INJ_PROMPT_ATTR, 'true')
@@ -405,7 +410,9 @@ function applyInjectionFold(
         copyButton.title = '复制'
         copyButton.innerHTML = COPY_ICON_SVG
         copyButton.addEventListener('click', () => {
-          void copyInjectionText(copyButton, group.userText)
+          if (group.userText !== undefined) {
+            void copyInjectionText(copyButton, group.userText)
+          }
         })
         actions.appendChild(copyButton)
         prompt.appendChild(actions)
