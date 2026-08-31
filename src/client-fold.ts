@@ -191,9 +191,9 @@ export interface InjectionGroup {
 }
 
 /**
- * 新格式识别 source.form='snapshot' 的独立 meow-memory context 消息；
- * 旧格式继续识别含注入前缀和「本轮用户prompt：」分隔符的 user 消息。
- * 旧格式仅折叠纯文本消息，避免重建气泡时丢失附件。
+ * 新格式优先识别 source.memory.kind (initial/reinjection/hit) 机器元数据，解耦于自然语言文本；
+ * 兼容未带元数据的 snapshot (中英文标记兜底)；
+ * 旧格式继续识别含注入前缀和分隔符的 user 消息。
  */
 export function computeInjectionGroups(snapshot: ConversationSnapshot): InjectionGroup[] {
   const groups: InjectionGroup[] = []
@@ -205,13 +205,23 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
         kind?: string
         plugin?: string
         form?: string
+        memory?: { kind?: 'initial' | 'hit' | 'reinjection' | 'welcome' }
       } | undefined
-      if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME || source.form !== 'snapshot') continue
-      const injectedText = contextText(node)
-      let kind: InjectionKind | null = null
-      if (injectedText.startsWith(FIRST_INJECTION_MARKER)) kind = 'first'
-      else if (injectedText.startsWith(HIT_INJECTION_MARKER)) kind = 'hit'
-      if (kind !== null) groups.push({ id: key, kind, injectedText })
+      if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) continue
+      const memKind = source.memory?.kind
+      if (memKind === 'initial' || memKind === 'reinjection') {
+        groups.push({ id: key, kind: 'first', injectedText: contextText(node) })
+        continue
+      }
+      if (memKind === 'hit') {
+        groups.push({ id: key, kind: 'hit', injectedText: contextText(node) })
+        continue
+      }
+      if (source.form === 'snapshot') {
+        const injectedText = contextText(node)
+        const isFirst = injectedText.startsWith(FIRST_INJECTION_MARKER) || injectedText.includes('LONG-TERM MEMORY')
+        groups.push({ id: key, kind: isFirst ? 'first' : 'hit', injectedText })
+      }
       continue
     }
     if (node.kind !== 'user') continue
@@ -220,16 +230,17 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
     const text = blocksToText(content)
     if (text.length === 0) continue
     let kind: InjectionKind | null = null
-    if (text.startsWith(FIRST_INJECTION_MARKER)) kind = 'first'
-    else if (text.startsWith(HIT_INJECTION_MARKER)) kind = 'hit'
+    if (text.startsWith(FIRST_INJECTION_MARKER) || text.includes('LONG-TERM MEMORY') || text.includes('===== 长期记忆 =====')) kind = 'first'
+    else if (text.startsWith(HIT_INJECTION_MARKER) || text.includes('Possibly relevant memories') || text.includes('可能相关的记忆')) kind = 'hit'
     if (kind === null) continue
-    const sepIdx = text.lastIndexOf(PROMPT_SEPARATOR)
-    if (sepIdx === -1) continue // 没有分隔标记（异常数据）：不折叠
-    const userText = text.slice(sepIdx + PROMPT_SEPARATOR.length).replace(/^\n+/, '')
+    const sep = text.includes(PROMPT_SEPARATOR) ? PROMPT_SEPARATOR : (text.includes('Your prompt:') ? 'Your prompt:' : null)
+    if (sep === null) continue // 没有分隔标记（异常数据）：不折叠
+    const sepIdx = text.lastIndexOf(sep)
+    const userText = text.slice(sepIdx + sep.length).replace(/^\n+/, '')
     const time = typeof (node.data as { time?: unknown }).time === 'number'
       ? (node.data as { time: number }).time
       : undefined
-    groups.push({ id: key, kind, injectedText: text.slice(0, sepIdx + PROMPT_SEPARATOR.length), userText, time })
+    groups.push({ id: key, kind, injectedText: text.slice(0, sepIdx + sep.length), userText, time })
   }
   return groups
 }

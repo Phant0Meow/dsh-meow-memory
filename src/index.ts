@@ -51,19 +51,38 @@ const WELCOME_GUIDE_SEEN_ID = '__welcomeGuide__'
 import { collectDreamStates, DreamStateBroadcast } from './dream-signal.js'
 
 export const name = 'meow-memory'
-
-/** tools 是硬依赖（注册 memory_*）；systemPrompt 为可选服务（ctx.get 兜底）。 */
 export const inject = ['tools']
 
+/** 记忆来源机器元数据，供前端与下游消费，解耦于自然语言文本。 */
+export interface MemorySourceMeta {
+  kind: 'initial' | 'hit' | 'reinjection' | 'welcome'
+  ids?: string[]
+}
+
 /** 把动态记忆作为独立上下文消息交给模型，不改写人类 user 消息。 */
-function createMemorySnapshotMessage(text: string): ReturnType<typeof createUserMessage> {
+function createMemorySnapshotMessage(text: string, meta: MemorySourceMeta): ReturnType<typeof createUserMessage> {
   return createUserMessage({
     content: [{ type: 'text', text }],
     source: {
       kind: 'plugin',
       plugin: 'meow-memory',
       form: 'snapshot',
+      memory: meta,
       sections: [{ name: '长期记忆', text }],
+    },
+  })
+}
+
+/** 构造独立的插件通知消息（如语言引导），不改写人类 user 消息。 */
+function createMemoryNoticeMessage(text: string, meta: MemorySourceMeta, sectionName = '提示'): ReturnType<typeof createUserMessage> {
+  return createUserMessage({
+    content: [{ type: 'text', text }],
+    source: {
+      kind: 'plugin',
+      plugin: 'meow-memory',
+      form: 'notice',
+      memory: meta,
+      sections: [{ name: sectionName, text }],
     },
   })
 }
@@ -325,10 +344,20 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         return
       }
       if (t === 'user/message') {
-        const src = (event.data as { source?: { kind?: string; plugin?: string; form?: string } } | undefined)?.source
-        if (src?.kind === 'plugin' && src.plugin === 'meow-memory' && src.form !== 'snapshot') {
-          isPluginTurn.set(sid, true) // 反思/dream 指令轮
-          return // 指令消息本身也不刷新活跃度
+        const data = event.data as {
+          source?: { kind?: string; plugin?: string; form?: string }
+          content?: Array<{ type?: string; text?: string }>
+        } | undefined
+        const src = data?.source
+        if (src?.kind === 'plugin' && src.plugin === 'meow-memory') {
+          const msgText = (data?.content ?? [])
+            .filter((b) => b.type === 'text' && typeof b.text === 'string')
+            .map((b) => b.text ?? '')
+            .join(' ')
+          if (msgText.includes(REFLECT_MARKER) || msgText.includes(DREAM_MARKER)) {
+            isPluginTurn.set(sid, true) // 反思/dream 指令轮
+            return // 指令消息本身也不刷新活跃度
+          }
         }
       }
       if (isPluginTurn.get(sid)) return // 插件轮内：不 touchWindow
@@ -388,7 +417,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       clearReinjectPending(ws, sid, resolved.projectDir)
       if (reinj !== null) {
         const rewritten = [...decision.messages]
-        rewritten.splice(rewritten.indexOf(lastUser), 0, createMemorySnapshotMessage(reinj.text))
+        rewritten.splice(rewritten.indexOf(lastUser), 0, createMemorySnapshotMessage(reinj.text, { kind: 'reinjection', ids: reinj.injectedIds }))
         ctx.logger.info(`meow-memory: post-compaction memory re-injected (${reinj.text.length} chars)`)
         return { ...decision, messages: rewritten }
       }
@@ -401,7 +430,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       let priorUser = 0
       for (const e of agent.session.events) {
         const evt = e as { type?: string; data?: { source?: { kind?: string } } }
-        if (evt?.type === 'user/message' && evt.data?.source?.kind !== 'plugin') priorUser++
+        if (evt?.type === 'user/message' && evt.data?.source?.kind === 'user') priorUser++
       }
       if (ws) {
         try {
@@ -427,7 +456,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           }, resolved.projectDir)
           if (injected) {
             const rewritten = [...decision.messages]
-            rewritten.splice(rewritten.indexOf(firstUser), 0, createMemorySnapshotMessage(injected.text))
+            rewritten.splice(rewritten.indexOf(firstUser), 0, createMemorySnapshotMessage(injected.text, { kind: 'initial', ids: injected.injectedIds }))
             ctx.logger.info(`meow-memory: inserted memory snapshot (${injected.text.length} chars) before first user message`)
             return { ...decision, messages: rewritten }
           }
@@ -443,6 +472,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     // accessed 不被 releaseSeen 清除，上下文压缩后不会重注入；配置生效后 promptLang
     // 有值 → 本分支永久短路）。首轮消息不进这里（首轮分支上方已 return——装插件场景
     // 会话早已过首轮，且首轮用户往往还没好好说话，判断语言不可靠）。
+    // 作为独立的插件通知消息注入，不改写人类 user 消息。
     if (resolved.promptLang === undefined && ws) {
       const seen = readSeen(ws, sid, resolved.projectDir)
       if (!seen.has(WELCOME_GUIDE_SEEN_ID)) {
@@ -450,10 +480,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         if (lastUser !== undefined) {
           markAccessed(ws, sid, [WELCOME_GUIDE_SEEN_ID], resolved.projectDir)
           const guide = resolveSlotText('welcome-guide', { homePath: homedir() })
-          const rewritten = decision.messages.map((m) => m === lastUser
-            ? { ...m, content: [{ type: 'text', text: guide }, ...m.content] }
-            : m)
-          ctx.logger.info('meow-memory: first-run lang guide injected (promptLang unset)')
+          const rewritten = [...decision.messages]
+          rewritten.splice(rewritten.indexOf(lastUser), 0, createMemoryNoticeMessage(guide, { kind: 'welcome' }, '语言设置引导'))
+          ctx.logger.info('meow-memory: first-run lang guide injected as independent notice (promptLang unset)')
           return { ...decision, messages: rewritten }
         }
       }
@@ -479,7 +508,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         } catch { /* 日志失败不阻塞 */ }
         if (hit !== null) {
           const rewritten = [...decision.messages]
-          rewritten.splice(rewritten.indexOf(lastUser), 0, createMemorySnapshotMessage(hit.text))
+          rewritten.splice(rewritten.indexOf(lastUser), 0, createMemorySnapshotMessage(hit.text, { kind: 'hit', ids: hit.injectedIds }))
           return { ...decision, messages: rewritten }
         }
       }

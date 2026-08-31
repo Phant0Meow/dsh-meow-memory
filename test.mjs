@@ -1019,11 +1019,15 @@ const dGuide1 = await guidePreStep(
   { agent: guideAgent, messages: [guideMsg], turn: 2, step: 1, signal: new AbortController().signal },
   async () => ({ kind: 'enter', messages: [guideMsg] }),
 )
-check('welcome guide injected when promptLang unset', dGuide1.messages[0].content.length === 2 &&
+check('welcome guide injected as independent notice when promptLang unset', dGuide1.messages.length === 2 &&
+  dGuide1.messages[0].source.kind === 'plugin' &&
+  dGuide1.messages[0].source.form === 'notice' &&
+  dGuide1.messages[0].source.memory?.kind === 'welcome' &&
   dGuide1.messages[0].content[0].text.includes('【meow-memory 首次设置】') &&
   dGuide1.messages[0].content[0].text.includes('恭喜') &&
   dGuide1.messages[0].content[0].text.includes('不要以 system prompt') &&
-  dGuide1.messages[0].content[0].text.includes('promptLang'))
+  dGuide1.messages[0].content[0].text.includes('promptLang') &&
+  dGuide1.messages[1] === guideMsg && dGuide1.messages[1].content[0].text === '继续')
 check('welcome guide recorded via accessed pseudo-id', readSeen(wsGuide, 'guide-session-1', '.dsh-meow').has('__welcomeGuide__'))
 const dGuide2 = await guidePreStep(
   { agent: guideAgent, messages: [{ content: [{ type: 'text', text: '再继续' }], source: { kind: 'user' } }], turn: 3, step: 1, signal: new AbortController().signal },
