@@ -106,22 +106,23 @@
 
 ## 📦 安装
 
-### 通过 npm（已发布包）
+### 一键安装（推荐）
 
 ```sh
-# 1. 安装到 profile 的 node_modules（loader 在那里解析插件）
-cd $DSH_HOME/profiles/web          # 默认 home: ~/.dsh/profiles/web
-npm install meow-memory
-
-# 2. 在 profile 的 package.json 中把包加进装配 bundles（推荐，v0.9.0 起）：
-#    "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "meow-memory"] } }
-#    （插件自带 dsh.bundle.patch，bundle 机制自动装配；profile patch 的 insert
-#     按 id 寻址、找不到已有条目会报 not found——新增插件请走 bundles 数组。）
-
-# 3. 重启 dsh web。新会话自动加载插件。
+dsh plugin --profile web add github:Phant0Meow/dsh-meow-memory
 ```
 
-### 手动安装（任意 DSH 安装，无需 npm）
+一条命令装完即生效：安装时自动编译（包内含 `prepare` 脚本），自动挂载，重启 `dsh web` 后新会话自动加载插件。
+
+> pnpm ≥10 默认会阻止安装期的构建脚本：首次 `add` 可能失败并提示 `allowBuilds`，按提示把输出的键加进 profile 的 `pnpm-workspace.yaml` 后重跑即可。
+
+### 卸载
+
+```sh
+dsh plugin --profile web remove meow-memory
+```
+
+### 手动安装（开发者，任意 DSH 安装，无需 npm）
 
 1. 把本包复制（或软链）到 profile 的 `node_modules`：
    ```sh
