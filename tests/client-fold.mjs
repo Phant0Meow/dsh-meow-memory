@@ -230,7 +230,8 @@ console.log('=== 9. computeInjectionGroups ===')
   const EN_HIT = 'Possibly relevant memories, for reference only:\n[fact:abc] Content'
   const LEGACY_FIRST = `${SNAPSHOT_FIRST}\n===== 长期记忆结束 =====\n\n本轮用户prompt：\n\n旧会话你好`
   const LEGACY_HIT = `${SNAPSHOT_HIT}\n------\n本轮用户prompt：\n\n旧会话再问一句`
-  const LEGACY_EN_FIRST = `${EN_FIRST}\n===== END OF LONG-TERM MEMORY =====\n\nYour prompt:\n\nHello legacy`
+  // en 旧格式分隔符 = labels en inject.promptLabel 实际值（"This turn's user prompt:"），非猜测值
+  const LEGACY_EN_FIRST = `${EN_FIRST}\n===== END OF LONG-TERM MEMORY =====\n\nThis turn's user prompt:\n\nHello legacy`
   const PLAIN = '普通消息没有注入'
   const snapshotSource = (text, meta) => ({
     kind: 'plugin', plugin: 'meow-memory', form: 'snapshot',

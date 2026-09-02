@@ -174,6 +174,8 @@ export const FIRST_INJECTION_MARKER = '===== 长期记忆 ====='
 export const HIT_INJECTION_MARKER = '可能相关的记忆，仅供参考：'
 /** 注入文本与用户 prompt 的分隔标记（两种注入都以它结尾）。 */
 export const PROMPT_SEPARATOR = '本轮用户prompt：'
+/** en 语言包（v0.22.0）旧格式分隔符（labels en inject.promptLabel，逐字一致）。 */
+export const EN_PROMPT_SEPARATOR = "This turn's user prompt:"
 
 export type InjectionKind = 'first' | 'hit'
 
@@ -233,7 +235,8 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
     if (text.startsWith(FIRST_INJECTION_MARKER) || text.includes('LONG-TERM MEMORY') || text.includes('===== 长期记忆 =====')) kind = 'first'
     else if (text.startsWith(HIT_INJECTION_MARKER) || text.includes('Possibly relevant memories') || text.includes('可能相关的记忆')) kind = 'hit'
     if (kind === null) continue
-    const sep = text.includes(PROMPT_SEPARATOR) ? PROMPT_SEPARATOR : (text.includes('Your prompt:') ? 'Your prompt:' : null)
+    // en 旧格式分隔符 = labels en inject.promptLabel 实际值（"This turn's user prompt:"，v0.22.0 en 包历史会话）
+    const sep = text.includes(PROMPT_SEPARATOR) ? PROMPT_SEPARATOR : (text.includes(EN_PROMPT_SEPARATOR) ? EN_PROMPT_SEPARATOR : null)
     if (sep === null) continue // 没有分隔标记（异常数据）：不折叠
     const sepIdx = text.lastIndexOf(sep)
     const userText = text.slice(sepIdx + sep.length).replace(/^\n+/, '')

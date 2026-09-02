@@ -21,7 +21,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -73,16 +73,18 @@ function createMemorySnapshotMessage(text: string, meta: MemorySourceMeta): Retu
   })
 }
 
-/** 构造独立的插件通知消息（如语言引导），不改写人类 user 消息。 */
-function createMemoryNoticeMessage(text: string, meta: MemorySourceMeta, sectionName = '提示'): ReturnType<typeof createUserMessage> {
+/** 构造独立的插件通知消息（如语言引导），不改写人类 user 消息。
+ *  notice form 按 dsh-llm ContextFormed 契约须带 summary（折叠行一行摘要，≤120 字符）；
+ *  snapshot form 才用 sections（见 createMemorySnapshotMessage）。 */
+function createMemoryNoticeMessage(text: string, meta: MemorySourceMeta): ReturnType<typeof createUserMessage> {
   return createUserMessage({
     content: [{ type: 'text', text }],
     source: {
       kind: 'plugin',
       plugin: 'meow-memory',
       form: 'notice',
+      summary: boundContextSummary(text.replace(/\s+/g, ' ').trim()),
       memory: meta,
-      sections: [{ name: sectionName, text }],
     },
   })
 }
@@ -481,7 +483,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           markAccessed(ws, sid, [WELCOME_GUIDE_SEEN_ID], resolved.projectDir)
           const guide = resolveSlotText('welcome-guide', { homePath: homedir() })
           const rewritten = [...decision.messages]
-          rewritten.splice(rewritten.indexOf(lastUser), 0, createMemoryNoticeMessage(guide, { kind: 'welcome' }, '语言设置引导'))
+          rewritten.splice(rewritten.indexOf(lastUser), 0, createMemoryNoticeMessage(guide, { kind: 'welcome' }))
           ctx.logger.info('meow-memory: first-run lang guide injected as independent notice (promptLang unset)')
           return { ...decision, messages: rewritten }
         }
