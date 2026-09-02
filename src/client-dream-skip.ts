@@ -10,8 +10,9 @@
  * 注入方式（零 dsh 改动）：
  * - 身份解析：dsh Rows.tsx 在菜单打开期间给行挂 menuOpen 类——读该行 fiber key
  *   即得 session id，任意时刻可确定「谁的菜单开着」，不受挂载延迟影响；
- *   pointerdown 捕获（行操作区 → readSessionId）作 menuOpen 锚点失效时的兜底，
- *   仅限点击后 1.5s 时间窗内生效。
+ *   pointerdown 捕获（行操作区 → readSessionId）仅在「menuOpen 会话行存在但
+ *   fiber 读失败」时兜底，且仅限点击后 1.5s 时间窗内；页面上没有 menuOpen
+ *   会话行（如工作区菜单开着，issue #8）一律不注入。
  * - MutationObserver 双路注入：快路径扫 addedNodes 里的 [role="menu"]；防抖自愈
  *   （syncOpenMenus）在每次 DOM 变化后收敛——迟挂载/模板晚到/项被冲掉/容器复用
  *   串味统一处理。取现有 menuitem 做 cloneNode 模板——像素级对齐本体菜单；找不到
@@ -39,8 +40,12 @@ const ROW_ACTIONS_SEL = '[class*="_rowActions"]'
  *  对当前选中的会话点 … 永远捕获不到 id，注入时灵时不灵）。 */
 export const SESSION_ROW_SEL = '[role="treeitem"][class*="_sessionRow"]'
 /** 菜单打开中的会话行：dsh Rows.tsx 把 menuOpen 状态同时挂到行级 menuOpen 类——
- *  据此可在任意时刻确定「哪个会话的菜单正开着」，不依赖点击时间窗。 */
-export const MENU_OPEN_ROW_SEL = '[role="treeitem"][class*="_menuOpen"]'
+ *  据此可在任意时刻确定「哪个会话的菜单正开着」，不依赖点击时间窗。
+ *  必须叠加 _sessionRow 约束（issue #8 回归）：工作区行（projectRow）同样是
+ *  `role="treeitem"` 且共用同一 CSS Modules 的 _menuOpen 类——无 _sessionRow
+ *  约束时，工作区菜单打开也会被解析成"会话菜单"，注入项落 workspace id
+ *  （点击无反应 + 垃圾数据落库）。 */
+export const MENU_OPEN_ROW_SEL = '[role="treeitem"][class*="_sessionRow"][class*="_menuOpen"]'
 /** 点击→菜单挂载的判定窗口（ms；仅作 menuOpen 锚点失效时的兜底）。 */
 const MENU_WINDOW_MS = 1500
 
@@ -96,20 +101,23 @@ export function retitleLeaf(root: Element, text: string): boolean {
 
 /**
  * 解析「当前开着的会话菜单」属于哪个会话：优先读 menuOpen 行（确定性锚点，
- * dsh Rows.tsx 在菜单打开期间给行挂 menuOpen 类），读不到再退回点击时捕获的 id。
+ * dsh Rows.tsx 在菜单打开期间给行挂 menuOpen 类），行存在但 fiber 读失败时
+ * 退回点击时捕获的 id；页面上**没有** menuOpen 会话行时返回 null——此时开着的
+ * 菜单若存在必属非会话行（工作区行同样挂 menuOpen，issue #8），绝不能把点击
+ * 窗口残留的会话 id 注进别行的菜单（1.5s 内先点会话 … 再开工作区菜单的串味
+ * 防护）。menuOpen 锚点整体失效（dsh 改类名）时本功能降级为不注入——好过
+ * 错注入 + 垃圾数据落库。
  * @param doc - Document（或等价 querySelector 载体，测试传桩）。
- * @param fallback - 点击捕获兜底值；无兜底且行不可读时返回 null（不注入）。
+ * @param fallback - 点击捕获兜底值；仅 menuOpen 会话行存在但行不可读时生效。
  */
 export function resolveMenuSessionId(
   doc: { querySelector(selector: string): Element | null },
   fallback: string | null,
 ): string | null {
   const openRow = doc.querySelector(MENU_OPEN_ROW_SEL)
-  if (openRow !== null) {
-    const sid = readSessionId(openRow as HTMLElement)
-    if (sid !== null) return sid
-  }
-  return fallback
+  if (openRow === null) return null
+  const sid = readSessionId(openRow as HTMLElement)
+  return sid !== null ? sid : fallback
 }
 
 interface SkipItemHost {

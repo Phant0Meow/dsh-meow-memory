@@ -83,16 +83,22 @@ check('retitle returns false when no leaf has text', (() => {
 // class 属性串做结尾匹配——选中行/菜单打开行必然失配，导致注入时灵时不灵。
 check('session row selector uses substring match (not end match)', SESSION_ROW_SEL.includes('[class*="_sessionRow"]') && !SESSION_ROW_SEL.includes('class$='))
 check('menuOpen row selector uses substring match', MENU_OPEN_ROW_SEL.includes('[class*="_menuOpen"]'))
+// issue #8 回归：工作区行（projectRow）同样是 role="treeitem" 且共用 _menuOpen
+// 类——menuOpen 锚点必须叠加 _sessionRow 约束，否则工作区菜单被误当会话菜单。
+check('menuOpen anchor is constrained to session rows (issue #8)', MENU_OPEN_ROW_SEL.includes('[class*="_sessionRow"]'))
 
-// ── resolveMenuSessionId：menuOpen 行优先，点击捕获兜底 ──────────────────────
+// ── resolveMenuSessionId：menuOpen 行优先；无 menuOpen 会话行一律不注入 ──────
 function fakeDoc(openRow) {
   return { querySelector: (sel) => (sel === MENU_OPEN_ROW_SEL ? openRow : null) }
 }
 const fiberRow = { '__reactFiber$abc': { key: 'sess-open', return: null } }
 check('resolve: menuOpen row wins with its fiber key', resolveMenuSessionId(fakeDoc(fiberRow), 'fallback') === 'sess-open')
-check('resolve: falls back to captured sid without open row', resolveMenuSessionId(fakeDoc(null), 'captured') === 'captured')
+// issue #8 回归：工作区菜单开着 = 页面上没有 menuOpen 的会话行。即便 1.5s 窗口内
+// 刚点过某个会话的 …（captured 有值），也绝不能把该会话 id 注进工作区菜单。
+check('resolve: workspace menu open (no session menuOpen row) → null even with captured sid',
+  resolveMenuSessionId(fakeDoc(null), 'captured') === null)
 check('resolve: null when neither anchor available', resolveMenuSessionId(fakeDoc(null), null) === null)
-check('resolve: unreadable row falls back too', resolveMenuSessionId(fakeDoc({}), 'captured') === 'captured')
+check('resolve: unreadable menuOpen row falls back to captured sid', resolveMenuSessionId(fakeDoc({}), 'captured') === 'captured')
 
 // ── setMenuIcon（v0.18.0 用户实测纠正）：图标画「点击后将变成的状态」──────────
 // 未跳过（当前=false）→ 标签「跳过…」→ 配斜杠月牙（点下去静音）；
