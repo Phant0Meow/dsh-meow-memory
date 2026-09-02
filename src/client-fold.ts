@@ -63,19 +63,22 @@ function turnOf(node: ChatNode): number | undefined {
   return undefined
 }
 
+function contextText(node: ChatNode): string {
+  return blocksToText((node.data as ContextLike).content ?? [])
+}
+
 /** 判定节点是否 meow-memory 注入的反思/dream prompt。 */
 function isMemoryPrompt(node: ChatNode): boolean {
   if (node.kind !== 'context') return false
   const source = (node.data as ContextLike).source as { kind?: string; plugin?: string } | undefined
-  return source?.kind === 'plugin' && source.plugin === PLUGIN_NAME
+  if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) return false
+  const text = contextText(node)
+  return text.includes(REFLECT_MARKER) || text.includes(DREAM_MARKER)
 }
 
 /** 从 prompt 文本判定轮次类型（reflect / dream）。 */
 function variantOf(node: ChatNode): FoldVariant {
-  const text = ((node.data as ContextLike).content ?? [])
-    .filter((block) => block.type === 'text' && typeof block.text === 'string')
-    .map((block) => block.text ?? '')
-    .join('\n')
+  const text = contextText(node)
   return text.includes(DREAM_MARKER) ? 'dream' : 'reflect'
 }
 
@@ -174,46 +177,70 @@ export const PROMPT_SEPARATOR = '本轮用户prompt：'
 
 export type InjectionKind = 'first' | 'hit'
 
-/** 一个含注入前缀的用户消息（前端折叠成横条，只显示用户 prompt）。 */
+/** 一个可折叠的记忆注入（新格式为独立 context，旧格式为 user 前缀）。 */
 export interface InjectionGroup {
-  /** user 节点的 key（快照 chat 节点 key）。 */
+  /** 要隐藏并在其原位放置横条的节点 key。 */
   readonly id: string
   readonly kind: InjectionKind
-  /** 注入的完整文本（含分隔标记）。 */
+  /** 注入的完整文本。 */
   readonly injectedText: string
-  /** 用户 prompt 原文（分隔标记之后）。 */
-  readonly userText: string
+  /** 仅旧格式存在：从被污染 user 消息中拆出的 prompt 原文。 */
+  readonly userText?: string
   /** 消息事件时间（Unix epoch ms）；缺失时操作行不显示时钟。 */
   readonly time?: number
 }
 
 /**
- * 识别含注入前缀的用户消息（首轮长期记忆 / 关键词命中）。
- * pre-step 把注入文本 prepend 到用户消息的 text block，两者以
- * 「本轮用户prompt：」分隔——前端据此折叠注入、只显示用户 prompt。
- * 仅折叠纯文本消息（content 全是 text block）——带附件/图片的消息保持原样
- * （前端折叠会重建文本气泡，附件会丢）。
+ * 新格式优先识别 source.memory.kind (initial/reinjection/hit) 机器元数据，解耦于自然语言文本；
+ * 兼容未带元数据的 snapshot (中英文标记兜底)；
+ * 旧格式继续识别含注入前缀和分隔符的 user 消息。
  */
 export function computeInjectionGroups(snapshot: ConversationSnapshot): InjectionGroup[] {
   const groups: InjectionGroup[] = []
   for (const key of snapshot.chat.order) {
     const node = snapshot.chat.nodes.get(key)
-    if (node === undefined || node.kind !== 'user') continue
+    if (node === undefined) continue
+    if (node.kind === 'context') {
+      const source = (node.data as ContextLike).source as {
+        kind?: string
+        plugin?: string
+        form?: string
+        memory?: { kind?: 'initial' | 'hit' | 'reinjection' | 'welcome' }
+      } | undefined
+      if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) continue
+      const memKind = source.memory?.kind
+      if (memKind === 'initial' || memKind === 'reinjection') {
+        groups.push({ id: key, kind: 'first', injectedText: contextText(node) })
+        continue
+      }
+      if (memKind === 'hit') {
+        groups.push({ id: key, kind: 'hit', injectedText: contextText(node) })
+        continue
+      }
+      if (source.form === 'snapshot') {
+        const injectedText = contextText(node)
+        const isFirst = injectedText.startsWith(FIRST_INJECTION_MARKER) || injectedText.includes('LONG-TERM MEMORY')
+        groups.push({ id: key, kind: isFirst ? 'first' : 'hit', injectedText })
+      }
+      continue
+    }
+    if (node.kind !== 'user') continue
     const content = (node.data as { content?: readonly { type?: string; text?: string }[] }).content ?? []
     if (content.length === 0 || content.some((b) => b.type !== 'text')) continue // 带附件不折叠
     const text = blocksToText(content)
     if (text.length === 0) continue
     let kind: InjectionKind | null = null
-    if (text.startsWith(FIRST_INJECTION_MARKER)) kind = 'first'
-    else if (text.startsWith(HIT_INJECTION_MARKER)) kind = 'hit'
+    if (text.startsWith(FIRST_INJECTION_MARKER) || text.includes('LONG-TERM MEMORY') || text.includes('===== 长期记忆 =====')) kind = 'first'
+    else if (text.startsWith(HIT_INJECTION_MARKER) || text.includes('Possibly relevant memories') || text.includes('可能相关的记忆')) kind = 'hit'
     if (kind === null) continue
-    const sepIdx = text.lastIndexOf(PROMPT_SEPARATOR)
-    if (sepIdx === -1) continue // 没有分隔标记（异常数据）：不折叠
-    const userText = text.slice(sepIdx + PROMPT_SEPARATOR.length).replace(/^\n+/, '')
+    const sep = text.includes(PROMPT_SEPARATOR) ? PROMPT_SEPARATOR : (text.includes('Your prompt:') ? 'Your prompt:' : null)
+    if (sep === null) continue // 没有分隔标记（异常数据）：不折叠
+    const sepIdx = text.lastIndexOf(sep)
+    const userText = text.slice(sepIdx + sep.length).replace(/^\n+/, '')
     const time = typeof (node.data as { time?: unknown }).time === 'number'
       ? (node.data as { time: number }).time
       : undefined
-    groups.push({ id: key, kind, injectedText: text.slice(0, sepIdx + PROMPT_SEPARATOR.length), userText, time })
+    groups.push({ id: key, kind, injectedText: text.slice(0, sepIdx + sep.length), userText, time })
   }
   return groups
 }

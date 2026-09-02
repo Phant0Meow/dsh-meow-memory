@@ -24,10 +24,10 @@ function turnLoc(turn) {
 function stepLoc(turn, step) {
   return { kind: 'step', turn: { turn }, step: { step } }
 }
-function contextNode(key, text, loc) {
+function contextNode(key, text, loc, source = { kind: 'plugin', plugin: 'meow-memory' }) {
   return {
     key, kind: 'context', location: loc,
-    data: { source: { kind: 'plugin', plugin: 'meow-memory' }, content: [{ type: 'text', text }] },
+    data: { source, content: [{ type: 'text', text }] },
   }
 }
 function userNode(key, loc, content, time) {
@@ -221,31 +221,60 @@ console.log('=== 8. 缺 location 防护 ===')
   check('缺 location 的组被跳过=不折叠保持可见', !groups?.some((g) => g.id === 'bad-ctx'))
 }
 
-// ---- 9. 注入折叠：首轮长期记忆 / 关键词命中识别与解析 ----
+// ---- 9. 注入折叠：新独立 snapshot + 结构化元数据 + 英文 i18n + 旧 user 前缀兼容 ----
 console.log('=== 9. computeInjectionGroups ===')
 {
-  const FIRST = '===== 长期记忆 =====\n【关于你】x\n===== 长期记忆结束 =====\n\n本轮用户prompt：\n\n你好'
-  const HIT = '可能相关的记忆，仅供参考：\n- [fact:abc] 内容\n------\n本轮用户prompt：\n\n再问一句'
+  const SNAPSHOT_FIRST = '===== 长期记忆 =====\n【关于你】x'
+  const SNAPSHOT_HIT = '可能相关的记忆，仅供参考：\n[fact:abc] 内容'
+  const EN_FIRST = '===== LONG-TERM MEMORY =====\n【About You】x'
+  const EN_HIT = 'Possibly relevant memories, for reference only:\n[fact:abc] Content'
+  const LEGACY_FIRST = `${SNAPSHOT_FIRST}\n===== 长期记忆结束 =====\n\n本轮用户prompt：\n\n旧会话你好`
+  const LEGACY_HIT = `${SNAPSHOT_HIT}\n------\n本轮用户prompt：\n\n旧会话再问一句`
+  const LEGACY_EN_FIRST = `${EN_FIRST}\n===== END OF LONG-TERM MEMORY =====\n\nYour prompt:\n\nHello legacy`
   const PLAIN = '普通消息没有注入'
+  const snapshotSource = (text, meta) => ({
+    kind: 'plugin', plugin: 'meow-memory', form: 'snapshot',
+    memory: meta,
+    sections: [{ name: '长期记忆', text }],
+  })
   const nodes = new Map([
-    ['u-first', userNode('u-first', turnLoc(1), [{ type: 'text', text: FIRST }], 1755900000000)],
-    ['u-hit', userNode('u-hit', turnLoc(2), [{ type: 'text', text: HIT }])],
-    ['u-plain', userNode('u-plain', turnLoc(3), [{ type: 'text', text: PLAIN }])],
-    ['u-img', userNode('u-img', turnLoc(4), [{ type: 'text', text: HIT }, { type: 'image', attachment: {} }])],
+    ['ctx-first', contextNode('ctx-first', SNAPSHOT_FIRST, turnLoc(1), snapshotSource(SNAPSHOT_FIRST, { kind: 'initial', ids: ['s1'] }))],
+    ['u-first', userNode('u-first', turnLoc(1), [{ type: 'text', text: '你好' }], 1755900000000)],
+    ['ctx-hit', contextNode('ctx-hit', SNAPSHOT_HIT, turnLoc(2), snapshotSource(SNAPSHOT_HIT, { kind: 'hit', ids: ['f1'] }))],
+    ['u-hit', userNode('u-hit', turnLoc(2), [{ type: 'text', text: '再问一句' }])],
+    ['ctx-en-first', contextNode('ctx-en-first', EN_FIRST, turnLoc(3), snapshotSource(EN_FIRST, { kind: 'initial', ids: ['s2'] }))],
+    ['ctx-en-hit', contextNode('ctx-en-hit', EN_HIT, turnLoc(4), snapshotSource(EN_HIT, { kind: 'hit', ids: ['f2'] }))],
+    ['u-legacy-first', userNode('u-legacy-first', turnLoc(5), [{ type: 'text', text: LEGACY_FIRST }], 1755900000000)],
+    ['u-legacy-hit', userNode('u-legacy-hit', turnLoc(6), [{ type: 'text', text: LEGACY_HIT }])],
+    ['u-legacy-en', userNode('u-legacy-en', turnLoc(7), [{ type: 'text', text: LEGACY_EN_FIRST }])],
+    ['u-plain', userNode('u-plain', turnLoc(8), [{ type: 'text', text: PLAIN }])],
+    ['u-img', userNode('u-img', turnLoc(9), [{ type: 'text', text: LEGACY_HIT }, { type: 'image', attachment: {} }])],
+    ['ctx-other', contextNode('ctx-other', SNAPSHOT_FIRST, turnLoc(10), { kind: 'plugin', plugin: 'other', form: 'snapshot', sections: [] })],
+    ['ctx-welcome', contextNode('ctx-welcome', '【meow-memory 首次设置】', turnLoc(11), { kind: 'plugin', plugin: 'meow-memory', form: 'notice', memory: { kind: 'welcome' }, sections: [] })],
   ])
-  const s = snapshot(['u-first', 'u-hit', 'u-plain', 'u-img'], nodes, () => [])
+  const order = ['ctx-first', 'u-first', 'ctx-hit', 'u-hit', 'ctx-en-first', 'ctx-en-hit', 'u-legacy-first', 'u-legacy-hit', 'u-legacy-en', 'u-plain', 'u-img', 'ctx-other', 'ctx-welcome']
+  const s = snapshot(order, nodes, () => [])
   const injs = computeInjectionGroups(s)
-  check('识别 2 个注入组（带图不折叠）', injs.length === 2)
-  const first = injs.find((g) => g.id === 'u-first')
-  check('首轮注入 kind=first', first?.kind === 'first')
-  check('首轮 userText 解析', first?.userText === '你好')
-  check('首轮 time 提取', first?.time === 1755900000000)
-  check('首轮 injectedText 含完整注入', first?.injectedText.includes('===== 长期记忆 =====') && first?.injectedText.includes('本轮用户prompt：'))
-  const hit = injs.find((g) => g.id === 'u-hit')
-  check('命中注入 kind=hit', hit?.kind === 'hit')
-  check('命中 userText 解析', hit?.userText === '再问一句')
-  check('无 time → undefined', hit?.time === undefined)
-  check('命中 injectedText 含标记', hit?.injectedText.includes('可能相关的记忆，仅供参考：'))
+  check('识别 7 个注入组（中文 2 + 英文 2 + 旧格式 3）', injs.length === 7)
+  const first = injs.find((g) => g.id === 'ctx-first')
+  check('独立首轮 snapshot kind=first', first?.kind === 'first')
+  check('独立 snapshot 不重建 user 气泡', first?.userText === undefined && first?.time === undefined)
+  check('独立 snapshot 文本无旧分隔符', first?.injectedText === SNAPSHOT_FIRST && !first?.injectedText.includes('本轮用户prompt：'))
+  const hit = injs.find((g) => g.id === 'ctx-hit')
+  check('独立命中 snapshot kind=hit', hit?.kind === 'hit' && hit?.injectedText === SNAPSHOT_HIT)
+  const enFirst = injs.find((g) => g.id === 'ctx-en-first')
+  check('英文模式独立首轮 snapshot kind=first', enFirst?.kind === 'first' && enFirst?.injectedText === EN_FIRST)
+  const enHit = injs.find((g) => g.id === 'ctx-en-hit')
+  check('英文模式独立命中 snapshot kind=hit', enHit?.kind === 'hit' && enHit?.injectedText === EN_HIT)
+  const legacyFirst = injs.find((g) => g.id === 'u-legacy-first')
+  check('旧首轮 userText/time 兼容', legacyFirst?.userText === '旧会话你好' && legacyFirst?.time === 1755900000000)
+  check('旧首轮 injectedText 保留分隔标记', legacyFirst?.injectedText.includes('===== 长期记忆 =====') && legacyFirst?.injectedText.includes('本轮用户prompt：'))
+  const legacyHit = injs.find((g) => g.id === 'u-legacy-hit')
+  check('旧命中 userText 兼容', legacyHit?.kind === 'hit' && legacyHit?.userText === '旧会话再问一句')
+  const legacyEn = injs.find((g) => g.id === 'u-legacy-en')
+  check('英文旧格式 userText 兼容', legacyEn?.kind === 'first' && legacyEn?.userText === 'Hello legacy')
+  check('带图旧消息/其他插件/welcome notice 不折叠', !injs.some((g) => g.id === 'u-img' || g.id === 'ctx-other' || g.id === 'ctx-welcome'))
+  check('记忆 snapshot 不被误识别为反思轮', computeFoldGroups(s).length === 0)
 }
 
 // ---- 10. 注入消息时钟（对齐 dsh formatMessageClock 规则） ----

@@ -46,9 +46,14 @@ export function scanTurn(events: readonly unknown[]): {
       }
     }
     if (e?.type === 'user/message') {
-      const src = e.data?.source
-      if (src?.kind === 'plugin' && src.plugin === 'meow-memory') sawReflect = true
-      else {
+      const src = e.data?.source as { kind?: string; plugin?: string } | undefined
+      const msgText = (e.data?.content ?? [])
+        .filter((b) => b.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text ?? '')
+        .join(' ')
+      if (src?.kind === 'plugin' && src.plugin === 'meow-memory' && msgText.includes(REFLECT_MARKER)) {
+        sawReflect = true
+      } else {
         for (const b of e.data?.content ?? []) if (b.type === 'text' && b.text) texts.push(b.text)
       }
     } else if (e?.type === 'assistant/message') {

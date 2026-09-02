@@ -106,7 +106,7 @@ if (inj) {
   check('injection has soul block', inj.text.includes('【关于你】'))
   check('injection has user block', inj.text.includes('【关于user】'))
   check('injection has guide', inj.text.includes('【记忆导引】') && inj.text.includes('用户的所有 project：'))
-  check('injection format', inj.text.includes('===== 长期记忆结束 =====') && inj.text.includes('本轮用户prompt：'))
+  check('injection has no legacy prompt separator', !inj.text.includes('===== 长期记忆结束 =====') && !inj.text.includes('本轮用户prompt：'))
   check('injected ids recorded', readFileSync(join(ws2, '.dsh-meow', 'sessions', 'test-session-1.json'), 'utf8').includes(inj.injectedIds[0]))
 }
 // 已注入过的命中不再重复注入

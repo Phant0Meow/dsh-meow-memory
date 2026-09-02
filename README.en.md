@@ -27,10 +27,11 @@ frozen at the last conversation timestamp.
   format is injected: `===== 长期记忆 =====` → `【关于你】` (all soul entries) →
   `【关于user】` (all user entries) → `【设计原则】` (global rules with importance ≥ 2 —
   few, imperative guidelines) → `【记忆导引】` (usage note + the dynamic "all your projects"
-  list for `memory_project`) → `===== 长期记忆结束 =====` + `本轮用户prompt：`.
-  **No keyword hits on the first turn** (hits start from the second message). Even when the
-  first user message arrives batched with a plugin notice (e.g. an approval-policy change
-  notification), the snapshot still lands on the real user message and hits never fire early.
+  list for `memory_project`). The memory is inserted as an independent plugin snapshot directly
+  before the real user message; the user's prompt is never rewritten. **No keyword hits on the
+  first turn** (hits start from the second message). Even when the first user message arrives
+  batched with a plugin notice (e.g. an approval-policy change notification), the snapshot still
+  lands directly before the real user message and hits never fire early.
 - **Per-message keyword hits**: from the second user message on, every real user message is
   matched against fact/lesson/rules/topic (scope = global + current-project anchor),
   top-2 hits are injected under a "可能相关的记忆，仅供参考：" prefix. Matching is based on
@@ -208,12 +209,11 @@ First user message (turn 1)      Every message from turn 2            idle ≥3h
 │ 【关于user】         │          │ top-2 (global +     │        │ topic, summary), 7+   │
 │ 【设计原则】(rules)   │          │ current-project     │        │ extracted, updated_at │
 │ 【记忆导引】          │          │ anchor)            │        │ stamped at T          │
-│ ─────────────      │          └────────────────────┘        └──────────────────────┘
-│ 本轮用户prompt：     │          seen ids recorded
-│ [user text]        │          per session (sessions/<id>.json)
-└────────────────────┘          compaction signal → seen released
-   injected once per
-   session, no hits on turn 1
+└────────────────────┘          └────────────────────┘        └──────────────────────┘
+independent snapshot message    seen ids recorded
+↓ pristine user prompt          per session (sessions/<id>.json)
+  injected once per             compaction signal → seen released
+  session, no hits on turn 1
 ```
 
 ## 🛠 Development

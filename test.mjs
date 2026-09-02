@@ -462,7 +462,7 @@ if (inj) {
     inj.text.includes('当有项目相关任务时，应先用 memory_project 查项目全景（记得带上项目名，不能空参）') &&
     inj.text.includes('用户的所有 project：'))
   check('injection no topic/project title list', !inj.text.includes('- topic:') && !inj.text.includes('- project:'))
-  check('injection format', inj.text.includes('===== 长期记忆结束 =====') && inj.text.includes('本轮用户prompt：'))
+  check('injection has no legacy prompt separator', !inj.text.includes('===== 长期记忆结束 =====') && !inj.text.includes('本轮用户prompt：'))
   check('injection tool name fixed', !inj.text.includes('memory_recall') && inj.text.includes('memory_search'))
   check('sessions file written', readFileSync(join(ws2, '.dsh-meow', 'sessions', 'test-session-1.json'), 'utf8').includes(inj.injectedIds[0]))
 }
@@ -887,9 +887,15 @@ const decisionA = await preStep(
   { agent: agentA, messages: [{ content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }], turn: 1, step: 1, signal: new AbortController().signal },
   async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }] }),
 )
-check('pre-step injects', decisionA.kind === 'enter' && decisionA.messages[0].content[0].type === 'text' &&
-  decisionA.messages[0].content[0].text.includes('===== 长期记忆 ====='))
-check('user text preserved', decisionA.messages[0].content[1].text === '你好')
+check('pre-step inserts independent snapshot', decisionA.kind === 'enter' && decisionA.messages.length === 2 &&
+  decisionA.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
+  decisionA.messages[0].source.kind === 'plugin' && decisionA.messages[0].source.plugin === 'meow-memory' &&
+  decisionA.messages[0].source.form === 'snapshot' && decisionA.messages[0].source.sections.length === 1 &&
+  decisionA.messages[0].source.sections[0].name === '长期记忆' &&
+  decisionA.messages[0].source.sections[0].text === decisionA.messages[0].content[0].text)
+check('first user message remains pristine', decisionA.messages[1].source.kind === 'user' &&
+  decisionA.messages[1].content.length === 1 && decisionA.messages[1].content[0].text === '你好')
+check('snapshot has no legacy prompt separator', !decisionA.messages[0].content[0].text.includes('本轮用户prompt：'))
 
 // 回归（真机 2026-08-16）：首条用户消息与插件通知同批到达（messages[0].source.kind='plugin'，
 // 如 user-approval 的 policy 变更通知）→ 快照必须仍注入到真实用户消息上，且命中链路不得在首轮触发。
@@ -900,13 +906,15 @@ const decisionNotif = await preStep(
   { agent: notifAgent, messages: [notifMsg, notifUserMsg], turn: 1, step: 1, signal: new AbortController().signal },
   async () => ({ kind: 'enter', messages: [notifMsg, notifUserMsg] }),
 )
-check('snapshot injects into first user message despite leading plugin notice',
+check('snapshot is inserted before first user despite leading plugin notice',
   decisionNotif.kind === 'enter' &&
   decisionNotif.messages[0].content.length === 1 && // 通知消息原样保留
-  decisionNotif.messages[1].content[0].type === 'text' &&
+  decisionNotif.messages[0] === notifMsg &&
+  decisionNotif.messages[1].source.kind === 'plugin' &&
+  decisionNotif.messages[1].source.form === 'snapshot' &&
   decisionNotif.messages[1].content[0].text.includes('===== 长期记忆 =====') &&
-  decisionNotif.messages[1].content[0].text.includes('本轮用户prompt：') &&
-  !decisionNotif.messages[1].content[0].text.includes('可能相关的记忆，仅供参考：'))
+  !decisionNotif.messages[1].content[0].text.includes('可能相关的记忆，仅供参考：') &&
+  decisionNotif.messages[2] === notifUserMsg && decisionNotif.messages[2].content[0].text === '首条带通知的消息')
 
 // 恢复会话（进程重启后，日志已有历史用户消息）：快照不重复注入，命中链路照跑（第 N 条消息）
 const resumeAgent = { session: { header: { cwd: ws, id: 'apply-session-resume' }, events: [events.userMsg('之前')] }, steer: () => {} }
@@ -916,9 +924,11 @@ const decisionResume = await preStep(
   { agent: resumeAgent, messages: [resumeMsg], turn: 2, step: 1, signal: new AbortController().signal },
   async () => ({ kind: 'enter', messages: [resumeMsg] }),
 )
-check('resumed session skips snapshot, hit chain runs', decisionResume.messages[0].content.length === 2 &&
+check('resumed session skips first snapshot, hit chain inserts independent snapshot', decisionResume.messages.length === 2 &&
+  decisionResume.messages[0].source.form === 'snapshot' &&
   decisionResume.messages[0].content[0].text.includes('可能相关的记忆，仅供参考：') &&
-  !decisionResume.messages[0].content[0].text.includes('===== 长期记忆 ====='))
+  !decisionResume.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
+  decisionResume.messages[1] === resumeMsg && decisionResume.messages[1].content[0].text === '测试关键词')
 
 // 同会话第二次 pre-step（Set 命中）→ 零开销放行，不再注入（回归：防重复注入膨胀上下文）
 const decisionA2 = await preStep(
@@ -935,10 +945,12 @@ const decisionA3 = await preStep(
   { agent: agentA3, messages: [{ content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }], turn: 3, step: 1, signal: new AbortController().signal },
   async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }] }),
 )
-check('per-message hit injects', decisionA3.messages[0].content.length === 2 &&
+check('per-message hit inserts independent snapshot', decisionA3.messages.length === 2 &&
+  decisionA3.messages[0].source.kind === 'plugin' && decisionA3.messages[0].source.form === 'snapshot' &&
   decisionA3.messages[0].content[0].text.includes('可能相关的记忆，仅供参考：') &&
-  decisionA3.messages[0].content[0].text.includes('本轮用户prompt：') &&
-  decisionA3.messages[0].content[0].text.includes('测试关键词修正'))
+  !decisionA3.messages[0].content[0].text.includes('本轮用户prompt：') &&
+  decisionA3.messages[0].content[0].text.includes('测试关键词修正') &&
+  decisionA3.messages[1].source.kind === 'user' && decisionA3.messages[1].content[0].text === '测试关键词')
 const decisionA4 = await preStep(
   { agent: agentA3, messages: [{ content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }], turn: 4, step: 1, signal: new AbortController().signal },
   async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }] }),
@@ -959,13 +971,15 @@ const dReinj = await preStep(
   async () => ({ kind: 'enter', messages: [reinjMsg] }),
 )
 check('post-compaction reinjection injects snapshot + projects', dReinj.kind === 'enter' &&
-  dReinj.messages[0].content.length === 2 &&
+  dReinj.messages.length === 2 &&
+  dReinj.messages[0].source.kind === 'plugin' && dReinj.messages[0].source.form === 'snapshot' &&
   dReinj.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
   dReinj.messages[0].content[0].text.includes('【会话已压缩】') &&
   dReinj.messages[0].content[0].text.includes('【项目：femwa】') &&
   dReinj.messages[0].content[0].text.includes('femwa 项目重注入全景条目') &&
-  dReinj.messages[0].content[0].text.includes('本轮用户prompt：'))
-check('reinjection preserves user text', dReinj.messages[0].content[1].text === '压缩后的第一条消息')
+  !dReinj.messages[0].content[0].text.includes('本轮用户prompt：') &&
+  dReinj.messages[1] === reinjMsg && dReinj.messages[1].content[0].text === '压缩后的第一条消息')
+check('reinjection preserves user text', dReinj.messages[1].content[0].text === '压缩后的第一条消息')
 check('reinjection does not run hit chain', !dReinj.messages[0].content[0].text.includes('可能相关的记忆，仅供参考：'))
 check('reinjection clears pending', isReinjectPending(wsReinj, 's-reinj', '.dsh-meow') === false)
 check('reinjection re-marks snapshot ids as injected', readSeen(wsReinj, 's-reinj', '.dsh-meow').size >= 2)
@@ -1005,11 +1019,15 @@ const dGuide1 = await guidePreStep(
   { agent: guideAgent, messages: [guideMsg], turn: 2, step: 1, signal: new AbortController().signal },
   async () => ({ kind: 'enter', messages: [guideMsg] }),
 )
-check('welcome guide injected when promptLang unset', dGuide1.messages[0].content.length === 2 &&
+check('welcome guide injected as independent notice when promptLang unset', dGuide1.messages.length === 2 &&
+  dGuide1.messages[0].source.kind === 'plugin' &&
+  dGuide1.messages[0].source.form === 'notice' &&
+  dGuide1.messages[0].source.memory?.kind === 'welcome' &&
   dGuide1.messages[0].content[0].text.includes('【meow-memory 首次设置】') &&
   dGuide1.messages[0].content[0].text.includes('恭喜') &&
   dGuide1.messages[0].content[0].text.includes('不要以 system prompt') &&
-  dGuide1.messages[0].content[0].text.includes('promptLang'))
+  dGuide1.messages[0].content[0].text.includes('promptLang') &&
+  dGuide1.messages[1] === guideMsg && dGuide1.messages[1].content[0].text === '继续')
 check('welcome guide recorded via accessed pseudo-id', readSeen(wsGuide, 'guide-session-1', '.dsh-meow').has('__welcomeGuide__'))
 const dGuide2 = await guidePreStep(
   { agent: guideAgent, messages: [{ content: [{ type: 'text', text: '再继续' }], source: { kind: 'user' } }], turn: 3, step: 1, signal: new AbortController().signal },
@@ -1050,8 +1068,10 @@ const decisionFork = await preStep(
   async () => ({ kind: 'enter', messages: [forkMsg] }),
 )
 check('fork session (parentSession without origin) still injects', decisionFork.kind === 'enter' &&
-  decisionFork.messages[0].content.length === 2 &&
-  decisionFork.messages[0].content[0].text.includes('===== 长期记忆 ====='))
+  decisionFork.messages.length === 2 &&
+  decisionFork.messages[0].source.form === 'snapshot' &&
+  decisionFork.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
+  decisionFork.messages[1] === forkMsg && decisionFork.messages[1].content[0].text === 'fork 会话的首条消息')
 
 // turn-stopping 反思（单任务内连续工具 step ≥7 才触发——用户拍板语义）
 const stopping = handlers['agent/turn-stopping']
