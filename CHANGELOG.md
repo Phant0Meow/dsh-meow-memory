@@ -21,6 +21,10 @@
 - **文案外置**：`inject.reinjectIntro` 改为覆盖三块的通用表述（zh/en 同步）；新增 `inject.writtenSection`/`inject.writtenIntro`。
 - 新增测试：written 记账（remember 新建/合并、update 落库与未找到/空 patch 不记）、LRU 上限、releaseSeen 保留、第三块回放（active 过滤/归档跳过/快照与全景去重/按库最新数据/db-only 并集）、apply 级注入与 injected 重记账。
 
+- 打点气泡（`client-delegate-notice.ts`）：识别 delegate 打点节点（`memory.kind='reflect-marker'/'dream-marker'/'reflect-done-marker'` 元数据优先 + 【记忆反思标记】文本兜底，与折叠轮/注入互斥）→ 隐藏原生低调 notice 行 → 原位插折叠横条同款胶囊气泡。dream 气泡状态化：「进行中…」⇄「已完成 ✓」（dreamed 才翻已完成，状态未知默认进行中），状态源 = dreamed-sessions 对账 + 增量信号；reflect 气泡按「触发→完成打点」交替配对（in-flight 防重入保证序列，最后一条 reflect 系打点且 30min 保鲜窗内=进行中）。`/dream` 命令 feedback 去掉「处理中」死文字改指向状态气泡。
+- prompt 正负平衡改造（zh/en 同步）：反思与 dream prompt 强调记忆正负平衡——被表扬的也记（不只教训）、被纠正的记 `corrected`、踩坑记、干了漂亮的事也记；防止记忆库全是教训让模型畏手畏脚。
+- dream 触发链 resume 修复：进程重启后 `liveAgents` 清空，agent-missing 窗口经 `agentsSvc.resume({ resumeSessionId })`（factory.resume，与 GUI 打开会话同路径）恢复后再 dream——挂着的老窗口不因重启丢 dream 资格。首版取 `factory.resume` 恒 undefined → 全部 agent-missing 窗口静默跳过（真机踩坑：重启后自动 dream 从未真正恢复），按 dsh-agent 源码实证修正。
+
 ### 前端连接池修复：dream-events SSE → 全页共享轮询（2026-09-05）
 
 - **根因**：dream-icon / dream-skip / delegate-notice 三个客户端管理器各自开一条 `EventSource('/meow-memory/dream-events')`——单页 3 条 HTTP/1.1 长连接，加上 DSH 官方 events.mux/events.host 两条 ws，同源浏览器每域 6 连接池被占满：同源第二个标签页与刷新被饿死（「第二个窗口打不开 / 刷新打不开 / 越来越卡」，3080/3081 皆然）。
