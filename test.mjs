@@ -54,6 +54,7 @@ import {
   minutesInTimeZone,
   isDreamSuppressed,
   collectDreamStates,
+  sessionEventsOf,
 } from './lib/index.js'
 
 let passed = 0
@@ -930,6 +931,27 @@ check('resumed session skips first snapshot, hit chain inserts independent snaps
   !decisionResume.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
   decisionResume.messages[1] === resumeMsg && decisionResume.messages[1].content[0].text === '测试关键词')
 
+// alpha.4 形态（Session.events 属性移除，ownEvents() 函数提供事件流）：
+// 恢复会话的快照不重复注入、命中链路照跑——与 events 数组形态行为一致。
+const alphaAgent = { session: { header: { cwd: ws, id: 'apply-session-alpha4' }, ownEvents: () => [events.userMsg('之前')] }, steer: () => {} }
+setCurrentProject(ws, 'apply-session-alpha4', 'dsh', '.dsh-meow')
+const alphaMsg = { content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }
+const decisionAlpha = await preStep(
+  { agent: alphaAgent, messages: [alphaMsg], turn: 2, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [alphaMsg] }),
+)
+check('ownEvents-only session: resume skips snapshot, hit chain inserts independent snapshot', decisionAlpha.messages.length === 2 &&
+  decisionAlpha.messages[0].source.form === 'snapshot' &&
+  decisionAlpha.messages[0].content[0].text.includes('可能相关的记忆，仅供参考：') &&
+  !decisionAlpha.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
+  decisionAlpha.messages[1] === alphaMsg && decisionAlpha.messages[1].content[0].text === '测试关键词')
+
+// sessionEventsOf 兼容层单元测试：ownEvents() 优先 → events 回退 → 缺失 fail-closed
+check('sessionEventsOf prefers ownEvents()', sessionEventsOf({ ownEvents: () => [1, 2], events: [9] }).length === 2)
+check('sessionEventsOf falls back to events array', sessionEventsOf({ events: [1, 2, 3] }).length === 3)
+check('sessionEventsOf fail-closed on missing both', sessionEventsOf({}).length === 0)
+check('sessionEventsOf fail-closed on undefined session', sessionEventsOf(undefined).length === 0)
+
 // 同会话第二次 pre-step（Set 命中）→ 零开销放行，不再注入（回归：防重复注入膨胀上下文）
 const decisionA2 = await preStep(
   { agent: agentA, messages: [{ content: [{ type: 'text', text: '第二条消息' }], source: { kind: 'user' } }], turn: 2, step: 1, signal: new AbortController().signal },
@@ -1083,6 +1105,12 @@ const steered = []
 const agentD = { session: { header: { cwd: ws, id: 's4' }, events: sevenSteps }, steer: (m) => steered.push(m) }
 stopping({ agent: agentD, turn: 1, signal: new AbortController().signal })
 check('steer after 7 consecutive tool steps', steered.length === 1 && steered[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
+
+// alpha.4 形态：事件流由 ownEvents() 提供，反射链路必须等价（7 步触发）。
+const steeredA4 = []
+const agentA4 = { session: { header: { cwd: ws, id: 's4a' }, ownEvents: () => sevenSteps }, steer: (m) => steeredA4.push(m) }
+stopping({ agent: agentA4, turn: 1, signal: new AbortController().signal })
+check('alpha.4 ownEvents session steers after 7 consecutive tool steps', steeredA4.length === 1 && steeredA4[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
 
 // 单步工具调用 → 不触发
 const steered1 = []

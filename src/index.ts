@@ -230,6 +230,21 @@ function sessionIdOfAgent(agent: { session?: { header?: SessionHeaderLike } }): 
   return typeof id === 'string' && id.length > 0 ? id : 'unknown'
 }
 
+/**
+ * 双版本会话事件读取：dsh 0.1.2-alpha.4 重构移除 Session.events 属性，
+ * 改为 ownEvents() 方法（返回剔除 fork 继承前缀的本会话事件，与旧版
+ * events 语义等价）；旧版仍是数组属性。探测函数形态优先，回退属性，
+ * 两者都缺返回空数组（fail-closed：绝不抛 events is not iterable）。
+ */
+export function sessionEventsOf(session: { events?: readonly unknown[]; ownEvents?: () => readonly unknown[] } | undefined | null): readonly unknown[] {
+  if (typeof session?.ownEvents === 'function') {
+    const evs = session.ownEvents()
+    return Array.isArray(evs) ? evs : []
+  }
+  const evs = session?.events
+  return Array.isArray(evs) ? evs : []
+}
+
 /** 本 turn 是否为 dream 轮（事件流里存在 meow-memory 的 dream 指令消息）。 */
 function wasDreamTurn(events: readonly unknown[]): boolean {
   for (let i = events.length - 1; i >= 0; i--) {
@@ -430,7 +445,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     if (!firstUserHandled.has(sid)) {
       firstUserHandled.add(sid)
       let priorUser = 0
-      for (const e of agent.session.events) {
+      for (const e of sessionEventsOf(agent.session)) {
         const evt = e as { type?: string; data?: { source?: { kind?: string } } }
         if (evt?.type === 'user/message' && evt.data?.source?.kind === 'user') priorUser++
       }
@@ -524,8 +539,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     const t0 = Date.now()
     if (agent.session.header.origin === 'subagent') return // 子代理不参与（origin 权威判定）
     registerLiveAgent(agent)
-    const endReason = lastTurnEndReason(agent.session.events)
-    const dreamTurn = wasDreamTurn(agent.session.events)
+    const endReason = lastTurnEndReason(sessionEventsOf(agent.session))
+    const dreamTurn = wasDreamTurn(sessionEventsOf(agent.session))
     const wsTs = workspaceOfAgent(agent)
     const sidTs = sessionIdOfAgent(agent)
     if (wsTs) {
@@ -547,11 +562,11 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     if (!resolved.reflect) return
     const ws = workspaceOfAgent(agent)
     if (!ws) return
-    const { sawToolCall, lastToolName, sawReflect, turnText } = scanTurn(agent.session.events)
+    const { sawToolCall, lastToolName, sawReflect, turnText } = scanTurn(sessionEventsOf(agent.session))
     if (sawReflect) return // 本 turn 已反思过（含反思轮自身结束）
     if (!sawToolCall) return // 纯聊天轮，不反思
     if (lastToolName !== undefined && lastToolName.startsWith('memory_')) return // 已主动记忆
-    if (consecutiveToolSteps(agent.session.events) < resolved.reflectTurns) return // 单任务内连续工具 step 不足
+    if (consecutiveToolSteps(sessionEventsOf(agent.session)) < resolved.reflectTurns) return // 单任务内连续工具 step 不足
     const message = buildReflectMessage(ws, turnText, resolved.projectDir)
     agent.steer(message)
     if (Date.now() - t0 > 20) perf(`turn-stopping slow ${Date.now() - t0}ms`)

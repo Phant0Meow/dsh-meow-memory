@@ -99,6 +99,9 @@ function toolNameOf(node: ChatNode): string | undefined {
  * @returns 按渲染顺序排列的折叠组。
  */
 export function computeFoldGroups(snapshot: ConversationSnapshot): FoldGroup[] {
+  // fail-closed：宿主快照形状变化（如旧/新 dsh 前端 chat 缺失）时降级为不折叠，
+  // 绝不抛错炸掉 dock（官方 issue #2 turnOf 同类无保护读教训）。
+  if (snapshot?.chat === undefined) return []
   const order = snapshot.chat.order
   const nodes = snapshot.chat.nodes
   const groups: FoldGroup[] = []
@@ -198,6 +201,7 @@ export interface InjectionGroup {
  * 旧格式继续识别含注入前缀和分隔符的 user 消息。
  */
 export function computeInjectionGroups(snapshot: ConversationSnapshot): InjectionGroup[] {
+  if (snapshot?.chat === undefined) return [] // fail-closed：快照无 chat 时不注入折叠，绝不抛错
   const groups: InjectionGroup[] = []
   for (const key of snapshot.chat.order) {
     const node = snapshot.chat.nodes.get(key)
