@@ -27,6 +27,7 @@ import {
   markProjectQueried,
   readProjectQueried,
   isReinjectPending,
+  MAX_REINJECT_WRITTEN,
   newId,
   projectCovers,
   projectLabel,
@@ -38,6 +39,7 @@ import {
   buildDreamMessage,
   windowNeedsDream,
   startWindowDream,
+  resumeAndDream,
   advanceDream,
   abortDream,
   recoverInterruptedDream,
@@ -46,8 +48,10 @@ import {
   markInjected,
   markSearched,
   markAccessed,
+  markWritten,
   releaseSeen,
   readSeen,
+  readWritten,
   getCurrentProject,
   setCurrentProject,
   hourInTimeZone,
@@ -179,6 +183,47 @@ dbW.finishDream('win-1', 0)
 check('check gate passes first', dbW.claimCheckGate(0) === true)
 check('check gate blocks within interval', dbW.claimCheckGate(86_400_000) === false)
 check('check gate passes after interval', dbW.claimCheckGate(0) === true)
+
+// v0.23.1：进程重启后 agent-missing 窗口从 persistence 恢复 agent → dream 自动触发（不需要人碰窗口）
+{
+  const cfgR = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2 }
+  const wsR = mkdtempSync(join(tmpdir(), 'mm-resume-'))
+  const dbR = getDb(wsR, '.dsh-meow')
+  const widR = 'win-resume-1'
+  dbR.touchWindow(widR, wsR, Date.now() - 4 * 3600_000) // 空闲 4h，need=true
+  dbR.insert({ level: 'fact', content: '恢复后要整理的记忆', project: 'dsh', source_session: widR, created_at: 100 })
+  const steered = []
+  const resumedAgent = { session: { header: { id: widR } }, steer: (m) => steered.push(m) }
+  // mock 对齐现行契约：resume 在 agents service 本体（service.resume(options)），
+  // factory 槽是 { target } 包装、其上无 resume（src/dream.ts resumeAndDream 实证）。
+  const ctxR = { get: (name) => (name === 'agents' ? { resume: async () => resumedAgent } : undefined) }
+  await resumeAndDream(ctxR, widR, wsR, '.dsh-meow', undefined, cfgR)
+  check('resume: agent restored → dream started (steered + lease)', steered.length === 1 && dbR.getDreamLease(widR) !== null)
+
+  const wsR2 = mkdtempSync(join(tmpdir(), 'mm-resume-fail-'))
+  const dbR2 = getDb(wsR2, '.dsh-meow')
+  const widR2 = 'win-resume-2'
+  dbR2.touchWindow(widR2, wsR2, Date.now() - 4 * 3600_000)
+  dbR2.insert({ level: 'fact', content: '恢复失败窗口的记忆', project: 'dsh', source_session: widR2, created_at: 100 })
+  const ctxR2 = { get: (name) => (name === 'agents' ? { resume: async () => { throw new Error('session file gone') } } : undefined) }
+  await resumeAndDream(ctxR2, widR2, wsR2, '.dsh-meow', undefined, cfgR)
+  check('resume: failure degrades silently (no lease, no throw)', dbR2.getDreamLease(widR2) === null)
+
+  const wsR3 = mkdtempSync(join(tmpdir(), 'mm-resume-dedup-'))
+  const dbR3 = getDb(wsR3, '.dsh-meow')
+  const widR3 = 'win-resume-3'
+  dbR3.touchWindow(widR3, wsR3, Date.now() - 4 * 3600_000)
+  dbR3.insert({ level: 'fact', content: '防重入窗口的记忆', project: 'dsh', source_session: widR3, created_at: 100 })
+  let resumeCalls = 0
+  let releaseResume
+  const gate = new Promise((r) => { releaseResume = r })
+  const ctxR3 = { get: (name) => (name === 'agents' ? { resume: async () => { resumeCalls++; await gate; return resumedAgent } } : undefined) }
+  const p1 = resumeAndDream(ctxR3, widR3, wsR3, '.dsh-meow', undefined, cfgR)
+  const p2 = resumeAndDream(ctxR3, widR3, wsR3, '.dsh-meow', undefined, cfgR)
+  releaseResume()
+  await Promise.all([p1, p2])
+  check('resume: in-flight dedup (single resume call)', resumeCalls === 1)
+}
 
 // dream 分轮结构：原子（project/fact/lesson）/ topic / 项目总结；本窗口建立 ∪ 提取过的记忆；project 小标题
 const wsD = mkdtempSync(join(tmpdir(), 'mm-dream-'))
@@ -492,16 +537,18 @@ check('no memory → null', buildInjection(db4, ws4, 'x', 'hi') === null)
 
 // ═══════════════════════ 部分 2：apply 级 ═══════════════════════
 
-function makeCtx() {
+function makeCtx(subagents) {
   const tools = []
   const handlers = {}
+  const effects = []
   const ctx = {
     logger: { info: () => {}, warn: () => {}, error: console.error },
     tools: { register: (t) => tools.push(t) },
     on: (name, fn) => { handlers[name] = fn },
-    subagents: { start: () => { throw new Error('subagents not expected in tests') } },
+    effect: (fn) => { effects.push(fn); return () => {} },
+    subagents: subagents ?? { start: () => { throw new Error('subagents not expected in tests') } },
   }
-  return { ctx, tools, handlers }
+  return { ctx, tools, handlers, effects }
 }
 
 const { ctx, tools, handlers } = makeCtx()
@@ -682,6 +729,59 @@ check('compaction/end success arms reinjection', isReinjectPending(wsReinj, 's-r
 check('releaseSeen keeps projectsQueried for reinjection', JSON.stringify(readProjectQueried(wsReinj, 's-reinj', '.dsh-meow')) === JSON.stringify(['femwa']))
 await handlers['session/event']({ id: 's-reinj2', header: { cwd: wsReinj } }, { type: 'compaction/end', time: Date.now(), data: { compactionId: 'c2', turn: null, error: 'provider failed' } })
 check('compaction/end with error does not arm', isReinjectPending(wsReinj, 's-reinj2', '.dsh-meow') === false)
+
+// ── 写痕迹（v0.23.0）：memory_remember/memory_update 落库记 written；LRU / releaseSeen 保留 ──
+const wsWritten = mkdtempSync(join(tmpdir(), 'mm-written-'))
+const dbWritten = new MemoryDb(memoryDbPath(wsWritten))
+const rememberToolW = tools.find((t) => t.name === 'memory_remember')
+const updateToolW = tools.find((t) => t.name === 'memory_update')
+const writtenCtx = { agent: { session: { header: { cwd: wsWritten, id: 's-w' } } } }
+const r1 = await rememberToolW.execute({ content: '本会话新建的记忆条目', project: 'femwa', keywords: ['新建', '记忆', '测试', '压缩', '重注入', '回放', '痕迹', '条目'], importance: 1 }, writtenCtx)
+check('remember insert records written', readWritten(wsWritten, 's-w', '.dsh-meow').includes(r1.id))
+const r2 = await rememberToolW.execute({ content: '本会话新建的记忆条目', project: 'femwa', keywords: ['新建', '记忆', '测试', '压缩', '重注入', '回放', '痕迹', '条目'], importance: 2 }, writtenCtx)
+check('remember merge records written', r2.merged === true && r2.id === r1.id && readWritten(wsWritten, 's-w', '.dsh-meow').includes(r2.id))
+const r3 = await updateToolW.execute({ id: r1.id, importance: 3 }, writtenCtx)
+check('update success records written', r3.ok === true && readWritten(wsWritten, 's-w', '.dsh-meow').includes(r1.id))
+const r4 = await updateToolW.execute({ id: 'nonexistent-id-xxxx', importance: 1 }, writtenCtx)
+check('update not-found does not record', r4.ok === false && readWritten(wsWritten, 's-w', '.dsh-meow').length === 1)
+await updateToolW.execute({ id: r1.id, keywords: [] }, writtenCtx) // 空 patch = 不更新
+check('empty patch update does not change written', readWritten(wsWritten, 's-w', '.dsh-meow').length === 1)
+markWritten(wsWritten, 's-wlru', ['a', 'b'], '.dsh-meow')
+markWritten(wsWritten, 's-wlru', ['a'], '.dsh-meow')
+check('markWritten moves repeat to end', JSON.stringify(readWritten(wsWritten, 's-wlru', '.dsh-meow')) === JSON.stringify(['b', 'a']))
+for (let i = 0; i < MAX_REINJECT_WRITTEN + 3; i++) markWritten(wsWritten, 's-wlru2', [`w${i}`], '.dsh-meow')
+const wlru = readWritten(wsWritten, 's-wlru2', '.dsh-meow')
+check('markWritten caps at MAX_REINJECT_WRITTEN', wlru.length === MAX_REINJECT_WRITTEN && !wlru.includes('w0') && wlru.includes(`w${MAX_REINJECT_WRITTEN + 2}`))
+markWritten(wsWritten, 's-wrel', ['keepme'], '.dsh-meow')
+await handlers['session/event']({ id: 's-wrel', header: { cwd: wsWritten } }, { type: 'compaction/summary', time: Date.now() })
+check('releaseSeen keeps written for reinjection', readWritten(wsWritten, 's-wrel', '.dsh-meow').includes('keepme'))
+
+// 第三块构造：active 回放 / 归档跳过 / 快照与全景去重 / 按库最新数据 / db-only 并集
+const wsW3 = mkdtempSync(join(tmpdir(), 'mm-reinj-written-'))
+const dbW3 = new MemoryDb(memoryDbPath(wsW3))
+dbW3.insert({ level: 'soul', content: 'W3 快照 soul 条目' })
+const wSoul = dbW3.insert({ level: 'soul', content: 'W3 快照与本块重复的 soul 条目' })
+const wSelf = dbW3.insert({ level: 'fact', content: '本会话自己存的 fact 原文', project: 'femwa', source_session: 's-w3' })
+const wOther = dbW3.insert({ level: 'lesson', content: '别的窗口建、本会话更新的 lesson 原文', source_session: 's-other' })
+const wArch = dbW3.insert({ level: 'fact', content: '本会话存了又归档的条目', source_session: 's-w3' })
+dbW3.update(wArch.level, wArch.id, { status: 'archived' })
+const wProj = dbW3.insert({ level: 'project', content: 'W3 全景里会出现的 project 条目', project: 'femwa', subcategory: 'overview' })
+const wFresh = dbW3.insert({ level: 'fact', content: '写入时的旧原文', source_session: 's-w3' })
+markWritten(wsW3, 's-w3', [wSelf.id, wOther.id, wArch.id, wProj.id, wSoul.id, wFresh.id], '.dsh-meow')
+dbW3.update('fact', wFresh.id, { content: '更新后的最新原文' })
+const w3Reinj = buildReinjection(dbW3, wsW3, 's-w3', ['femwa'], {}, '.dsh-meow')
+const countOccurrences = (s, sub) => s.split(sub).length - 1
+check('reinjection includes written section', w3Reinj !== null && w3Reinj.text.includes('【本会话写过的记忆】'))
+check('written replays session-created entry', w3Reinj.text.includes('本会话自己存的 fact 原文'))
+check('written replays foreign entry updated this session', w3Reinj.text.includes('别的窗口建、本会话更新的 lesson 原文'))
+check('written replays latest db content', w3Reinj.text.includes('更新后的最新原文') && !w3Reinj.text.includes('写入时的旧原文'))
+check('written skips archived', !w3Reinj.text.includes('本会话存了又归档的条目'))
+check('written dedups against snapshot', countOccurrences(w3Reinj.text, 'W3 快照与本块重复的 soul 条目') === 1)
+check('written dedups against project panorama', countOccurrences(w3Reinj.text, 'W3 全景里会出现的 project 条目') === 1)
+const wDbOnly = dbW3.insert({ level: 'fact', content: '仅库痕迹的条目也能回放', source_session: 's-w3' }) // 不 markWritten
+const w3Reinj2 = buildReinjection(dbW3, wsW3, 's-w3', [], {}, '.dsh-meow')
+check('written union covers db source_session entries', w3Reinj2 !== null && w3Reinj2.text.includes('仅库痕迹的条目也能回放'))
+dbW3.close()
 
 // 插件注入轮（反思/dream steer 消息轮）内的事件不刷新窗口活跃度（防 dream 反复触发）
 const wsWin = mkdtempSync(join(tmpdir(), 'mm-win-'))
@@ -1027,6 +1127,20 @@ const dSubPending = await preStep(
   async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '子代理消息' }], source: { kind: 'user' } }] }),
 )
 check('no reinjection for subagent, pending kept', dSubPending.messages[0].content.length === 1 && isReinjectPending(wsReinj, 's-reinj4', '.dsh-meow') === true)
+// 第三块 apply 级：pending + 本会话写过的记忆 → 注入含【本会话写过的记忆】段；written id 记入 injected
+await handlers['session/event']({ id: 's-reinj5', header: { cwd: wsReinj } }, { type: 'compaction/end', time: Date.now(), data: { compactionId: 'c5', turn: null } })
+const reinjRemember = tools.find((t) => t.name === 'memory_remember')
+const reinjRememberCtx = { agent: { session: { header: { cwd: wsReinj, id: 's-reinj5' } } } }
+const rReinj5 = await reinjRemember.execute({ content: '压缩前本会话写入的记忆', project: 'femwa', keywords: ['压缩', '写入', '记忆', '回放', '第三块', '重注入', '痕迹', '测试'], importance: 1 }, reinjRememberCtx)
+const reinjAgent5 = { session: { header: { cwd: wsReinj, id: 's-reinj5' }, events: [] }, steer: () => {} }
+const dReinj5 = await preStep(
+  { agent: reinjAgent5, messages: [{ content: [{ type: 'text', text: '第三块测试' }], source: { kind: 'user' } }], turn: 1, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '第三块测试' }], source: { kind: 'user' } }] }),
+)
+check('reinjection includes written section (apply)', dReinj5.kind === 'enter' &&
+  dReinj5.messages[0].content[0].text.includes('【本会话写过的记忆】') &&
+  dReinj5.messages[0].content[0].text.includes('压缩前本会话写入的记忆'))
+check('written ids re-marked as injected (apply)', readSeen(wsReinj, 's-reinj5', '.dsh-meow').has(rReinj5.id))
 dbReinj.close()
 
 // 首次设置引导（v0.19.0）：promptLang 未配置 → 插件生效后第一条真实用户消息注入
@@ -1155,6 +1269,156 @@ const agentF = { session: { header: { cwd: ws, id: 's6' }, events: [events.turnS
 stopping({ agent: agentF, turn: 1, signal: new AbortController().signal })
 check('no steer after memory_ tool', steered3.length === 0)
 
+// ═══════════════════════ delegate（fork 子代理执行体） ═══════════════════════
+
+// parseModelSpec 单元：'provider/model' / 'model' / 空
+const { parseModelSpec, validateConfigUserLayer, mergeConfigLayer } = await import('./lib/index.js')
+check('parseModelSpec splits provider/model', JSON.stringify(parseModelSpec('prov/main')) === JSON.stringify({ provider: 'prov', model: 'main' }))
+check('parseModelSpec model-only keeps provider inherited', JSON.stringify(parseModelSpec('solo')) === JSON.stringify({ model: 'solo' }))
+check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && parseModelSpec(undefined) === undefined && parseModelSpec('  ') === undefined)
+
+// ── 设置页数据层：mergeConfigLayer（user 层字段级覆盖+子对象浅合并）/ validateConfigUserLayer ──
+{
+  const patch = { enabled: true, hitTopK: 2, dream: { enabled: true, idleMinutes: 180, timeZone: 'UTC' }, delegate: { reflect: false, dream: false, model: '' } }
+  const merged = mergeConfigLayer(patch, { hitTopK: 5, dream: { idleMinutes: 60 } })
+  check('settings merge: top-level field overridden', merged.hitTopK === 5 && merged.enabled === true)
+  check('settings merge: dream sub-fields shallow-merged (patch keys kept)', merged.dream.enabled === true && merged.dream.idleMinutes === 60 && merged.dream.timeZone === 'UTC')
+  check('settings merge: untouched groups pass through', JSON.stringify(merged.delegate) === JSON.stringify(patch.delegate))
+  check('settings merge: undefined user layer returns patch', mergeConfigLayer(patch, undefined) === patch)
+  check('settings validate: valid layer passes', (validateConfigUserLayer({ enabled: false, promptLang: 'en', dream: { idleMinutes: 60, suppressWindows: [{ start: '09:00', end: '12:00' }] }, delegate: { model: 'prov/m' } }), true))
+  const bad = (v) => {
+    try { validateConfigUserLayer(v); return false } catch { return true }
+  }
+  check('settings validate: bool/type violations rejected', bad({ enabled: 'yes' }) && bad({ hitTopK: 'many' }) && bad({ dream: { timeZone: 8 } }) && bad({ delegate: { model: 7 } }))
+  check('settings validate: bad suppressWindows rejected', bad({ dream: { suppressWindows: [{ start: '9点', end: '12点' }] } }) && bad({ dream: { suppressWindows: '09:00-12:00' } }))
+}
+
+// delegate.reflect=true：不 steer，起 fork 子代理 + agentOptions 模型覆盖
+{
+  const calls = []
+  let release
+  const gate = new Promise((r) => { release = r })
+  const subMock = {
+    start: (name, req) => {
+      calls.push({ name, req })
+      return { id: 'child-1', result: gate.then(() => ({ stopReason: 'completed', output: [] })), dispose: async () => {} }
+    },
+  }
+  const d = makeCtx(subMock)
+  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { reflect: true, model: 'prov/main' } })
+  const dStop = d.handlers['agent/turn-stopping']
+  const dSteered = []
+  const dAgent = { session: { header: { cwd: ws, id: 's-del' }, events: sevenSteps }, steer: (m) => dSteered.push(m) }
+  dStop({ agent: dAgent, turn: 1, signal: new AbortController().signal })
+  check('delegate: fork subagent started, not steered', calls.length === 1 && dSteered.length === 0)
+  check('delegate: provider name = fork', calls[0]?.name === 'fork')
+  check('delegate: agentOptions overrides provider+model', JSON.stringify(calls[0]?.req.agentOptions) === JSON.stringify({ provider: 'prov', model: 'main' }))
+  check('delegate: prompt carries reflect message', calls[0]?.req.prompt?.[0]?.text.includes('记忆反思任务'))
+  check('delegate: label set', calls[0]?.req.label === 'meow-memory reflect')
+  // in-flight 防重入：结果未 settle 前再触发 → 不重复 start
+  dStop({ agent: dAgent, turn: 2, signal: new AbortController().signal })
+  check('delegate: in-flight suppresses second trigger', calls.length === 1)
+  // settle 后 inFlight 清除 → 可再次触发
+  release()
+  await new Promise((r) => setTimeout(r, 0))
+  dStop({ agent: dAgent, turn: 3, signal: new AbortController().signal })
+  check('delegate: settled run clears in-flight', calls.length === 2)
+}
+
+// delegate.reflect=true 无 model：agentOptions 缺省（继承父 route = 缓存命中形态）
+{
+  const calls = []
+  const subMock = {
+    start: (name, req) => {
+      calls.push({ name, req })
+      return { id: 'child-2', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} }
+    },
+  }
+  const d = makeCtx(subMock)
+  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { reflect: true } })
+  d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-del2' }, events: sevenSteps } }, steer: () => {} }, { turn: 1, signal: new AbortController().signal })
+  check('delegate: no model → no agentOptions (inherit parent route)', calls.length === 1 && calls[0].req.agentOptions === undefined)
+}
+
+// delegate 服务不可用 → 回退 steer（功能降级而非消失）
+{
+  const d = makeCtx(null)
+  delete d.ctx.subagents
+  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { reflect: true } })
+  const fSteered = []
+  d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-del3' }, events: sevenSteps }, steer: (m) => fSteered.push(m) } }, { turn: 1, signal: new AbortController().signal })
+  check('delegate: unavailable falls back to steer', fSteered.length === 1 && fSteered[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
+}
+
+// delegate 无 model 配置时 Config 默认关闭 → steer 现状（agentD 系列已覆盖，此处防回归断言 delegate 缺省）
+{
+  const d = makeCtx()
+  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+  const calls = []
+  d.ctx.subagents = { start: (name, req) => { calls.push({ name, req }); return { id: 'x', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} } } }
+  const gSteered = []
+  d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-del4' }, events: sevenSteps }, steer: (m) => gSteered.push(m) } }, { turn: 1, signal: new AbortController().signal })
+  check('delegate: default off → steer unchanged, subagents untouched', gSteered.length === 1 && calls.length === 0)
+}
+
+// 换模型强制 delegate（猫猫拍板：换模型缓存命中无意义，必须不占主会话上下文）
+{
+  const { setDreamDelegateEnv } = await import('./lib/index.js')
+  const calls = []
+  const d = makeCtx({ start: (name, req) => { calls.push({ name, req }); return { id: 'c', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} } } })
+  try {
+    await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'cheap/m' } })
+    const fSteered = []
+    d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-forced' }, events: sevenSteps }, steer: (m) => fSteered.push(m) } }, { turn: 1, signal: new AbortController().signal })
+    check('delegate: model set forces delegate without explicit reflect', calls.length === 1 && fSteered.length === 0)
+  } finally {
+    setDreamDelegateEnv(null) // mock ctx.effect 不执行清理，手动清模块级 env 防泄漏到 /dream 用例
+  }
+}
+
+// 子会话归档双保险：settle 后 workspace.archiveSession(childId) 被调
+{
+  const { setDreamDelegateEnv } = await import('./lib/index.js')
+  const archived = []
+  const released = []
+  const d = makeCtx({
+    start: () => {
+      let release
+      const p = new Promise((res) => { release = res })
+      released.push(release)
+      return { id: 'child-arch', result: p.then(() => ({ stopReason: 'completed', output: [] })), dispose: async () => {} }
+    },
+  })
+  try {
+    d.ctx.get = (name) => (name === 'workspace' ? { archiveSession: (id) => archived.push(id) } : undefined)
+    await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { reflect: true } })
+    d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-arch' }, events: sevenSteps }, steer: () => {} } }, { turn: 1, signal: new AbortController().signal })
+    check('delegate: archive not called before settle', archived.length === 0)
+    released[0]()
+    await new Promise((r) => setTimeout(r, 0))
+    check('delegate: workspace.archiveSession(childId) after settle', archived.includes('child-arch'))
+  } finally {
+    setDreamDelegateEnv(null)
+  }
+}
+
+// 主会话打点：delegate started 后 session.append 收到带【记忆反思标记】的 user/message
+{
+  const { setDreamDelegateEnv } = await import('./lib/index.js')
+  const appended = []
+  const d = makeCtx({ start: () => ({ id: 'c2', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} }) })
+  try {
+    await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { reflect: true } })
+    const mAgent = { session: { header: { cwd: ws, id: 's-marker' }, events: sevenSteps, append: (type, data) => appended.push({ type, data }) }, steer: () => {} }
+    d.handlers['agent/turn-stopping']({ agent: mAgent, turn: 1, signal: new AbortController().signal })
+    check('delegate: marker appended to main session log', appended.length === 1 && appended[0].type === 'user/message' &&
+      appended[0].data.content.some((b) => b.type === 'text' && b.text.includes('【记忆反思标记】')) &&
+      appended[0].data.source.kind === 'plugin' && appended[0].data.source.form === 'notice')
+  } finally {
+    setDreamDelegateEnv(null)
+  }
+}
+
 // ═══════════════════════ /dream 用户命令（dsh 命令平面） ═══════════════════════
 
 // 定义形状 + handler 全路径。语义=手动触发：直接 startWindowDream，不吃峰时抑制/空闲检查。
@@ -1169,7 +1433,7 @@ check('no steer after memory_ tool', steered3.length === 0)
   const steeredC = []
   const agentC = { session: { header: { cwd: wsCmd, id: 's-cmd' } }, steer: (m) => steeredC.push(m) }
   const r1 = await def.handler({ agent: agentC })
-  check('/dream starts window dream', r1.kind === 'success' && r1.text.includes('已安排'), JSON.stringify(r1))
+  check('/dream starts window dream', r1.kind === 'success' && r1.text.includes('已触发'), JSON.stringify(r1))
   check('/dream steers round 1 with marker', steeredC.length === 1 && JSON.stringify(steeredC[0]).includes('[meow-memory-dream]'))
   check('/dream claims lease', dbCmd.getDreamLease('s-cmd') !== null)
   // 占用中：第二次调用 → error 且不重复 steer
@@ -1223,6 +1487,108 @@ check('no steer after memory_ tool', steered3.length === 0)
   await apply(ctxCmd, { enabled: true })
   check('/dream auto-registered via commands service', registeredC.length === 1 && registeredC[0].name === 'dream',
     JSON.stringify(registeredC.map((d) => d.name)))
+}
+
+// ═══════════════════════ delegate.dream：fork 子代理执行 dream 组链 ═══════════════════════
+{
+  const { setDreamDelegateEnv } = await import('./lib/index.js')
+  const wsDD = mkdtempSync(join(tmpdir(), 'mm-dd-'))
+  const dbDD = getDb(wsDD, '.dsh-meow')
+  dbDD.insert({ level: 'fact', content: 'delegate dream 测试原子条目 特异词dq', project: 'dsh', source_session: 's-dd' })
+  dbDD.insert({ level: 'topic', content: '【起因】委托dream测试【经过】链式推进【结果】验证', title: '委托dream', goal: '验证组推进', source_session: 's-dd' })
+  dbDD.insert({ level: 'fact', content: 'delegate dream 项目总结素材 特异词dp', project: 'femwa', source_session: 's-dd' })
+  dbDD.touchWindow('s-dd', wsDD, Date.now())
+
+  const calls = []
+  const gates = []
+  const makeGate = (stop) => {
+    let release
+    const p = new Promise((res) => { release = res })
+    gates.push({ release })
+    return p.then(() => ({ stopReason: stop, output: [] }))
+  }
+  const subMock = {
+    start: (name, req) => {
+      calls.push({ name, req })
+      return { id: `child-${calls.length}`, result: makeGate('completed'), dispose: async () => {} }
+    },
+  }
+  const dreamed = []
+  const dreamAbort = new AbortController()
+  setDreamDelegateEnv({
+    logger: { info: () => {}, warn: () => {} },
+    // 2026-09-03 契约：env 传 ctx 现场解析（apply 期服务未就绪的坑），不再固化 subagents。
+    ctx: { get: (name) => (name === 'subagents' ? subMock : undefined) },
+    signal: dreamAbort.signal,
+    inFlight: new Set(),
+    modelSpec: { provider: 'prov', model: 'm1' },
+  })
+  try {
+    // 组链：start（组1）→ release → 组2 → release → 组3 → release → 收尾
+    const agentDD = { session: { header: { cwd: wsDD, id: 's-dd' } }, steer: () => { throw new Error('delegate mode must not steer') } }
+    const ok = startWindowDream({ logger: { info: () => {}, warn: () => {} } }, agentDD, wsDD, '.dsh-meow', (sid, st) => { if (st === 'dreamed') dreamed.push(sid) })
+    check('dream delegate: started without steering', ok === true && calls.length === 1 && dbDD.getDreamLease('s-dd') !== null)
+    check('dream delegate: fork provider + model override + label', calls[0].name === 'fork' &&
+      JSON.stringify(calls[0].req.agentOptions) === JSON.stringify({ provider: 'prov', model: 'm1' }) &&
+      calls[0].req.label === 'meow-memory dream 1/3' && calls[0].req.prompt[0].text.includes('[meow-memory-dream]'))
+    gates[0].release()
+    await new Promise((r) => setTimeout(r, 0))
+    check('dream delegate: done callback advances to group 2', calls.length === 2 && calls[1].req.label === 'meow-memory dream 2/3')
+    gates[1].release()
+    await new Promise((r) => setTimeout(r, 0))
+    check('dream delegate: advances to group 3', calls.length === 3 && calls[2].req.label === 'meow-memory dream 3/3')
+    gates[2].release()
+    await new Promise((r) => setTimeout(r, 0))
+    check('dream delegate: final group finalizes (lease cleared + dreamed signal)', dreamed.includes('s-dd') && dbDD.getDreamLease('s-dd') === null)
+    check('dream delegate: last_dream_time stamped', dbDD.getWindow('s-dd').last_dream_time > 0)
+  } finally {
+    setDreamDelegateEnv(null)
+  }
+
+  // 失败路径：组 2 error → 立即收尾（aborted），不再推进下一组。
+  // s-dd2 需有自己的条目（source_session='s-dd2'）凑出 ≥2 组（原子轮 + 恒触发的 topic 轮）。
+  {
+    dbDD.insert({ level: 'fact', content: 'delegate dream 错误路径条目 特异词dr', project: 'dsh', source_session: 's-dd2' })
+    dbDD.touchWindow('s-dd2', wsDD, Date.now())
+    const calls2 = []
+    const gates2 = []
+    const makeGate2 = (stop) => {
+      let release
+      const p = new Promise((res) => { release = res })
+      gates2.push({ release })
+      return p.then(() => ({ stopReason: stop, output: [] }))
+    }
+    const subMock2 = {
+      start: (name, req) => {
+        calls2.push({ name, req })
+        return { id: `child2-${calls2.length}`, result: makeGate2(calls2.length === 2 ? 'error' : 'completed'), dispose: async () => {} }
+      },
+    }
+    const dreamed2 = []
+    setDreamDelegateEnv({
+      logger: { info: () => {}, warn: () => {} },
+      // 同上：ctx 现场解析契约。
+      ctx: { get: (name) => (name === 'subagents' ? subMock2 : undefined) },
+      signal: new AbortController().signal,
+      inFlight: new Set(),
+    })
+    try {
+      const agentDD2 = { session: { header: { cwd: wsDD, id: 's-dd2' } }, steer: () => {} }
+      const ok2 = startWindowDream({ logger: { info: () => {}, warn: () => {} } }, agentDD2, wsDD, '.dsh-meow', (sid, st) => { if (st === 'dreamed') dreamed2.push(sid) })
+      check('dream delegate error path: started', ok2 === true && calls2.length === 1, `ok=${ok2} calls=${calls2.length}`)
+      gates2[0].release()
+      await new Promise((r) => setTimeout(r, 0))
+      check('dream delegate error path: group 2 launched', calls2.length === 2 && calls2[1].req.label === 'meow-memory dream 2/3', `calls=${calls2.length} labels=${calls2.map((c) => c.req.label).join(',')}`)
+      gates2[1].release()
+      await new Promise((r) => setTimeout(r, 0))
+      check('dream delegate error path: error finalizes without next group', calls2.length === 2 && dreamed2.includes('s-dd2') && dbDD.getDreamLease('s-dd2') === null)
+    } finally {
+      setDreamDelegateEnv(null)
+    }
+  }
+
+  dbDD.close() // 显式关库：Windows WAL 句柄挡 rmSync
+  rmSync(wsDD, { recursive: true, force: true })
 }
 
 // disabled

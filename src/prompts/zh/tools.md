@@ -3,7 +3,7 @@
 
 ### memory_remember
 
-- memory_remember.description: 把一条值得跨会话记住的信息写入当前工作区的记忆库（SQLite，按 level 分表）。 必填参数：content（内容）/ project（归属："全局"或项目名，多项目用英文逗号分隔）/ keywords（8-13 个检索关键词）/ importance（重要性评估）。缺失会报错并提示重填。 level 分类：soul=AI 自身（少用）；user=用户基本信息与基础偏好； project=项目（项目名如 femwa/meow-memory/meow-eyes/dsh）； rules=设计原则/行为准则（全局准则 project 填"全局"且 importance≥2 会全量注入到首轮；  项目特定准则填 project 参数，随 memory_project 注入；其余走检索）； fact=细碎原子事实（一句话直陈 ≤60 字）；lesson=错误与教训（被纠正的一定记这里）； topic=话题（建议 goal 目标句，用 keywords 检索）。 铁律：用户介绍项目设计思路/框架/决策理由时，content 必须保留用户原话措辞，不要转述总结。 与已有条目高度重复会自动合并（更新而非新增）。调用成功后工具会返回确认，无需重复调用本工具。
+- memory_remember.description: 把一条值得跨会话记住的信息写入当前工作区的记忆库（SQLite，按 level 分表）。 必填参数：content（内容）/ project（归属："全局"或项目名，多项目用英文逗号分隔）/ keywords（8-13 个检索关键词）/ importance（重要性评估）。缺失会报错并提示重填。 level 分类：soul=AI 自身（少用）；user=用户基本信息与基础偏好； project=项目（项目名如 femwa/meow-memory/meow-eyes/dsh）； rules=设计原则/行为准则（全局准则 project 填"全局"且 importance≥2 会全量注入到首轮；  项目特定准则填 project 参数，随 memory_project 注入；其余走检索）； fact=细碎原子事实（一句话直陈 ≤60 字）；lesson=你学到的经验（被纠正的一定记这里）； topic=话题（建议 goal 目标句，用 keywords 检索）。 铁律：用户介绍项目设计思路/框架/决策理由时，content 必须保留用户原话措辞，不要转述总结。 与已有条目高度重复会自动合并（更新而非新增）。调用成功后工具会返回确认，无需重复调用本工具。
 - memory_remember.param.content: 要记住的内容；fact/lesson 一句话 ≤60 字；topic ≤300 字；涉及用户原话必须保留措辞。
 - memory_remember.param.level: 记忆层级，默认 fact。
 - memory_remember.param.project: 必填。项目名（level=project 时必须是具体项目名）；全局适用的信息填"全局"；同时适用于多个项目时用英文逗号分隔，如"dsh,femwa"。

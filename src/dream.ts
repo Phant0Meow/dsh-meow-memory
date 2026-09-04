@@ -20,7 +20,9 @@
  *   09:00–12:00、14:00–18:00，API 峰谷电价峰时，及各自开始前 15 分钟）时不触发，
  *   等峰时结束后的下一个检查周期自然触发。进行中的 dream 不打断，只挡新启动；
  *   手动 memory_dream 不受峰时抑制。
- * - 串行：同一时刻只有一个进行中的 dream 任务；旧窗口（无 live agent）不碰。
+ * - 串行：同一时刻只有一个进行中的 dream 任务；旧窗口（进程重启后无 live agent）
+ *   会尝试从 session persistence 恢复 agent 再照常 dream（2026-09-01 用户拍板：
+ *   符合条件就自动触发，不需要人碰窗口；恢复失败只记日志降级，绝不新建会话）。
  *
  * 冲突处理：memory_search 返回 top-k 后按 updated_at 重排 + 顶部提示；
  * agent 据"记忆时间戳"判断新旧（工具层乐观锁留待迭代）。
@@ -32,11 +34,42 @@ import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { getDb, projectList, type Level, type MemoryRow } from './db.js'
+import { appendDelegateMarker, resolveSubagents, resolveWorkspace, startDelegateSubagent, DREAM_DELEGATE_MARKER, type AgentOptionsSpec, type DelegateLogger } from './delegate.js'
 import { fillTemplate, keyedValue, resolveSlotText } from './prompt-loader.js'
-import { readSeen } from './inject.js'
+import { readSeen, readWritten } from './inject.js'
 import { workspaceOf } from './tools.js'
 
 const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'meow-memory' }
+
+// ── delegate（fork 子代理执行体，delegate.dream 开启时启用） ─────────────────
+//
+// steer 版 dream 的组推进由主会话 turn-stopping 驱动（dream 轮消息落主 log）；
+// delegate 版把执行体换成 fork 子代理：每组一个子代理（播种主会话全部已完成
+// turn，零写主 log），done 回调链式推进下一组。DB 租约状态机（claim/CAS 推进/
+// 过期补收尾）完全复用，只换"执行体 + 驱动源"。
+
+/** dream 组执行体：收到一条组消息，负责把它交给模型跑完（steer 或子代理）。 */
+export type DreamLaunchFn = (msg: { content?: ReadonlyArray<{ type?: string; text?: string }> }, sessionId: string, ws: string, groupIdx: number, groupsTotal: number) => void
+
+export interface DreamDelegateEnv {
+  logger: DelegateLogger
+  /**
+   * 插件 ctx：subagents/workspace 不在 apply 期固化（那时服务尚未启动，同步解析
+   * 抛 without inject / 拿 undefined）——消费点每次现场解析（运行期服务已就绪）。
+   */
+  ctx: unknown
+  signal: AbortSignal
+  /** dream 组防重入集合（键=`${sessionId}:dream`）。 */
+  inFlight: Set<string>
+  modelSpec?: AgentOptionsSpec
+}
+
+let dreamDelegateEnv: DreamDelegateEnv | null = null
+
+/** 设置 delegate 环境（applyInner 在 delegate.dream 开启时调用；null=回到 steer）。 */
+export function setDreamDelegateEnv(env: DreamDelegateEnv | null): void {
+  dreamDelegateEnv = env
+}
 
 /** dream 消息识别标记（turn-stopping 推进判定用）。 */
 export const DREAM_MARKER = '[meow-memory-dream]'
@@ -115,7 +148,10 @@ export function collectDreamRounds(
   dir = '.dsh-meow',
   rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS,
 ): DreamRound[] {
-  const seen = readSeen(workspace, sessionId, dir)
+  // 清单范围 = 本窗口建立（source_session）∪ 注入/检索/查阅（seen）∪ 写过（written，
+  // v0.23.0——经 memory_project 全景看到条目后 update 它，不落任何旧痕迹（全景刻意不标记），
+  // written 补上这个漏记口子：凡本窗口写工具落库过的条目必进复查清单）。
+  const seen = new Set([...readSeen(workspace, sessionId, dir), ...readWritten(workspace, sessionId, dir)])
   const atomic: MemoryRow[] = []
   const topic: MemoryRow[] = []
   for (const level of ['project', 'fact', 'lesson', 'rules', 'soul', 'user'] as const) {
@@ -236,10 +272,12 @@ export function windowNeedsDream(w: { last_event_time: number; last_dream_time: 
 export type DreamStateCallback = (sessionId: string, state: 'dreaming' | 'dreamed') => void
 
 /**
- * 启动一个窗口的 dream（steer 第一组）。agent 必须是该窗口的 live 顶层 agent。
+ * 启动一个窗口的 dream（第 0 组）。agent 必须是该窗口的 live 顶层 agent。
  * 返回 false 表示无法启动（已有任务在跑 / 别处（含其他进程）正在 dream / 无记忆可整理）。
  * 防重复：DB 原子抢占 dream 租约（跨进程/重启一致）——抢占失败即不 start；
  * 抢占成功后即使本进程崩溃/被重载，下个检查周期也会按过期租约补收尾而不是重复 start。
+ * 执行体：delegate 环境已设置（delegate.dream=true）时走 fork 子代理（launch 闭包，
+ * done 回调链式推进），否则 steer 主会话（旧行为）。
  */
 export function startWindowDream(ctx: Context, agent: { session?: { header?: { id?: string } } }, workspace: string, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS): boolean {
   const sessionId = agent.session?.header?.id
@@ -259,17 +297,27 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
   if (!db.claimDream(sessionId, newDreamOwner(), T, DREAM_LEASE_MS)) return false // 别处活跃租约未过期
   onDreamState?.(sessionId, 'dreaming')
   const msg = buildDreamMessage(db, sessionId, T, rounds, 0)
-  ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
-  dreamLog(workspace, dir, `dream start pid=${process.pid} session=${shortSessionId(sessionId)} rounds=${rounds.length} T=${T}`)
+  const launch = delegateLaunchFor(agent, dir, onDreamState, rulesReviewDays)
+  if (launch !== undefined) {
+    launch(msg, sessionId, workspace, 0, rounds.length)
+    // 主会话打点（delegate 模式整理不进主 log，恢复位置锚点；不触发 turn）
+    appendDelegateMarker(agent, 'dream')
+    dreamLog(workspace, dir, `dream start delegated pid=${process.pid} session=${shortSessionId(sessionId)} rounds=${rounds.length} T=${T}`)
+  } else {
+    ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
+    dreamLog(workspace, dir, `dream start pid=${process.pid} session=${shortSessionId(sessionId)} rounds=${rounds.length} T=${T}`)
+  }
   return true
 }
 
 /**
- * turn-stopping 推进：本 turn 是 dream 轮 → 下一组或收尾。
+ * 推进：本窗口有进行中 dream → 下一组或收尾。
  * 状态完全从 DB 租约读：跨实例、热重载残留、中止都不影响推进正确性。
  * 推进按「sessionId + 租约未过期」判定，不校验 owner（owner 只用于抢占判断 + 诊断）。
+ * 执行体：launch 提供时把组消息交给它（delegate 链式推进），否则 steer 主会话
+ * （steer 版由 turn-stopping 驱动进入；delegate 版由子代理 done 回调驱动进入）。
  */
-export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS): void {
+export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS, launch?: DreamLaunchFn): void {
   const sessionId = (agent as { session?: { header?: { id?: string } } })?.session?.header?.id
   const ws = (agent as { session?: { header?: { cwd?: string } } })?.session?.header?.cwd
   if (typeof sessionId !== 'string' || typeof ws !== 'string' || ws.length === 0) return
@@ -291,13 +339,61 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
     // CAS 推进：多实例同收 turn-stopping 时只有一个成功，其余跳过
     if (db.advanceDreamLease(sessionId, lease.group_idx, DREAM_LEASE_MS)) {
       const msg = buildDreamMessage(db, sessionId, lease.T, rounds, nextIdx)
-      ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
-      dreamLog(ws, dir, `dream group ${nextIdx + 1}/${rounds.length} steered`)
+      if (launch !== undefined) {
+        launch(msg, sessionId, ws, nextIdx, rounds.length)
+        dreamLog(ws, dir, `dream group ${nextIdx + 1}/${rounds.length} delegated`)
+      } else {
+        ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
+        dreamLog(ws, dir, `dream group ${nextIdx + 1}/${rounds.length} steered`)
+      }
     }
     return
   }
   // 最后一轮完成 → 收尾
   finalizeDream(db, sessionId, ws, dir, lease.T, 'done', rounds.length, onDreamState)
+}
+
+/**
+ * 构造 delegate 模式的组执行体闭包：每组起一个 fork 子代理，done 回调里推进下一组
+ * （stopReason=completed）或按中止收尾（组未完成）。delegate 环境未设置时返回
+ * undefined（调用方回退 steer）。
+ */
+function delegateLaunchFor(agent: unknown, dir: string, onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS): DreamLaunchFn | undefined {
+  const env = dreamDelegateEnv
+  if (env === null) return undefined
+  return (msg, sessionId, ws, groupIdx, groupsTotal) => {
+    const text = (msg?.content ?? []).map((b) => (b.type === 'text' ? b.text : '')).join('')
+    const outcome = startDelegateSubagent(env.logger, resolveSubagents(env.ctx), {
+      parent: agent,
+      promptText: text,
+      label: `meow-memory dream ${groupIdx + 1}/${groupsTotal}`,
+      modelSpec: env.modelSpec,
+      signal: env.signal,
+      inFlight: env.inFlight,
+      sessionKey: `${sessionId}:dream`,
+      workspace: resolveWorkspace(env.ctx),
+      done: (r) => {
+        if (r.stopReason === 'completed') {
+          // 推进下一组（launch 重新解析 delegate 环境——热重载后旧闭包不残留）
+          advanceDream(agent, dir, onDreamState, rulesReviewDays, delegateLaunchFor(agent, dir, onDreamState, rulesReviewDays))
+        } else {
+          // 组失败/被中止：立即收尾（组未完成，按 aborted 语义封存已写条目）
+          const db = getDb(ws, dir)
+          const lease = db.getDreamLease(sessionId)
+          if (lease !== null) {
+            finalizeDream(db, sessionId, ws, dir, lease.T, 'aborted', lease.group_idx + 1, onDreamState)
+            env.logger.warn(`meow-memory: dream group ${groupIdx + 1}/${groupsTotal} ended (${r.stopReason}) — window dream finalized`)
+          }
+        }
+      },
+    })
+    if (outcome === 'unavailable') {
+      // 服务不可用回退 steer：不回退则组消息静默丢失（既不子代理也不进主会话，
+      // 卡到租约过期补收尾——组内容永远没人整理）。'in-flight' 保持静默跳过（防重入）。
+      ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
+      dreamLog(ws, dir, `dream group ${groupIdx + 1}/${groupsTotal} steered (delegate unavailable fallback)`)
+    }
+  }
 }
 
 /** 收尾：封存全部条目（updated_at=T）+ 清租约 + 记 last_dream_time。失败不阻塞（日志兜底）。 */
@@ -359,7 +455,7 @@ export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamS
       if (!workspace) throw new Error('memory_dream: 无法确定工作区（会话无 cwd）')
       if (!exec.agent) throw new Error('memory_dream: 无法确定当前 agent')
       const ok = startWindowDream(ctx, exec.agent, workspace, dir, onDreamState, rulesReviewDays)
-      if (ok) return { ok, note: '整理指令已发出，逐个项目组处理中。' }
+      if (ok) return { ok, note: '整理任务已在后台启动，会话流中的任务气泡会显示进度与完成状态。' }
       const sessionId = exec.agent.session?.header?.id
       const lease = typeof sessionId === 'string' ? getDb(workspace, dir).getDreamLease(sessionId) : null
       return {
@@ -418,7 +514,7 @@ export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamS
         return { kind: 'error', text: '/dream 无法确定当前窗口的会话 id。' }
       }
       const ok = startWindowDream(ctx, agent, workspace, dir, onDreamState, rulesReviewDays)
-      if (ok) return { kind: 'success', text: '🧠 dream 已安排：整理指令已发出，逐组处理中。' }
+      if (ok) return { kind: 'success', text: '🧠 dream 已触发：整理任务已在后台运行，会话流中的任务气泡会显示进度与完成状态。' }
       const lease = getDb(workspace, dir).getDreamLease(header.id)
       return lease !== null
         ? { kind: 'error', text: '本窗口已有 dream 任务在进行中（或待补收尾），未重复启动。' }
@@ -525,6 +621,47 @@ export function isDreamSuppressed(cfg: DreamConfig, date = new Date()): boolean 
   return false
 }
 
+/** 进程重启后 liveAgents 清空：对满足 dream 条件的窗口按需恢复 agent。
+ *  factory.resume 从 session persistence（jsonl 后端）把已有会话恢复成 live agent，
+ *  与 GUI 打开会话同路径；恢复后重验全部条件再 startWindowDream（恢复耗时期间
+ *  窗口状态可能已变）。失败只记日志静默降级——绝不 create 新建会话（窗口必然
+ *  已有会话文件，恢复失败说明环境异常，宁可本轮不 dream 也不能造空会话）。
+ *  resumeInFlight 防重入：恢复是异步的，耗时若跨过检查周期，避免重复 resume。 */
+const resumeInFlight = new Set<string>()
+
+export async function resumeAndDream(ctx: Context, sessionId: string, workspace: string, dir: string, onDreamState: DreamStateCallback | undefined, cfg: DreamConfig): Promise<void> {
+  const log = (msg: string): void => dreamLog(workspace, dir, msg)
+  const sid = shortSessionId(sessionId)
+  if (resumeInFlight.has(sessionId)) return
+  resumeInFlight.add(sessionId)
+  try {
+    // ⚠️ resume 在 agents service 本体上（service.resume(options) 内部注入 ownerCtx
+    // 并委托 factory.target.resume）——factory 槽是 { target } 包装、其上无 resume
+    // 方法（dsh-agent lib/index.js 529-561 实证）。首版写 factory.resume 恒 undefined
+    // → 全部 agent-missing 窗口 resume 静默失败（真机踩坑 2026-09-04，日志
+    // 'agent-resume-unavailable factory=yes'），重启后自动 dream 从未真正恢复过。
+    const agentsSvc = (ctx as { get?: (name: string) => unknown }).get?.('agents') as
+      | { resume?: (options: { resumeSessionId: string }) => Promise<unknown> }
+      | undefined
+    if (agentsSvc === undefined || typeof agentsSvc.resume !== 'function') {
+      log(`check agent-resume-unavailable sid=${sid} service=${agentsSvc ? 'yes' : 'no'}`)
+      return
+    }
+    const agent = await agentsSvc.resume({ resumeSessionId: sessionId })
+    log(`check agent-resumed sid=${sid}`)
+    const db = getDb(workspace, dir)
+    const w = db.getWindow(sessionId)
+    if (!w || !windowNeedsDream(w)) return // 恢复期间超 24h / 已 dream 过
+    if (Date.now() - w.last_event_time < cfg.idleMinutes * 60_000) return // 恢复期间窗口被碰，空闲不足
+    if (db.getDreamLease(sessionId) !== null) return // 恢复期间别处已启动 dream
+    startWindowDream(ctx, agent as { session?: { header?: { id?: string } } }, workspace, dir, onDreamState, cfg.rulesReviewDays)
+  } catch (error) {
+    log(`check agent-resume-failed sid=${sid} err=${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    resumeInFlight.delete(sessionId)
+  }
+}
+
 /** 后台定时检查（全局 setInterval + dispose 清理；cordis 无内置定时器）。
  *  判定纯时间化（用户拍板）：窗口最后发言在 24h 内 且 最后动作不是 dream
  *  （last_dream_time < last_event_time）；不依赖 live agent 存在性。
@@ -588,8 +725,13 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow',
         liveAgents.get(sessionId) ??
         (agentsSvc !== undefined && typeof agentsSvc.get === 'function' ? agentsSvc.get(sessionId) : undefined)
       if (!agent) {
-        dreamLog(workspace, dir, `check agent-missing sid=${shortSessionId(sessionId)}`)
-        continue // 进程内无该窗口 agent（重启后）：跳过
+        // 进程内无该窗口 agent（重启后 liveAgents 清空）：异步从 persistence 恢复
+        // （factory.resume，与 GUI 打开会话同路径）后再 dream——挂着的窗口不因重启
+        // 丢 dream 资格（2026-09-01 用户拍板）。fire-and-forget：不阻塞本轮检查，
+        // resumeInFlight 防重入，失败静默降级为旧行为（只跳过不 dream）。
+        dreamLog(workspace, dir, `check agent-missing sid=${shortSessionId(sessionId)} -> try resume`)
+        void resumeAndDream(ctx, sessionId, workspace, dir, onDreamState, cfg)
+        continue
       }
       const started = startWindowDream(ctx, agent as never, workspace, dir, onDreamState, cfg.rulesReviewDays)
       if (started) return // 一轮一个窗口

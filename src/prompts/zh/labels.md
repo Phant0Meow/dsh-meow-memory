@@ -14,7 +14,9 @@
 - project.global: 全局
 - inject.hitHeader: 可能相关的记忆，仅供参考：
 - inject.reinjectSection: 会话已压缩
-- inject.reinjectIntro: 本会话此前的上下文已被压缩。上面是长期记忆快照，下面是你此前用 memory_project 查阅过的项目记忆（已按最新数据重新整理）：
+- inject.reinjectIntro: 本会话此前的上下文已被压缩。下面是压缩前本会话可见、现已随压缩丢失的记忆，均按当前库最新数据重新整理：
+- inject.writtenSection: 本会话写过的记忆
+- inject.writtenIntro: 你本会话通过 memory_remember 新建/合并、memory_update 更新过的记忆原文如下（含子代理代写；已归档/完结的不回放）：
 - dream.title: 记忆整理任务（dream）
 - dream.round.atomic: 原子记忆条目
 - dream.round.topic: topic记忆条目

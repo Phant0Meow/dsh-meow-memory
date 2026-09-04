@@ -1,4 +1,4 @@
-﻿# meow-memory short framework words (key-value lines: `- key: value`; the first ASCII colon+space is the separator, the value is kept verbatim; a line starting with two spaces continues the previous value; {name} placeholders are filled in by the code. This comment line and blank lines are ignored by the parser.)
+# meow-memory short framework words (key-value lines: `- key: value`; the first ASCII colon+space is the separator, the value is kept verbatim; a line starting with two spaces continues the previous value; {name} placeholders are filled in by the code. This comment line and blank lines are ignored by the parser.)
 
 - inject.title: ===== LONG-TERM MEMORY =====
 - inject.end: ===== END OF LONG-TERM MEMORY =====
@@ -12,7 +12,9 @@
 - inject.guideProjectLine: When a task involves a project, start with memory_project for the project-wide picture (pass the project name, it cannot be empty) 鈥?that is how you get a whole-project understanding.
 - inject.guideProjects: All of the user's projects: {list}
 - inject.reinjectSection: Session compacted
-- inject.reinjectIntro: This session's earlier context has been compacted. Above is the long-term memory snapshot; below are the project memories you previously looked up with memory_project (rebuilt from the latest data):
+- inject.reinjectIntro: This session's earlier context has been compacted. Below are the memories that were visible in this session before compaction and are now gone with it, all rebuilt from the latest data:
+- inject.writtenSection: Memories written this session
+- inject.writtenIntro: Full text of the memories you created/merged with memory_remember or updated with memory_update in this session (including those written by subagents on your behalf; archived/completed entries are not replayed):
 - project.global: global
 - inject.hitHeader: Possibly relevant memories, for reference only:
 - dream.title: Memory consolidation task (dream)

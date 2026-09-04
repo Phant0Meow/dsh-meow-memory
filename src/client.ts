@@ -16,13 +16,22 @@
  *   不碰卡片内容——卡片内容只在 toggle 时同步填充/清空。
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createElement, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ConversationSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
 import type { InputZone } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { AssistantChatData, ChatNode, ToolChatData } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { blocksToText, computeFoldGroups, computeInjectionGroups, foldLabel, formatInjectionClock, toolCallDetail, type FoldGroup, type InjectionGroup } from './client-fold.ts'
+import {
+  applyVanishDom,
+  computeVanishDecision,
+  SENTINEL_ATTR,
+  startVanishObserver,
+  type VanishDecision,
+} from './client-delegate-vanish.ts'
+import { applyDelegateNotices, computeDelegateNotices, startDelegateStateSync, type DelegateNotice } from './client-delegate-notice.ts'
 import { startDreamIconManager } from './client-dream-icon.ts'
 import { startDreamSkipManager } from './client-dream-skip.ts'
+import { applySettingsPage } from './settings-page.ts'
 
 /** 折叠行标记（CSS 规则隐藏）。 */
 const FOLDED_ATTR = 'data-meow-memory-folded'
@@ -286,7 +295,7 @@ function fillBody(id: string, visible: boolean, keys: readonly string[], session
       clone.removeAttribute('data-chat-anchor-key')
       clone.removeAttribute('data-chat-flow-kind')
       body.appendChild(clone)
-      enhanceClone(clone, session.chat.nodes.get(key))
+      enhanceClone(clone, session.chat?.nodes.get(key))
     }
     bodySigs.set(id, sigOf(container, keys))
   }
@@ -475,6 +484,7 @@ export function MemoryFoldDock({ session }: InputZone): null {
   const [injExpanded, setInjExpanded] = useState<ReadonlySet<string>>(() => new Set())
   const groups = useMemo(() => computeFoldGroups(session), [session])
   const injGroups = useMemo(() => computeInjectionGroups(session), [session])
+  const dgNotices = useMemo(() => computeDelegateNotices(session), [session])
   const toggle = useCallback((id: string): void => {
     setExpanded((prev) => {
       const next = new Set(prev)
@@ -500,11 +510,12 @@ export function MemoryFoldDock({ session }: InputZone): null {
   useLayoutEffect(() => {
     applyFoldState(groups, expanded, toggle, session)
     applyInjectionFold(injGroups, injExpanded, toggleInj)
-  }, [groups, expanded, toggle, session, injGroups, injExpanded, toggleInj])
+    applyDelegateNotices(dgNotices)
+  }, [groups, expanded, toggle, session, injGroups, injExpanded, toggleInj, dgNotices])
 
   // 兜底：视图切换/元素重建/流式重渲染导致 DOM 变化时自愈（防抖）。
-  const latest = useRef({ groups, expanded, toggle, session, injGroups, injExpanded, toggleInj })
-  latest.current = { groups, expanded, toggle, session, injGroups, injExpanded, toggleInj }
+  const latest = useRef({ groups, expanded, toggle, session, injGroups, injExpanded, toggleInj, dgNotices })
+  latest.current = { groups, expanded, toggle, session, injGroups, injExpanded, toggleInj, dgNotices }
   useEffect(() => {
     let timer = 0
     const observer = new MutationObserver(() => {
@@ -512,6 +523,7 @@ export function MemoryFoldDock({ session }: InputZone): null {
       timer = window.setTimeout(() => {
         applyFoldState(latest.current.groups, latest.current.expanded, latest.current.toggle, latest.current.session)
         applyInjectionFold(latest.current.injGroups, latest.current.injExpanded, latest.current.toggleInj)
+        applyDelegateNotices(latest.current.dgNotices)
       }, 80)
     })
     observer.observe(document.body, { childList: true, subtree: true })
@@ -525,19 +537,84 @@ export function MemoryFoldDock({ session }: InputZone): null {
 }
 
 /**
- * 浏览器端插件体：注入折叠 CSS（常驻，防多会话/卸载时折叠失效），
- * 并注册 composer.dock 隐形条目驱动折叠。
- * @param ctx - client 根上下文（slots 服务）。
+ * header 子代理列表隐身哨兵（client-delegate-vanish 链路的 React 壳）：
+ * 挂 conversation.session.header.actions 叠加槽（lineage 是 single 槽：官方
+ * SubagentHeaderLineage 独占，同槽注册抛错、顶替则毁掉官方 UI）——useSessions
+ * 只读订阅官方 sessions store，复刻官方 count 公式做 trigger 决策；行隐藏与
+ * 自愈 observer 在纯逻辑模块里。
+ * 零视觉输出（display:none 哨兵作 DOM 定位锚点）；useSessions 不可用时
+ * fail-open（不订阅、不动 DOM）。
+ * @param useSessions - renderer standardProps 注入的官方 store hook。
+ * @param refreshSubagents - sessions face 的 catalog 刷新（apply 闭包注入；
+ *   缺省时目录未加载则决策 fail-open，等官方 UI 自行加载后收敛）。
  */
-export const inject = ['slots']
+function makeDelegateVanishDock(
+  refreshSubagents: ((parentSessionId: string) => unknown) | undefined,
+): (props: { useSessions?: (selector: (state: any) => any) => any }) => any {
+  return function DelegateVanishDock({ useSessions }: { useSessions?: (selector: (state: any) => any) => any }): any {
+    // 三个独立 selector：各自返回 store 内部稳定引用（新对象会破坏
+    // useSyncExternalStore 语义导致死循环），任一变化即重渲染。
+    const current: string | undefined = useSessions?.((state: any) => state?.current)
+    const byId = useSessions?.((state: any) => state?.byId)
+    const catalogs = useSessions?.((state: any) => state?.subagentsByParent)
+    const sentinelRef = useRef<HTMLElement | null>(null)
+    const decision: VanishDecision = useMemo(
+      () => computeVanishDecision({ current, byId, subagentsByParent: catalogs }),
+      [current, byId, catalogs],
+    )
+    const latest = useRef<{ decision: VanishDecision }>({ decision })
+    latest.current = { decision }
+
+    // 数据驱动：决策变化 → 立即应用（行 + trigger）。
+    useLayoutEffect(() => {
+      applyVanishDom(decision, sentinelRef.current)
+    }, [decision])
+
+    useEffect(() => {
+      // 目录尚未被官方 UI 请求时主动拉一次（manager 幂等去重；失败静默，
+      // 决策退化为 fail-open，等官方 trigger/菜单加载后自然收敛）。
+      if (current !== undefined && typeof refreshSubagents === 'function') {
+        try {
+          refreshSubagents(current)
+        } catch {
+          /* catalog 拉取失败不打扰用户 */
+        }
+      }
+      // 兜底：菜单 portal 渲染 / React 重渲染 / trigger 重建后自愈。
+      return startVanishObserver(() => ({ decision: latest.current.decision, sentinel: sentinelRef.current }))
+    }, [current])
+
+    return createElement('span', {
+      [SENTINEL_ATTR]: '1',
+      style: { display: 'none' },
+      ref: sentinelRef,
+    })
+  }
+}
+
+/**
+ * 浏览器端插件体：注入折叠 CSS（常驻，防多会话/卸载时折叠失效），
+ * 并注册 composer.dock 隐形条目驱动折叠、header 隐身哨兵（挂 header.actions 叠加槽）。
+ * @param ctx - client 根上下文（slots / sessions 服务）。
+ */
+export const inject = ['slots', 'settingsScope', 'sessions']
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function apply(ctx: any): () => void {
   const disposers: Array<() => void> = []
   // 会话列表"已 dream"小月牙：独立于 slots，直接启动（host 路由不可用时静默降级）。
   disposers.push(startDreamIconManager())
+  // delegate 打点气泡的 dream 状态同步（SSE）：dream 完成时气泡「处理中…」→「已完成 ✓」。
+  disposers.push(startDelegateStateSync())
   // 会话「…」菜单「跳过梦境整理记忆」toggle（v0.16.0）：同上独立启动，静默降级。
   disposers.push(startDreamSkipManager())
+  // 设置页「喵记忆」标签页（settings.section 顶级分区）：settingsScope 服务缺失
+  // 或注册失败只警告，不影响折叠/图标。
+  try {
+    applySettingsPage(ctx)
+  } catch (e) {
+    console.warn('[meow-memory] 设置页注册失败（不影响折叠与图标）：', e)
+  }
   // CSS 常驻全局（不随组件卸载移除：折叠行的隐藏由 data 属性驱动，规则在即生效）。
   // 热重载时 dispose 不删 style，直接 append 会堆积多代规则——旧代规则（如假气泡
   // 时代的 `[data-meow-injection-prompt] > div` 背景）会以同等/更高特异性命中新 DOM
@@ -560,6 +637,23 @@ export function apply(ctx: any): () => void {
         order: 90,
       },
       MemoryFoldDock,
+    )))
+    // header 子代理列表隐身（delegate fork 子代理全程不出现在 header）：
+    // conversation.session.header.lineage 是 single 槽，官方 SubagentHeaderLineage
+    // 已以 priority 0 独占——同槽再注册直接抛错，顶替则会毁掉官方 UI；哨兵改挂
+    // 同 header 的叠加 actions 槽（list），隐形 span 落在 header 里即作 DOM 锚点。
+    // sessions face 拿不到时 refresh 传 undefined，决策退化 fail-open。
+    const sessions = ctx?.sessions
+    const refreshSubagents = typeof sessions?.refreshSubagents === 'function'
+      ? (id: string) => sessions.refreshSubagents(id)
+      : undefined
+    disposers.push(slots.inject('conversation.session.header.actions', () => slots.register(
+      {
+        name: 'conversation.session.header.actions',
+        id: 'meow-memory',
+        order: 200,
+      },
+      makeDelegateVanishDock(refreshSubagents),
     )))
   }
   return () => {

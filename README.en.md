@@ -52,8 +52,10 @@ frozen at the last conversation timestamp.
 - **Post-compaction re-injection**: after a session is compacted (manual `/compact` or
   automatic token-pressure compaction), the next user-message turn automatically re-injects
   the long-term memory snapshot plus the project overviews this session previously fetched
-  via `memory_project` (rebuilt from the latest data) — the memory compacted away comes
-  back within one turn, so the AI never suddenly goes amnesiac after compaction.
+  via `memory_project`, plus the entries this session itself wrote or updated through
+  `memory_remember`/`memory_update` (all rebuilt from the latest data) — the memory
+  compacted away comes back within one turn, so the AI never suddenly goes amnesiac
+  after compaction.
 - **Toolset**: `memory_remember` (write, dedup merge, returns read-back confirmation:
   keywords/project; accepts a `keywords` parameter — reflection/dream turns have the LLM
   summarize 5–10 content words, auto bigram extraction as fallback) / `memory_search`
@@ -163,7 +165,7 @@ npm install meow-memory
 
 ## ⚙️ Configuration
 
-All fields are optional (profile patch or `cordis.patch.yml`):
+All fields are optional (profile patch or `cordis.patch.yml`). **You don't have to hand-edit files**: the DSH settings page has a dedicated "喵记忆" tab for this plugin (peer of General/Models/Plugins) where every option below is editable in place, saved per-field with one-click restore-to-default; reload/restart the meow-memory plugin after saving for changes to take effect.
 
 ```yaml
 - id: meow-memory
@@ -187,7 +189,33 @@ All fields are optional (profile patch or `cordis.patch.yml`):
       checkMinutes: 15
       timeZone: 'Asia/Shanghai'  # the user's machine clock is US time; suppression
                                  # windows must follow this fixed zone instead
+      rulesReviewDays: 2    # stable rules whose updated_at is older than this many
+                            # days are skipped in dream round 1 (anti-churn); 0 = off
+    delegate:
+      reflect: false       # hand the reflection turn to a standalone fork subagent:
+                           # it inherits every completed turn of the main session
+                           # (tool results included) and runs in its own session,
+                           # writing nothing into the main session context;
+                           # false = spliced into the main session (legacy behavior)
+      dream: false         # run each dream group in a fork subagent: one child per
+                           # group, chained via the done callback; the lease state
+                           # machine / peak suppression / skip semantics unchanged
+      model: ''            # subagent model: empty = follow the main session route
+                           # (request prefix matches the main session's, so provider
+                           # prompt cache can hit); 'provider/model' sets both,
+                           # 'model' swaps the model only (provider inherited)
 ```
+
+### delegate: reflection & dream outside the main session context (optional)
+
+By default the reflection turn and each dream group are spliced into the main session (steer) — their prompts, the model's replies, and every tool call land in the main session log (the fold UI only hides them visually; the model's context still pays for them). `delegate.reflect` / `delegate.dream` hand the work to a **fork subagent**: the child is seeded with every completed turn of the main session (it sees everything so far, tool results included), does its memory work in its own session, and writes nothing back — the main conversation's context footprint and compaction rhythm are untouched.
+
+`delegate.model` also covers "use a different model for memory work" (a main session has one route per session, so the spliced approach cannot swap models per turn). The decision matrix:
+
+- **Follow the main model + delegate**: the child's request prefix matches the main session's, so the provider-side prompt cache can hit while the main session stays untouched;
+- **Swap the model**: setting `delegate.model` force-enables `reflect`/`dream` — a swapped-model request is an independent stream that cannot hit the main model's cache anyway, so occupying the main session's context would be pure loss.
+
+Three companion behaviors in delegate mode: ① the child session carries `origin='subagent'`, which the GUI session list never shows; after settling it is additionally added to the persistent archive set as a double guard; ② a very short plugin marker message (【记忆反思标记】/【记忆整理标记】, no model call) is appended to the main session log, so the main model knows memory work happened there and future runs treat the marker as the increment boundary; ③ a failed child run finalizes the window dream as aborted — entries already written are stamped as usual.
 
 ### promptLang: prompt & retrieval language (important)
 

@@ -37,6 +37,10 @@ export interface SessionSeen {
   injected: string[]
   searched: string[]
   accessed: string[]
+  /** 本会话写工具落库过的记忆 id（v0.23.0）：memory_remember（新建/合并）与
+   *  memory_update（实际写入）成功后记录，子代理代写归父窗口文件（source_session 同源）。
+   *  压缩重注入第三块数据源；releaseSeen 不清（同 projectsQueried，正是重注入数据源）。 */
+  written: string[]
   /** 本会话 AI 调 memory_project 查阅过的项目名（v0.21.0，按查询顺序、去重、
    *  最多保留 MAX_REINJECT_PROJECTS 个最近项）：会话压缩后重注入项目全景的清单。
    *  '全局' 不记（全局 soul/user/rules 已在快照层，非项目）；多项目参数按逗号拆开记。 */
@@ -51,6 +55,9 @@ export interface SessionSeen {
 /** projectsQueried 保留上限：压缩重注入的项目全景个数上限（防极端会话注入膨胀）。 */
 export const MAX_REINJECT_PROJECTS = 8
 
+/** written 保留上限：压缩重注入"本会话写过的记忆"条数上限（防极端会话注入膨胀）。 */
+export const MAX_REINJECT_WRITTEN = 20
+
 function readSeenFile(workspace: string, sessionId: string, dir: string): SessionSeen {
   try {
     const text = readFileSync(sessionsFile(workspace, sessionId, dir), 'utf8')
@@ -59,12 +66,13 @@ function readSeenFile(workspace: string, sessionId: string, dir: string): Sessio
       injected: Array.isArray(parsed.injected) ? parsed.injected.filter((x): x is string => typeof x === 'string') : [],
       searched: Array.isArray(parsed.searched) ? parsed.searched.filter((x): x is string => typeof x === 'string') : [],
       accessed: Array.isArray(parsed.accessed) ? parsed.accessed.filter((x): x is string => typeof x === 'string') : [],
+      written: Array.isArray(parsed.written) ? parsed.written.filter((x): x is string => typeof x === 'string') : [],
       projectsQueried: Array.isArray(parsed.projectsQueried) ? parsed.projectsQueried.filter((x): x is string => typeof x === 'string') : [],
       reinjectPending: parsed.reinjectPending === true,
       currentProject: typeof parsed.currentProject === 'string' && parsed.currentProject.length > 0 ? parsed.currentProject : null,
     }
   } catch {
-    return { injected: [], searched: [], accessed: [], projectsQueried: [], reinjectPending: false, currentProject: null }
+    return { injected: [], searched: [], accessed: [], written: [], projectsQueried: [], reinjectPending: false, currentProject: null }
   }
 }
 
@@ -76,6 +84,7 @@ function writeSeenFile(workspace: string, sessionId: string, seen: SessionSeen, 
     injected: seen.injected,
     searched: seen.searched,
     accessed: seen.accessed,
+    written: seen.written,
     projectsQueried: seen.projectsQueried,
     reinjectPending: seen.reinjectPending,
     currentProject: seen.currentProject,
@@ -124,6 +133,23 @@ export function markAccessed(workspace: string, sessionId: string, ids: string[]
   writeSeenFile(workspace, sessionId, seen, dir)
 }
 
+/** 追加本会话写工具落库过的 id（v0.23.0）：memory_remember（新建/合并）与
+ *  memory_update（实际写入）成功后调用。重复写入移到末尾（最近优先），
+ *  超过 MAX_REINJECT_WRITTEN 淘汰最旧的。 */
+export function markWritten(workspace: string, sessionId: string, ids: string[], dir = '.dsh-meow'): void {
+  if (ids.length === 0) return
+  const seen = readSeenFile(workspace, sessionId, dir)
+  const ordered = seen.written.filter((id) => !ids.includes(id))
+  ordered.push(...ids)
+  seen.written = ordered.slice(-MAX_REINJECT_WRITTEN)
+  writeSeenFile(workspace, sessionId, seen, dir)
+}
+
+/** 读本会话写过的记忆 id 清单（压缩重注入第三块 + dream 第一轮清单用）。 */
+export function readWritten(workspace: string, sessionId: string, dir = '.dsh-meow'): string[] {
+  return readSeenFile(workspace, sessionId, dir).written
+}
+
 /** 记录 memory_project 查阅过的项目（v0.21.0）：压缩重注入清单。
  *  全局标记（isGlobalProject，语言感知）/空串跳过；多项目参数按逗号拆开逐个记；
  *  重复查询移到末尾（最近优先）；超过 MAX_REINJECT_PROJECTS 淘汰最旧的。 */
@@ -168,7 +194,7 @@ export function isReinjectPending(workspace: string, sessionId: string, dir = '.
  *  允许之前注入/检索过的记忆被再次命中提取——压缩后它们的内容已不在上下文里。
  *  accessed 不清（用户拍板 2026-08-25）：它只服务 dream 扫尾范围、没有去重功能，
  *  清掉纯丢信息——长窗口压缩前读过的条目恰恰最该被 dream 复查。
- *  当前 project 锚定保留（与可见性无关）；projectsQueried/reinjectPending 保留
+ *  当前 project 锚定保留（与可见性无关）；projectsQueried/written/reinjectPending 保留
  *  （它们正是压缩重注入的数据源，见 buildReinjection）。 */
 export function releaseSeen(workspace: string, sessionId: string, dir = '.dsh-meow'): void {
   const seen = readSeenFile(workspace, sessionId, dir)
@@ -310,8 +336,14 @@ function fmtProjectRow(r: MemoryRow): string {
  * 非 todo 子标签只取 active；条目正文本身是数据，不做文案外置。
  * @returns null = 项目无任何可注入段落（active 条目与已完成 todo 皆空）。
  */
-export function buildProjectSectionText(db: MemoryDb, workspace: string, project: string, dir = '.dsh-meow'): string | null {
+/** 内部构造：段落文本 + 段内出现过的全部条目 id（压缩重注入第三块按此去重，防同块重复展示）。 */
+function buildProjectSection(db: MemoryDb, workspace: string, project: string, dir: string): { text: string; ids: string[] } | null {
   const rows = db.list('project', { project }).filter((r) => r.project === project)
+  const ids: string[] = []
+  const render = (list: MemoryRow[]): string => {
+    for (const r of list) ids.push(r.id)
+    return list.map(fmtProjectRow).join('\n')
+  }
   const active = rows.filter((r) => r.status === 'active')
   // todo 已完成：stale 且 updated_at 非空，按 updated_at 取最近 5 条（展示仍按旧→新）。
   const done = sortByUpdatedAt(
@@ -333,7 +365,7 @@ export function buildProjectSectionText(db: MemoryDb, workspace: string, project
     db.list('rules', { project }).filter((r) => r.project === project && r.status === 'active'),
   )
   if (projectRules.length > 0) {
-    sections.push(`${lbl('inject.rules')}\n${projectRules.map(fmtProjectRow).join('\n')}`)
+    sections.push(`${lbl('inject.rules')}\n${render(projectRules)}`)
   }
   for (const sub of PROJECT_SUBCATEGORIES) {
     if (sub === 'todo') {
@@ -342,22 +374,28 @@ export function buildProjectSectionText(db: MemoryDb, workspace: string, project
       const lines = [sectionTitle('todo')]
       if (done.length > 0) {
         lines.push(lbl('project.todoDone'))
-        for (const r of done) lines.push(fmtProjectRow(r))
+        for (const r of done) {
+          ids.push(r.id)
+          lines.push(fmtProjectRow(r))
+        }
       }
       if (todos.length > 0) {
         lines.push(lbl('project.todoOpen'))
-        for (const r of todos) lines.push(fmtProjectRow(r))
+        for (const r of todos) {
+          ids.push(r.id)
+          lines.push(fmtProjectRow(r))
+        }
       }
       sections.push(lines.join('\n'))
     } else {
       const list = sortByUpdatedAt(bySub.get(sub) ?? [])
       if (list.length === 0) continue
-      sections.push(`${sectionTitle(sub)}\n${list.map(fmtProjectRow).join('\n')}`)
+      sections.push(`${sectionTitle(sub)}\n${render(list)}`)
     }
   }
   if (sections.length === 0) return null
   const dbPath = memoryDbPath(workspace, dir)
-  return [
+  const text = [
     lbl('project.header', { name: project }),
     '',
     sections.join('\n\n'),
@@ -368,16 +406,65 @@ export function buildProjectSectionText(db: MemoryDb, workspace: string, project
     '（库内结构：七层表 soul/user/project/fact/lesson/topic/rules，字段含 id/title/content/importance/keywords/status/corrected/project/subcategory/goal/source_session/created_at/updated_at（记忆时间戳=最后更新时间）/last_accessed_at；另有 dream_log 整理留痕表、windows 窗口时间表；也可按 id 用 memory_read 看单条完整元数据）',
     `如果你想了解未被记录的更多细节，可以直接去搜会话历史目录（dsh 的 session 日志，位置由 DSH_HOME 决定，默认 ~/.dsh/sessions，喵版为 dsh-home/sessions），按会话 id 查原始记录。`,
   ].join('\n')
+  return { text, ids }
+}
+
+/** 段落文本视图（memory_project 工具用）：只要文本。 */
+export function buildProjectSectionText(db: MemoryDb, workspace: string, project: string, dir = '.dsh-meow'): string | null {
+  return buildProjectSection(db, workspace, project, dir)?.text ?? null
 }
 
 /**
- * 构造压缩重注入块（v0.21.0）：长期记忆快照正文（与首轮 buildInjection 同款）+
- * 【会话已压缩】说明 + 本会话此前查阅过的项目全景（按当前库最新数据重新构造，
- * 空项目跳过；项目全景条目按现行原则不标记已见）。不拼尾注（PR #10 起）：
- * 正文作为独立 plugin snapshot 消息插在真实用户消息前，用户 prompt 保持原样。
- * 快照条目 id 重新记入 injected——压缩后内容重新进入上下文，去重语义随之恢复。
- * @returns null = 无任何可注入内容（库无快照正文且项目全空）；调用方仍应清除
- *          reinjectPending，避免每个用户消息轮空转重查。
+ * 压缩重注入第三块（v0.23.0）：本会话写过的记忆原文回放。
+ * 数据源 = sessions/<id>.json 的 written（memory_remember/memory_update 落库痕迹，
+ * 子代理代写归父窗口）∪ db 层 source_session=本会话 的新建条目（双保险，覆盖插件
+ * 热更新前旧代码写入的条目）。按当前库最新数据解析原文（不缓存旧文本）；只回放
+ * status=active（archived/stale 内容已失效，回放会误导）；排除快照正文与项目全景
+ * 已展示的 id（防同块重复）；超出 MAX_REINJECT_WRITTEN 保留最近写入的。
+ * @returns null = 本会话没有可回放的写入条目。
+ */
+function buildWrittenSection(
+  db: MemoryDb,
+  workspace: string,
+  sessionId: string,
+  dir: string,
+  exclude: ReadonlySet<string>,
+): { text: string; ids: string[] } | null {
+  const ordered: string[] = [...readWritten(workspace, sessionId, dir)]
+  for (const { id } of db.idsBySession(sessionId)) {
+    if (!ordered.includes(id)) ordered.push(id)
+  }
+  const rows: MemoryRow[] = []
+  for (const id of ordered) {
+    if (exclude.has(id)) continue
+    const found = db.findById(id)
+    if (!found || found.row.status !== 'active') continue
+    rows.push(found.row)
+  }
+  const kept = rows.slice(-MAX_REINJECT_WRITTEN)
+  if (kept.length === 0) return null
+  return {
+    text: [
+      lbl('inject.sectionFormat', { label: lbl('inject.writtenSection') }),
+      lbl('inject.writtenIntro'),
+      ...kept.map(fmtProjectRow),
+    ].join('\n'),
+    ids: kept.map((r) => r.id),
+  }
+}
+
+/**
+ * 构造压缩重注入块（v0.21.0 三块制，v0.23.0 增第三块）：
+ * ① 长期记忆快照正文（与首轮 buildInjection 同款）；
+ * ② 【会话已压缩】说明 + 本会话此前查阅过的项目全景（按当前库最新数据重新构造，
+ *    空项目跳过；项目全景条目按现行原则不标记已见）；
+ * ③ 【本会话写过的记忆】+ 本会话写工具落库过的条目原文（见 buildWrittenSection）。
+ * 不拼尾注（PR #10 起）：正文作为独立 plugin snapshot 消息插在真实用户消息前，
+ * 用户 prompt 保持原样。
+ * 快照条目 id 与回放的 written id 重新记入 injected——压缩后内容重新进入上下文，
+ * 去重语义随之恢复（合并更新过的他窗条目不再被关键词命中重复注入）。
+ * @returns null = 无任何可注入内容（库无快照正文、项目全空且无写入条目）；调用方仍应
+ *          清除 reinjectPending，避免每个用户消息轮空转重查。
  */
 export function buildReinjection(
   db: MemoryDb,
@@ -390,26 +477,39 @@ export function buildReinjection(
   const o = { ...DEFAULT_OPTS, ...opts }
   const snapshot = buildInjectionBody(db, o)
   const projectTexts: string[] = []
+  const projectIds = new Set<string>()
   for (const project of projects) {
-    const text = buildProjectSectionText(db, workspace, project, dir)
-    if (text !== null) projectTexts.push(text)
+    const built = buildProjectSection(db, workspace, project, dir)
+    if (built !== null) {
+      projectTexts.push(built.text)
+      for (const id of built.ids) projectIds.add(id)
+    }
   }
-  if (snapshot === null && projectTexts.length === 0) return null
+  // 第三块：本会话写过的记忆（排除快照与项目全景已展示的 id，防同块重复）。
+  const written = buildWrittenSection(db, workspace, sessionId, dir, new Set([...(snapshot?.injectedIds ?? []), ...projectIds]))
+  if (snapshot === null && projectTexts.length === 0 && written === null) return null
   const lines: string[] = []
   if (snapshot !== null) {
     lines.push(snapshot.body)
     lines.push('')
   }
-  if (projectTexts.length > 0) {
+  if (projectTexts.length > 0 || written !== null) {
     lines.push(lbl('inject.sectionFormat', { label: lbl('inject.reinjectSection') }))
     lines.push(lbl('inject.reinjectIntro'))
     lines.push('')
-    lines.push(projectTexts.join('\n\n'))
+    if (projectTexts.length > 0) {
+      lines.push(projectTexts.join('\n\n'))
+      lines.push('')
+    }
+  }
+  if (written !== null) {
+    lines.push(written.text)
     lines.push('')
   }
   const text = lines.join('\n').trimEnd()
-  if (snapshot !== null && snapshot.injectedIds.length > 0) markInjected(workspace, sessionId, snapshot.injectedIds, dir)
-  return { text, injectedIds: snapshot !== null ? snapshot.injectedIds : [] }
+  const replayedIds = [...(snapshot?.injectedIds ?? []), ...(written?.ids ?? [])]
+  if (replayedIds.length > 0) markInjected(workspace, sessionId, replayedIds, dir)
+  return { text, injectedIds: replayedIds }
 }
 
 /** 关键词命中查询（首轮与每条消息链路共用）：active 的 fact/lesson/rules/topic，

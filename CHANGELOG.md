@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.23.0 (2026-08-30)
+
+### 反思/梦境独立执行：fork 子代理委托（delegate.reflect / delegate.dream，默认关闭）
+
+- **设置页「喵记忆」标签页**：DSH 设置页新增与「通用」「模型」平级的顶级分区（settings.section 契约，cachebilling 同款双半身）——全部 config 项图形化可改（基础/注入命中/反思/独立执行/dream/语言六组），字段级保存（settings.yaml user 层）+单项恢复默认+「默认/已覆盖」徽章；dream 峰时窗口用 "HH:MM-HH:MM" 逗号分隔文本编辑（解析校验红框提示）。层级语义：patch config=装配基线，设置页 user 层字段级覆盖（apply 时合并，dream/delegate 子对象浅合并防丢键）。保存后热重载/重启插件生效（config 在 apply 时解析，页面顶栏明示）。RPC 写入走 validateConfigUserLayer 字段级类型校验（编不过拒写）。
+- **`delegate.reflect: true`**：反思轮不再拼接进主会话（steer 的 prompt/回应/工具调用全落主 log，折叠 UI 只是视觉隐藏）——改为起一个 **fork 子代理**（dsh `subagent_fork` 同源机制）：子代理播种主会话全部已完成 turn 的 log（user 消息、assistant 回应、工具调用与结果都在），在自己独立的 session 里执行记忆整理，**主会话 log 零写入**。子代理 `origin='subagent'`，本插件注入/反思/dream 链路对它天然跳过不自循环；同会话防重入（上一轮反思未结束不重复触发）；subagents 服务不可用自动回退 steer（功能降级而非消失）。反思触发条件、反思 prompt、记忆落库路径全部不变。
+- **`delegate.dream: true`**：dream 各组同理换 fork 子代理执行——每组一个子代理（label `meow-memory dream N/M`），组完成的 done 回调链式推进下一组；DB 租约状态机（原子抢占/CAS 推进/过期补收尾）、峰时抑制、skip 豁免、手动 /dream 与 memory_dream 语义全部不变，只换执行体与驱动源（turn-stopping steer → done 回调）。某组失败（stopReason≠completed）立即按 aborted 收尾封存已写条目，不再推进。
+- **`delegate.model`**：子代理模型路由。留空=跟随主会话（请求前缀与主会话请求同源，provider prompt cache 可命中）；`'provider/model'`（dsh route 格式）指定 provider+model，`'model'` 只换 model（provider 继承父）。主会话一个 session 一个 route，拼接方案下无法单轮换模型——fork 子代理是换模型的唯一路径（issue #7 的机制解）。**换模型强制 delegate**：model 一填 reflect/dream 自动强制开启——换模型的请求是独立流命不中主模型缓存链，占主会话上下文纯亏（猫猫拍板）。
+- **主会话打点**（猫猫拍板）：delegate 模式下整理过程不进主 log，主模型对「整理发生过」无感——起子代理成功后向主会话 log append 一条极短插件标记消息（【记忆反思标记】/【记忆整理标记】，`session.append('user/message')` 纯 log 写入**不触发 LLM turn**；kind='plugin'+form='notice' → GUI 一行折叠通知、标题提取跳过）——主模型元认知知道此处整理过，后续整理以标记为界取增量。
+- **子会话收尾**：子代理会话 `origin='subagent'`，GUI 会话列表天然过滤不显示（dsh-client-ui-workspace 列表谓词实证）；settle 后再写 `workspace.archiveSession(childId)` 持久化归档集合双保险（host 无删除 API，成果在 memory.db，log 文件留存无害）。某组失败（stopReason≠completed）立即按 aborted 收尾封存已写条目，不再推进。
+- 实现形态：`src/delegate.ts` 封装 `startDelegateSubagent`（fire-and-forget、inFlight 防重入、done 回调在清账后触发防链式自挡）；dream.ts 以 `DreamLaunchFn` 抽象执行体（steer=默认，delegate 经 `setDreamDelegateEnv` 注入）；插件经 `ctx.get('subagents')` 防御式解析 host registry（spawn/fork 后端在 host composition 装配）；插件 fiber dispose 时 abort in-flight 子代理并清 delegate 环境。
+- 测试：主套件 372 全绿（新增 parseModelSpec 3 项 + 设置页数据层 7 项：merge 字段级覆盖/子对象浅合并/undefined 直通/validate 拒写 + delegate 行为 16 项：fork 启动/模型覆盖/换模型强制 delegate/不 steer/in-flight 防重入/settle 后恢复/archive 双保险/主会话打点/服务缺失回退 steer/默认关闭不触碰 subagents + dream delegate 9 项：组链推进/收尾封存/失败中止收尾）。
+
+### 压缩重注入第三块：本会话写过的记忆原文回放
+
+- **写痕迹 `written`**：`memory_remember`（新建/合并两条路径）与 `memory_update`（实际落库才记，空 patch 无字段变化不算写）成功后把条目 id 记入 `sessions/<id>.json` 新字段 `written`（去重 + 重复移末尾最近优先，上限 `MAX_REINJECT_WRITTEN`=20；子代理代写按既有归属语义记入父窗口文件）。`releaseSeen` 照旧保留 `written`（它正是重注入数据源，同 `projectsQueried`）。
+- **重注入第三块**：`buildReinjection` 在快照与项目全景之后追加【本会话写过的记忆】段——数据源 = `written` ∪ db 层 `source_session`=本会话 的条目（双保险，覆盖插件热更新前旧代码写入的条目）；按当前库最新数据解析原文（不缓存旧文本）；只回放 status=active（archived/stale 内容已失效不回放）；排除快照正文与项目全景已展示的 id（防同块重复展示）；超出上限保留最近写入的。回放的 id 记入 injected——合并更新过的他窗条目不再被关键词命中重复注入。
+- **dream 第一轮清单补口**：清单范围并入 `written`——此前"经 memory_project 全景看到条目后 update 它"不落任何痕迹（全景刻意不标记），该条目漏出 dream 复查范围；现在本会话写工具落库过的条目必进清单。
+- **文案外置**：`inject.reinjectIntro` 改为覆盖三块的通用表述（zh/en 同步）；新增 `inject.writtenSection`/`inject.writtenIntro`。
+- 新增测试：written 记账（remember 新建/合并、update 落库与未找到/空 patch 不记）、LRU 上限、releaseSeen 保留、第三块回放（active 过滤/归档跳过/快照与全景去重/按库最新数据/db-only 并集）、apply 级注入与 injected 重记账。
+
+### 前端连接池修复：dream-events SSE → 全页共享轮询（2026-09-05）
+
+- **根因**：dream-icon / dream-skip / delegate-notice 三个客户端管理器各自开一条 `EventSource('/meow-memory/dream-events')`——单页 3 条 HTTP/1.1 长连接，加上 DSH 官方 events.mux/events.host 两条 ws，同源浏览器每域 6 连接池被占满：同源第二个标签页与刷新被饿死（「第二个窗口打不开 / 刷新打不开 / 越来越卡」，3080/3081 皆然）。
+- **药方**：三管理器的 EventSource 全部移除，新增共享模块 `client-dream-events.ts`——全页一个 60s 轮询（dreamed-sessions + skip-dreams 各一次 GET）对上轮快照做 diff，产出与旧 SSE 'dream' 帧同语义的增量事件（dreamed/dreaming/active + skip/unskip）；首轮静默建基线（存量状态不作为增量重放）。各管理器挂载时的 refresh() 全量对账保留，首屏即时性不变；订阅归零自动停表。
+- **取舍**：状态翻转延迟从实时变为 ≤60s（dream 本为小时级低频信号，UI 无感）；host `/meow-memory/dream-events` SSE 路由保留（向后兼容，现无客户端连接）。单页长连接 5 → 2。
+
 ## v0.22.0 (2026-08-30)
 
 ### English language pack + English tokenizer（首个社区语言包，PR #6 by @daveycodez）

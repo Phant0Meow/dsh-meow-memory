@@ -3,3 +3,8 @@ lib/
 *.log
 *.bak-*
 scripts/inspect-db.mjs
+*.tgz
+_diag*
+_diag-*
+Delete_*
+mytrashbin/

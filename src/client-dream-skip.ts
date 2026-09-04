@@ -27,6 +27,7 @@
  */
 
 import { MOON_SVG, makeSkipMoonSvg, readSessionId } from './client-dream-icon.ts'
+import { subscribeDreamEvents } from './client-dream-events.ts'
 
 /** 注入项标记属性（清理与幂等锚点；data-meow-session-id 记录绑定会话）。 */
 export const SKIP_ITEM_ATTR = 'data-meow-skip-item'
@@ -268,50 +269,31 @@ export function startDreamSkipManager(): () => void {
     }
   }
 
-  // SSE 增量：skip/unskip 同步本标签页集合（v0.18.0 起 dream 图标管理器也消费
+  // 增量订阅：skip/unskip 同步本标签页集合（v0.18.0 起 dream 图标管理器也消费
   // 同通道的 skip/unskip 渲染「月牙+斜杠」——两边各自对账，互不干扰）。
-  let eventSource: EventSource | null = null
-  let reconnectTimer = 0
-  const connect = (): void => {
-    eventSource?.close()
-    eventSource = new EventSource('/meow-memory/dream-events')
-    eventSource.addEventListener('dream', (raw) => {
-      try {
-        const data = JSON.parse((raw as MessageEvent).data) as { sessionId?: unknown; state?: unknown }
-        if (typeof data.sessionId !== 'string') return
-        if (data.state === 'skip') {
-          skipped.add(data.sessionId)
-        } else if (data.state === 'unskip') {
-          skipped.delete(data.sessionId)
-        } else {
-          return
-        }
-        void syncOpenMenus() // 已开着的菜单文案/图标同步翻转
-      } catch {
-        // 坏帧忽略
-      }
-    })
-    eventSource.onopen = () => { void refresh() }
-    eventSource.onerror = () => {
-      eventSource?.close()
-      eventSource = null
-      window.clearTimeout(reconnectTimer)
-      reconnectTimer = window.setTimeout(connect, 60_000)
+  // 【2026-09-05 连接池修复】共享 60s 轮询 diff 替代原每页一条的 EventSource
+  // （连接池饥饿修复，见 client-dream-events.ts 头注）。事件语义与旧 SSE 一致。
+  const unsubscribeDreamEvents = subscribeDreamEvents((event) => {
+    const { sessionId, state } = event
+    if (state === 'skip') {
+      skipped.add(sessionId)
+    } else if (state === 'unskip') {
+      skipped.delete(sessionId)
+    } else {
+      return
     }
-  }
+    void syncOpenMenus() // 已开着的菜单文案/图标同步翻转
+  })
 
   document.addEventListener('pointerdown', onPointerDown, true)
   observer.observe(document.body, { childList: true, subtree: true })
-  connect()
   void refresh()
 
   return () => {
     document.removeEventListener('pointerdown', onPointerDown, true)
     observer.disconnect()
     window.clearTimeout(observerTimer)
-    window.clearTimeout(reconnectTimer)
-    eventSource?.close()
-    eventSource = null
+    unsubscribeDreamEvents()
     for (const item of Array.from(document.querySelectorAll(`[${SKIP_ITEM_ATTR}]`))) item.remove()
   }
 }

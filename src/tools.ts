@@ -17,7 +17,7 @@ import { fillTemplate, keyedValue } from './prompt-loader.js'
 const T = (key: string): string => keyedValue('tools', key)
 /** 框架词/报错文案（labels.md）：与工具描述同源，随语言包走。 */
 const L = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
-import { buildProjectSectionText, markProjectQueried, readSeen, markAccessed, markSearched, setCurrentProject } from './inject.js'
+import { buildProjectSectionText, markProjectQueried, markWritten, readSeen, markAccessed, markSearched, setCurrentProject } from './inject.js'
 
 export type { Level }
 
@@ -184,6 +184,8 @@ function rememberTool(dir: string): ToolDefinition {
         if (level === 'lesson' && corrected) patch.corrected = 1
         if (Array.isArray(parsed.keywords)) patch.keywords = keywords // 显式关键词才覆盖合并目标
         db.update(level, merged.id, patch)
+        // 写痕迹（v0.23.0）：合并落库也记入 written——压缩重注入第三块回放本会话写过的记忆。
+        markWritten(workspace, source_session ?? 'unknown', [merged.id], dir)
         // 读回合并后的实际存储结果（关键词等），让模型知道最终落库形态。
         const after = db.findById(merged.id)?.row
         return {
@@ -207,6 +209,8 @@ function rememberTool(dir: string): ToolDefinition {
         keywords,
         source_session,
       })
+      // 写痕迹（v0.23.0）：新建落库记入 written——压缩重注入第三块回放本会话写过的记忆。
+      markWritten(workspace, source_session ?? 'unknown', [row.id], dir)
       return {
         ok: true,
         id: row.id,
@@ -603,6 +607,8 @@ function updateTool(dir: string): ToolDefinition {
       // 记忆时间戳 = 最后更新时间：db.update 内部自动刷新 updated_at（任何 update 都刷新）。
       // patch 为空（如只想传 keywords:[] 表达"不更新"）→ 视为调用成功、无字段变化。
       const ok = Object.keys(patch).length > 0 ? db.update(found.level, found.row.id, patch) : true
+      // 写痕迹（v0.23.0）：实际落库（patch 非空且 update 成功）才记——空 patch 无字段变化不算写。
+      if (ok && Object.keys(patch).length > 0) markWritten(workspace, sessionId ?? 'unknown', [found.row.id], dir)
       return { ok, id: found.row.id, level: found.level }
     },
     presentCall(args: unknown): { card: 'generic'; title: string; kind: 'write' } {

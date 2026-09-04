@@ -3,15 +3,14 @@ Look back over your chat history.
 
 [1] Since the last [Memory reflection task], across all those turns, is there anything new worth remembering across sessions? Use memory_remember to add it.
 1. Projects already in the memory store: {projectList}. Do you think a new project should be added? -> Add a memory for the new project.
-2. Did you misremember, misspeak, or get something wrong — were you corrected by the user?
-- Anything the user corrected must be recorded, at whichever level fits (project, rules, fact, ...).
-- If you write it at the lesson level, keep the corrected flag;
+2. Were you corrected by the user? Were you praised? Did you hit any pitfalls, and how did you solve them in the end? Store these as lesson memories.
+- Record your mistakes, but also your own excellent performances, the pitfalls you hit, and how you cleverly solved the problems in the end.
+- If it is something the user corrected, keep the corrected flag;
 3. Add entries at your discretion when any of these apply:
 - Did the user state a communication / working / coding preference? -> Global preferences go in user; project-specific ones go in project.
 - Did the user lay down a design principle or a rule of behavior? -> Record it in rules.
 - Did the user say anything while explaining the project's design thinking, framework, or reasoning? -> Preserve their own words, at the right level.
 - Any important facts, conclusions, or decisions?
-- Did you fall into a trap while working, or need several attempts before something worked? If you think it is worth keeping, record it as a lesson.
 
 [2] Look back at every memory injected into this context, weigh it against your latest progress, and decide: does anything need updating?
 1. Is there an entry you are now certain is out of date (the user said so themselves, or changed their mind)? -> Update its content; don't leave it sitting there.

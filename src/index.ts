@@ -22,11 +22,14 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { installSettingsSection } from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { closeAllDbs, getDb, memoryDbPath } from './db.js'
+import { appendDelegateMarker, parseModelSpec, resolveSubagents, resolveWorkspace, startDelegateSubagent, type AgentOptionsSpec } from './delegate.js'
+
 import {
   abortDream,
   advanceDream,
@@ -37,6 +40,7 @@ import {
   noteActivity,
   registerLiveAgent,
   scheduleDream,
+  setDreamDelegateEnv,
   shortSessionId,
   type DreamConfig,
 } from './dream.js'
@@ -172,7 +176,133 @@ export const Config = z.object({
       rulesReviewDays: z.number().min(0).default(DEFAULT_RULES_REVIEW_DAYS),
     })
     .default({}),
+  /** 反思/梦境的独立执行（fork 子代理，不占主会话上下文）。 */
+  delegate: z
+    .object({
+      /** 反思轮交给 fork 子代理：继承主会话全部已完成 turn（含工具结果），零写主 log，
+       *  不占主会话上下文。false = steer 进主会话（旧行为）。 */
+      reflect: z.boolean().default(false),
+      /** dream 各组交给 fork 子代理：每组一个子代理（继承主会话已完成 turn），
+       *  done 回调链式推进，DB 租约状态机不变。false = steer 进主会话（旧行为）。 */
+      dream: z.boolean().default(false),
+      /** 子代理模型：留空 = 跟随主会话 route（请求前缀与主会话同源，provider prompt
+       *  cache 可命中）；'provider/model'（dsh route 格式）指定 provider+model，
+       *  'model' 只换 model（provider 继承父）。 */
+      model: z.string().required(false),
+    })
+    .default({}),
 })
+
+// ── 设置页（喵记忆标签页）的数据底座 ──────────────────────────────────────────
+//
+// installSettingsSection(ctx, SETTINGS_NS, ...) 在 applyInner 最前面调用；标签页
+// （client/settings-page.ts）经 settingsScope.bind({namespace}) 读写 user 层，
+// applyInner 解析配置时把 user 层字段级合并进 patch config（用户改过的字段以
+// 设置页为准）。生效时机=config 在 apply 时解析 → 设置页保存后需热重载/重启插件。
+
+export const SETTINGS_NS = 'meow-memory'
+
+/** 设置页 base（预填层）=全部默认值；promptLang 刻意缺席=未设置语义（默认 zh+首用引导）。 */
+export const CONFIG_DEFAULTS = {
+  enabled: true,
+  projectDir: '.dsh-meow',
+  hitTopK: 2,
+  titleMax: 40,
+  reflect: true,
+  reflectTurns: 7,
+  autoMigrate: true,
+  dream: {
+    enabled: true,
+    idleMinutes: 180,
+    suppressWindows: [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '18:00' }],
+    suppressLeadMinutes: 15,
+    checkMinutes: 15,
+    timeZone: 'Asia/Shanghai',
+    rulesReviewDays: DEFAULT_RULES_REVIEW_DAYS,
+  },
+  delegate: { reflect: false, dream: false, model: '' },
+}
+
+/** 单个时间点（suppressWindows 的 start/end）。 */
+const TIME_OF_DAY_RE = /^\d{1,2}:\d{2}$/
+
+/**
+ * 设置页 user 层的字段级类型校验（RPC 写入走这里，编不过拒写）。
+ * 手编 settings.yaml 不经此路径，由 merge 后 resolveConfig 的兜底解析防御。
+ */
+export function validateConfigUserLayer(value: unknown): void {
+  if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('配置必须是对象')
+  }
+  const v = value as Record<string, unknown>
+  const reqBool = (k: string): void => {
+    if (v[k] !== undefined && typeof v[k] !== 'boolean') throw new Error(`${k} 必须是布尔`)
+  }
+  const reqStr = (k: string): void => {
+    if (v[k] !== undefined && typeof v[k] !== 'string') throw new Error(`${k} 必须是字符串`)
+  }
+  const reqNum = (k: string): void => {
+    if (v[k] === undefined) return
+    if (typeof v[k] !== 'number' || !Number.isFinite(v[k] as number)) throw new Error(`${k} 必须是数字`)
+  }
+  reqBool('enabled')
+  reqStr('projectDir')
+  reqNum('hitTopK')
+  reqNum('titleMax')
+  reqBool('reflect')
+  reqNum('reflectTurns')
+  reqBool('autoMigrate')
+  reqStr('promptLang')
+  const d = v.dream
+  if (d !== undefined) {
+    if (d === null || typeof d !== 'object' || Array.isArray(d)) throw new Error('dream 必须是对象')
+    const dd = d as Record<string, unknown>
+    if (dd.enabled !== undefined && typeof dd.enabled !== 'boolean') throw new Error('dream.enabled 必须是布尔')
+    reqNum('dream.idleMinutes') // 顶层校验器只认顶层键，dream 子键在此手查
+    if (dd.idleMinutes !== undefined && (typeof dd.idleMinutes !== 'number' || !Number.isFinite(dd.idleMinutes))) throw new Error('dream.idleMinutes 必须是数字')
+    for (const k of ['suppressLeadMinutes', 'checkMinutes', 'rulesReviewDays'] as const) {
+      if (dd[k] !== undefined && (typeof dd[k] !== 'number' || !Number.isFinite(dd[k]))) throw new Error(`dream.${k} 必须是数字`)
+    }
+    if (dd.timeZone !== undefined && typeof dd.timeZone !== 'string') throw new Error('dream.timeZone 必须是字符串')
+    if (dd.suppressWindows !== undefined) {
+      if (!Array.isArray(dd.suppressWindows)) throw new Error('dream.suppressWindows 必须是数组')
+      for (const w of dd.suppressWindows as unknown[]) {
+        const win = w as { start?: unknown; end?: unknown }
+        if (typeof win !== 'object' || win === null || typeof win.start !== 'string' || typeof win.end !== 'string' || !TIME_OF_DAY_RE.test(win.start) || !TIME_OF_DAY_RE.test(win.end)) {
+          throw new Error('dream.suppressWindows 每项必须是 { start: "HH:MM", end: "HH:MM" }')
+        }
+      }
+    }
+  }
+  const dg = v.delegate
+  if (dg !== undefined) {
+    if (dg === null || typeof dg !== 'object' || Array.isArray(dg)) throw new Error('delegate 必须是对象')
+    const ddg = dg as Record<string, unknown>
+    if (ddg.reflect !== undefined && typeof ddg.reflect !== 'boolean') throw new Error('delegate.reflect 必须是布尔')
+    if (ddg.dream !== undefined && typeof ddg.dream !== 'boolean') throw new Error('delegate.dream 必须是布尔')
+    if (ddg.model !== undefined && typeof ddg.model !== 'string') throw new Error('delegate.model 必须是字符串')
+  }
+}
+
+/**
+ * 设置页 user 层字段级覆盖 patch config（装配配置=基线）。
+ * dream/delegate 子对象做浅合并：用户只改一个子字段不丢 patch 里的其余键。
+ */
+export function mergeConfigLayer(patch: unknown, user: Record<string, unknown> | undefined): unknown {
+  if (user === undefined || typeof user !== 'object') return patch
+  const base = (typeof patch === 'object' && patch !== null ? { ...(patch as Record<string, unknown>) } : {}) as Record<string, unknown>
+  for (const [key, value] of Object.entries(user)) {
+    if (key === 'dream' || key === 'delegate') {
+      // 子对象浅合并：用户只改一个子字段不丢 patch 里的其余键
+      const pv = (base[key] ?? {}) as Record<string, unknown>
+      const uv = (typeof value === 'object' && value !== null ? value : {}) as Record<string, unknown>
+      base[key] = { ...pv, ...uv }
+    } else {
+      base[key] = value
+    }
+  }
+  return base
+}
 
 interface ResolvedConfig {
   enabled: boolean
@@ -185,11 +315,13 @@ interface ResolvedConfig {
   /** undefined = 用户未配置（首次设置引导的触发信号）；运行时语言兜底 zh。 */
   promptLang: string | undefined
   dream: DreamConfig
+  delegate: { reflect: boolean; dream: boolean; modelSpec: AgentOptionsSpec | undefined }
 }
 
 function resolveConfig(config: unknown): ResolvedConfig {
   const c = (config ?? {}) as Partial<ResolvedConfig>
   const d = (c.dream ?? {}) as Partial<DreamConfig>
+  const dg = (c.delegate ?? {}) as { reflect?: boolean; model?: string }
   return {
     enabled: c.enabled ?? true,
     projectDir: c.projectDir ?? '.dsh-meow',
@@ -208,6 +340,18 @@ function resolveConfig(config: unknown): ResolvedConfig {
       timeZone: d.timeZone ?? 'Asia/Shanghai',
       rulesReviewDays: d.rulesReviewDays ?? DEFAULT_RULES_REVIEW_DAYS,
     },
+    delegate: (() => {
+      // 换模型（modelSpec 存在）⇒ 强制 delegate：换模型的请求是独立流，命不中主模型
+      // 的缓存链，此时占主会话上下文纯亏（猫猫拍板 2026-09-02：换模型必须不加入上下文；
+      // 主模型才允许用户在拼接（持续命中缓存）/独立（零占用）之间选）。
+      const modelSpec = parseModelSpec(dg.model)
+      const forced = modelSpec !== undefined
+      return {
+        reflect: forced ? true : (dg.reflect ?? false),
+        dream: forced ? true : (dg.dream ?? false),
+        modelSpec,
+      }
+    })(),
   }
 }
 
@@ -284,7 +428,39 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
 }
 
 async function applyInner(ctx: Context, config: unknown): Promise<void> {
-  const resolved = resolveConfig(config)
+  // ── 设置页命名空间（喵记忆标签页的数据底座）──
+  // installSettingsSection 必须先于 resolveConfig：setSource 在 install 时同步回填
+  // getter，首启/热重载的首次 resolve 就能合并 settings.yaml 的 user 层。
+  // 三层模型：CONFIG_DEFAULTS（默认）< patch config（cordis.patch.yml 手编，合成进
+  // base 显示为"预填"）< 设置页 user 层（标签页改动，字段级覆盖）。
+  // base 必须合成 patch：否则 patch 手编的值（如 delegate/model）在标签页显示为空，
+  // 用户会以为配置丢了（2026-09-02 实测踩坑）。
+  const settingsBase = mergeConfigLayer(CONFIG_DEFAULTS, config)
+  let settingsGet: (() => unknown) | undefined
+  try {
+    installSettingsSection(ctx, SETTINGS_NS, z.dict(z.any()), settingsBase, {
+      validate: (value: unknown): void => {
+        validateConfigUserLayer(value)
+      },
+      setSource: (get: () => unknown): void => {
+        settingsGet = get
+      },
+      onChange: (): void => {
+        ctx.logger.info('meow-memory: 配置已通过设置页更新（热重载/重启插件后生效）')
+      },
+    })
+  } catch (e) {
+    // 设置服务未装配（别的 profile）不挡插件本体：config 退回 patch 层。
+    const msg = `meow-memory: 设置命名空间注册失败（标签页不可用，配置走 patch 层）：${e instanceof Error ? (e.stack ?? e.message) : String(e)}`
+    ctx.logger.warn(msg)
+    try {
+      appendFileSync(join(homedir(), '.dsh-meow', 'settings-register-error.log'), `[${new Date().toISOString()}] ${msg}\n`)
+    } catch {
+      /* 留痕失败忽略 */
+    }
+  }
+  const merged = mergeConfigLayer(config, settingsGet?.() as Record<string, unknown> | undefined)
+  const resolved = resolveConfig(merged)
   if (!resolved.enabled) {
     ctx.logger.info('meow-memory: disabled by config')
     return
@@ -312,6 +488,37 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays))
   if (typeof disposeDreamTool === 'function') toolDisposers.push(disposeDreamTool)
   ctx.logger.info('meow-memory: memory_remember/search/read/update + memory_dream registered')
+
+  // delegate（fork 子代理）状态：同会话防重入 + 插件卸载时中断 in-flight 子代理
+  //（热重载/卸载时 fiber dispose → abort；子代理内部 catch 记日志自清 inFlight）。
+  // ⚠️ dispose 只 abort、不清 dreamDelegateEnv（2026-09-04 竞态修复）：热重载时旧
+  // fiber 的 async dispose 与新 fiber 的 applyInner 并发，旧 dispose 的清 env 晚于
+  // 新 apply 的 set → env 被清成 null → dream 静默回退 steer（真机踩坑：sleep 窗口
+  // 自动 dream 三轮落主会话上下文，dream-debug.log 'dream start' 无 delegated 后缀）。
+  // env 的最终归属由下方 applyInner 同步决定（开=设新值 / 关=显式 null）；卸载后
+  // env 残留但 dream 触发链（定时器/命令）已随 fiber 消失，无调用方——安全。
+  const reflectInFlight = new Set<string>()
+  const delegateAbort = new AbortController()
+  ;(ctx as { effect?: (fn: unknown, name?: string) => unknown }).effect?.(() => async () => {
+    delegateAbort.abort()
+  }, 'meow-memory delegate lifecycle')
+  setDreamDelegateEnv(resolved.delegate.dream
+    ? {
+        // dream 组执行体换成 fork 子代理：每组一个子代理（播种主会话已完成 turn），
+        // done 回调链式推进；租约状态机/峰时抑制/skip 语义全部不变。
+        // subagents/workspace 不能在 apply 期解析：此刻服务尚未启动，ctx.get 拿不到、
+        // 直取属性直接抛 without inject（真机踩坑 2026-09-03，炸掉插件树加载）——
+        // 只存 ctx，delegateLaunchFor 每次起组时现场解析（那时 host 已就绪）。
+        logger: ctx.logger,
+        ctx,
+        signal: delegateAbort.signal,
+        inFlight: new Set<string>(),
+        modelSpec: resolved.delegate.modelSpec,
+      }
+    : null)
+  if (resolved.delegate.dream) {
+    ctx.logger.info('meow-memory: dream delegated to fork subagents')
+  }
 
   // 记忆系统手册挂进 system prompt（静态文本 → KV 缓存友好；order 130 = 工具指南区间末尾，
   // 与各 tool:* 说明（100–116）列在一起，不独占开头）。
@@ -568,9 +775,34 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     if (lastToolName !== undefined && lastToolName.startsWith('memory_')) return // 已主动记忆
     if (consecutiveToolSteps(sessionEventsOf(agent.session)) < resolved.reflectTurns) return // 单任务内连续工具 step 不足
     const message = buildReflectMessage(ws, turnText, resolved.projectDir)
-    agent.steer(message)
+    if (resolved.delegate.reflect) {
+      // fork 子代理执行（不占主会话上下文；steer 无法单轮换模型，delegate.model 是
+      // 唯一换模型路径）。in-flight 防重入：同会话上一轮反思未结束前不重复触发。
+      // 服务不可用回退 steer（功能降级而非消失）。
+      const outcome = startDelegateSubagent(ctx.logger, resolveSubagents(ctx), {
+        parent: agent,
+        promptText: message.content.map((b) => (b.type === 'text' ? b.text : '')).join(''),
+        label: 'meow-memory reflect',
+        modelSpec: resolved.delegate.modelSpec,
+        signal: delegateAbort.signal,
+        inFlight: reflectInFlight,
+        sessionKey: sidTs,
+        workspace: resolveWorkspace(ctx),
+        // 完成打点：client 气泡「进行中→已完成」的翻转信号（settle 后追加，不出气泡）。
+        done: () => appendDelegateMarker(agent, 'reflect-done'),
+      })
+      if (outcome === 'started') {
+        appendDelegateMarker(agent, 'reflect')
+        ctx.logger.info(`meow-memory: reflect delegated to fork subagent after ${resolved.reflectTurns}+ tool turns`)
+      } else if (outcome === 'unavailable') {
+        agent.steer(message)
+        ctx.logger.info('meow-memory: reflect steered (delegate unavailable, fell back)')
+      } // 'in-flight'：已有反思在跑，静默跳过
+    } else {
+      agent.steer(message)
+      ctx.logger.info(`meow-memory: reflect steered after ${resolved.reflectTurns}+ tool turns`)
+    }
     if (Date.now() - t0 > 20) perf(`turn-stopping slow ${Date.now() - t0}ms`)
-    ctx.logger.info(`meow-memory: reflect steered after ${resolved.reflectTurns}+ tool turns`)
   })
 
   // 3) 空闲整理（按窗口；windowIndex 记录 sessionId → workspace）。
@@ -861,11 +1093,12 @@ function persistWindowIndex(): void {
 
 // re-export 供测试/调试/其他插件
 export { PLUGIN_SOURCE, REFLECT_MARKER }
+export { appendDelegateMarker, buildDelegateMarkerMessage, parseModelSpec, resolveSubagents, resolveWorkspace, startDelegateSubagent, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } from './delegate.js'
 export { collectDreamStates } from './dream-signal.js'
 export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, globalProjectMarker, GLOBAL_PROJECT_CANON } from './db.js'
 export { migrateLegacy } from './migrate.js'
-export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
+export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markWritten, readWritten, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, MAX_REINJECT_WRITTEN, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition, setDreamDelegateEnv, type DreamLaunchFn, type DreamDelegateEnv } from './dream.js'

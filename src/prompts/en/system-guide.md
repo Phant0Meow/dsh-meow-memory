@@ -6,7 +6,7 @@ I. What the memory store holds
 - user = the user's basic facts, baseline preferences, important device/network environment, things that matter about the user themselves. Injected every session, so keep it lean — only what really matters.
 - rules = design principles / behavioral guidelines. Global rules take project "global"; project-specific rules take that project's name;
 - fact = small atomic facts (one plain sentence, ≤30 words);
-- lesson = mistakes and lessons, traps you fell into, things you learned by doing;
+- lesson = what you learned, your own experience;
 - topic = a thread: what caused something, how it developed, where it stands. Gives you the wider view of how events unfolded. Update it as the story moves on.
 - project = a project. Project memories have subcategories:
   overview: the project's purpose, summary, meta information, general introduction.

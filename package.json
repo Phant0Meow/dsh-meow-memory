@@ -1,6 +1,6 @@
 {
   "name": "meow-memory",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "description": "Cross-session project memory for DeepSeek Harness: seven-layer SQLite memory, first-turn snapshot injection, per-message keyword hits, memory_remember/search/project tools, automatic reflection with reflection-fold UI, and idle-triggered dream consolidation (peak-hour suppressed).",
   "keywords": [
     "deepseek-harness",
@@ -43,12 +43,13 @@
     "prepare": "node build.mjs",
     "build": "node build.mjs",
     "watch": "node build.mjs --watch",
-    "test": "node test.mjs && node tests/client-fold.mjs && node tests/client-dream-icon.mjs && node tests/client-dream-skip.mjs",
+    "test": "node test.mjs && node tests/client-fold.mjs && node tests/client-delegate-notice.mjs && node tests/client-delegate-vanish.mjs && node tests/client-dream-icon.mjs && node tests/client-dream-skip.mjs",
     "check-lang": "node scripts/check-lang.mjs",
     "link-workspace": "powershell -ExecutionPolicy Bypass -File scripts/link-workspace.ps1"
   },
   "devDependencies": {
     "@deepseek-ai/dsh-llm": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-settings": "^0.1.1-rc.2",
     "@deepseek-ai/schemastery": "^3.18.1",
     "esbuild": "^0.25.0"
   }

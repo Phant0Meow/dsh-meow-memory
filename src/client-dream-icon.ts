@@ -6,13 +6,13 @@
  * 蓝色动画，避免与正常工作混淆）；有新活动则移除。图标放进 dsh 会话行的
  * 状态槽位（16×20 的 slot span）——替换其内容，不新增元素，标题零位移。
  *
- * 数据（事件驱动，无轮询）：
- * - 挂载/EventSource 重连时 GET /meow-memory/dreamed-sessions 全量对账一次
+ * 数据（2026-09-05 连接池修复：SSE 长连接 → 共享 60s 轮询 diff）：
+ * - 挂载时 GET /meow-memory/dreamed-sessions 全量对账一次
  *   （{ sessionIds: 已整理, dreamingIds: 进行中 }）+ GET /meow-memory/skip-dreams
  *   （{ sessionIds: 已跳过 }，v0.18.0 起；
- * - /meow-memory/dream-events 是 SSE 长连接：dream 开始推 state:'dreaming'、
- *   dream 完成推 state:'dreamed'、会话有新活动推 state:'active'（去月亮）、
- *   跳过状态翻转推 'skip'/'unskip'。
+ * - 增量经 subscribeDreamEvents（client-dream-events.ts 全页共享轮询）：dream
+ *   开始推 state:'dreaming'、dream 完成推 state:'dreamed'、会话有新活动推
+ *   state:'active'（去月亮）、跳过状态翻转推 'skip'/'unskip'。
  *
  * 三态优先级（v0.18.0）：呼吸灯 dreaming > 跳过 skipped > 已整理 dreamed——
  * 进行中的 dream 不打断是既有语义，所以呼吸灯最优先；跳过的会话显示灰调
@@ -24,6 +24,8 @@
  * 的 fiber 就是 SessionNodeItem 的 fiber，其 key = 会话 id（渲染时 key={node.id}）。
  * 找不到 fiber（未来 React 改内部结构）→ 该行跳过，静默降级不报错。
  */
+
+import { subscribeDreamEvents } from './client-dream-events.ts'
 
 /** 静态淡黄月牙标记（CSS 选择器 + 幂等锚点）。 */
 export const DREAM_ICON_ATTR = 'data-meow-dreamed'
@@ -252,33 +254,16 @@ export function startDreamIconManager(): () => void {
     replay()
   }
 
-  /** SSE 增量订阅：dream 开始/完成/新活动/跳过翻转信号。断线后 60s 重连（onopen 时全量对账）。 */
-  let eventSource: EventSource | null = null
-  let reconnectTimer = 0
-  const connect = (): void => {
-    eventSource?.close()
-    eventSource = new EventSource('/meow-memory/dream-events')
-    eventSource.addEventListener('dream', (raw) => {
-      try {
-        const data = JSON.parse((raw as MessageEvent).data) as { sessionId?: unknown; state?: unknown }
-        if (typeof data.sessionId !== 'string') return
-        if (data.state === 'dreamed' || data.state === 'dreaming') dreamStates.set(data.sessionId, data.state)
-        else if (data.state === 'skip') skippedIds.add(data.sessionId)
-        else if (data.state === 'unskip') skippedIds.delete(data.sessionId)
-        else dreamStates.delete(data.sessionId) // 'active'（有新活动）或未知状态：去月亮
-        replay()
-      } catch {
-        // 坏帧忽略
-      }
-    })
-    eventSource.onopen = () => { void refresh() } // 首次连接/每次重连成功：全量对账补漏
-    eventSource.onerror = () => {
-      eventSource?.close()
-      eventSource = null
-      window.clearTimeout(reconnectTimer)
-      reconnectTimer = window.setTimeout(connect, 60_000)
-    }
-  }
+  // 增量订阅（共享 60s 轮询 diff，替代原每页一条的 EventSource——连接池饥饿
+  // 修复，见 client-dream-events.ts 头注）。事件语义与旧 SSE 'dream' 帧一致。
+  const unsubscribeDreamEvents = subscribeDreamEvents((event) => {
+    const { sessionId, state } = event
+    if (state === 'dreamed' || state === 'dreaming') dreamStates.set(sessionId, state)
+    else if (state === 'skip') skippedIds.add(sessionId)
+    else if (state === 'unskip') skippedIds.delete(sessionId)
+    else dreamStates.delete(sessionId) // 'active'（有新活动）或未知状态：去月亮
+    replay()
+  })
 
   // 样式常驻全局（图标由 data 属性驱动，规则在即生效；与折叠 UI 的 CSS 同策略）。
   // 热重载 dispose 不删 style——注入前先移除本插件旧 style，防多代规则堆积污染
@@ -298,15 +283,12 @@ export function startDreamIconManager(): () => void {
   })
   observer.observe(document.body, { childList: true, subtree: true })
 
-  connect()
   void refresh()
 
   return () => {
     observer.disconnect()
     window.clearTimeout(timer)
-    window.clearTimeout(reconnectTimer)
-    eventSource?.close()
-    eventSource = null
+    unsubscribeDreamEvents()
     style.remove()
     for (const el of Array.from(document.querySelectorAll<HTMLElement>(`[${DREAM_ICON_ATTR}], [${DREAMING_ATTR}], [${SKIPPED_ATTR}]`))) el.remove()
   }
