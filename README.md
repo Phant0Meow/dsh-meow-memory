@@ -201,6 +201,14 @@ npm run test           # 228 项逻辑测试：db / bm25 / migrate / inject / re
 包的 junction 镜像，使 esbuild 能解析它们；`build.mjs` 通过 `nodePaths` 引用。
 这些链接仅构建期需要。
 
+## 🙏 致谢
+
+感谢每一位贡献者让 meow-memory 越来越好：
+
+- **[daveycodez](https://github.com/daveycodez)** — 英文语言包与英文分词（[PR #6](https://github.com/Phant0Meow/dsh-meow-memory/pull/6)，v0.22.0 发布）
+- **[chenmzh](https://github.com/chenmzh)** — 记忆注入改为独立 plugin snapshot 消息，根治会话标题污染（[PR #10](https://github.com/Phant0Meow/dsh-meow-memory/pull/10)）
+- **[cuddly-guacamole](https://github.com/cuddly-guacamole)** — dsh 0.1.2-alpha.4 双版本 Session events 兼容（[PR #11](https://github.com/Phant0Meow/dsh-meow-memory/pull/11)）
+
 ## 📄 License
 
 MIT —— 见 [LICENSE](LICENSE)。

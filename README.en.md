@@ -229,6 +229,14 @@ The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this p
 creates junction mirrors of the workspace packages so esbuild can resolve them;
 `build.mjs` uses `nodePaths` to pick them up. The links are build-time only.
 
+## 🙏 Acknowledgments
+
+Thanks to every contributor who made meow-memory better:
+
+- **[daveycodez](https://github.com/daveycodez)** — English language pack & tokenizer ([PR #6](https://github.com/Phant0Meow/dsh-meow-memory/pull/6), shipped in v0.22.0)
+- **[chenmzh](https://github.com/chenmzh)** — isolated memory injections into independent plugin snapshot messages, fixing session title pollution ([PR #10](https://github.com/Phant0Meow/dsh-meow-memory/pull/10))
+- **[cuddly-guacamole](https://github.com/cuddly-guacamole)** — dual-version Session events compatibility for dsh 0.1.2-alpha.4 ([PR #11](https://github.com/Phant0Meow/dsh-meow-memory/pull/11))
+
 ## 📄 License
 
 MIT — see [LICENSE](LICENSE).
