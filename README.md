@@ -90,13 +90,15 @@
   折叠成一条横条（默认折叠，显示「新增记忆 N 条」/「记忆梦境任务」），点击向下展开成
   卡片查看完整记录——卡片内 Think / tool call / 上下文注入均可点开查看细节。
 - **会话列表 dream 图标（client 端）**：左侧会话列表中，"dream 整理过记忆且之后无新对话
-  新信息"的会话行显示**淡黄色小月牙 🌙**；dream 轮进行中显示**白→金呼吸灯月牙**（替换 dsh
-  的运行中蓝色动画，避免与正常工作混淆）；被**跳过梦境整理**的会话显示**静音灰「月牙+斜杠」**
-  （取消跳过自动回落；优先级：呼吸灯 > 跳过 > 月牙）；有新活动即移除。图标放进 dsh 会话行的状态槽位
-  （替换槽内内容，标题零位移）。数据走事件驱动无轮询：`/meow-memory/dream-events` SSE
-  长连接——dream 开始推 `state:'dreaming'`、完成推 `state:'dreamed'`、有新活动推
-  `state:'active'`、跳过翻转推 `state:'skip'/'unskip'`；client 挂载/断线重连时对
-  `/meow-memory/dreamed-sessions` 与 `/meow-memory/skip-dreams` 全量对账一次。
+  新信息"的会话行显示**淡黄色小月牙 🌙**；dream 轮进行中显示**白→金呼吸灯月牙**（与 dsh
+  状态点并存、月牙居左，不与正常工作混淆）；被**跳过梦境整理**的会话显示**静音灰「月牙+斜杠」**
+  （取消跳过自动回落；优先级：呼吸灯 > 跳过 > 月牙）；有新活动即移除。图标放进 dsh 会话行的
+  状态槽位、状态点左侧——只追加/只移除自有节点，不改写 React 拥有的子节点（整槽替换会令
+  React 虚拟 DOM 失同步，commit 抛 removeChild NotFoundError 把侧边栏整树卸载）。
+  数据走全页共享的 60s 轮询 diff（v0.23.0 连接池修复，替代原 SSE 长连接）：
+  `/meow-memory/dreamed-sessions` 与 `/meow-memory/skip-dreams` 各一次 GET，事件语义不变——
+  dream 开始推 `state:'dreaming'`、完成推 `state:'dreamed'`、有新活动推 `state:'active'`、
+  跳过翻转推 `state:'skip'/'unskip'`；client 挂载时全量对账一次。
   行定位零 dsh 改动：读 React 18 fiber（`__reactFiber$` 内部属性）拿会话行渲染 key =
   session id，不依赖标题匹配。
 - **dream 防重复**：check 门（DB 原子 60s 检查节流）+ start 幂等抢占（`dream_pending`）+

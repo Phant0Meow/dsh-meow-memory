@@ -2,9 +2,13 @@
  * meow-memory — 会话列表 dream 小月牙图标（client 端，用户拍板 2026-08-19）。
  *
  * 目标：左侧会话列表中，dream 整理过记忆且之后无新对话新信息的会话行显示
- * 淡黄色静态小月牙；dream 轮进行中显示白→金呼吸灯月牙（替换 dsh 的运行中
- * 蓝色动画，避免与正常工作混淆）；有新活动则移除。图标放进 dsh 会话行的
- * 状态槽位（16×20 的 slot span）——替换其内容，不新增元素，标题零位移。
+ * 淡黄色静态小月牙；dream 轮进行中显示白→金呼吸灯月牙（与 dsh 状态点并存，
+ * 月牙居左，不与正常工作混淆）；有新活动则移除。图标放进 dsh 会话行的状态
+ * 槽位（16×20 的 slot span）内状态点左侧——只追加/只移除自有节点，绝不改写
+ * React 拥有的子节点：replaceChildren 会拔掉 React 渲染的状态点而虚拟 DOM
+ * 仍持其引用，下一个触及该槽的 commit 在 removeChild 时抛 NotFoundError，
+ * React 把错误边界内的树整体卸载（侧边栏「工作区」以下整块空白的根因，
+ * 2026-09-06 修复）。
  *
  * 数据（2026-09-05 连接池修复：SSE 长连接 → 共享 60s 轮询 diff）：
  * - 挂载时 GET /meow-memory/dreamed-sessions 全量对账一次
@@ -69,6 +73,7 @@ const ICON_CSS = `[${DREAM_ICON_ATTR}],
   justify-content: center;
   width: 10px;
   height: 10px;
+  margin-right: 4px; /* 槽位内居状态点左侧 / flat 行首内联：与右侧内容保持间距 */
 }
 [${DREAM_ICON_ATTR}] { color: #e9c46a; opacity: 0.9; } /* 淡黄停驻 */
 [${DREAMING_ATTR}] {
@@ -80,7 +85,6 @@ const ICON_CSS = `[${DREAM_ICON_ATTR}],
   50% { color: #f2c14e; opacity: 1; }
 }
 [${SKIPPED_ATTR}] { color: #94a3b8; opacity: 0.85; } /* 静音灰：这扇窗不做梦 */
-[data-meow-inline-icon] { margin-right: 4px; } /* 无状态槽位的 flat 视图：行首内联 */
 `
 
 /** React fiber 内部属性前缀（React 17+ 稳定约定：__reactFiber$ + 随机后缀）。 */
@@ -159,11 +163,12 @@ export function mergeIconStates(
 
 /**
  * 重放一轮图标：扫描全部会话行，对照状态表放置/更新/移除小月牙。
- * 幂等：状态一致时不动元素；插入/替换动作触发 MutationObserver → 防抖重扫 → 已一致跳过，
+ * 幂等：状态一致时不动元素；插入/移除动作触发 MutationObserver → 防抖重扫 → 已一致跳过，
  * 无自循环（client-fold 同款模式）。
- * 位置：优先放进行的状态槽位（`[class$="_slot"]`，16×20 居中，替换槽内内容——
- * 含 dsh 的运行中/完成状态点，用户拍板"dream 图标直接替换它的位置"）；
- * 无槽位（flat 无状态视图）时退化为行首内联（占 14px，可接受）。
+ * 位置：优先放进会话行的状态槽位（`[class$="_slot"]`）内状态点左侧——只追加/
+ * 只移除自有图标节点，绝不 replaceChildren：React 拥有的状态点被拔掉后其虚拟
+ * DOM 仍持引用，下一个触及该槽的 commit 抛 NotFoundError（侧边栏整块空白的
+ * 根因）；无槽位（flat 无状态视图）时退化为行首内联（占 14px，可接受）。
  * @param states - 当前状态表：session id → 'dreamed' | 'dreaming' | 'skipped'
  *   （管理器先用 mergeIconStates 合并两路数据再传入）。
  * @param rows - 会话行集合；缺省时按 dsh 会话行选择器查询（CSS Modules 类名
@@ -177,11 +182,14 @@ export function applyDreamIcons(states: ReadonlyMap<string, DreamIconState>, row
     const wantAttr = attrForState(state)
     const slot = row.querySelector('[class$="_slot"]')
     if (slot !== null) {
-      // 状态槽位：替换槽内内容（含我们的旧图标 / dsh 状态点）。
+      // 状态槽位：只追加/只移除自有节点——ANY_ICON_SEL 只会命中我们 data-meow-*
+      // 图标，dsh 状态点（React 所有）原样保留；改写 React 子节点会令其虚拟 DOM
+      // 失同步（removeChild NotFoundError → 错误边界整树卸载，侧边栏空白）。
       const cur = slot.querySelector(ANY_ICON_SEL)
       const consistent = cur !== null && wantAttr !== null && cur.getAttribute(wantAttr) === 'true'
       if (state !== undefined && !consistent) {
-        slot.replaceChildren(makeIcon(state))
+        cur?.remove()
+        slot.insertBefore(makeIcon(state), slot.firstChild)
       } else if (state === undefined && cur !== null) {
         cur.remove()
       }

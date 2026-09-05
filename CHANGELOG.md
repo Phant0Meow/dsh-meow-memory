@@ -12,6 +12,11 @@
 
 - 气泡 dream 三态判定（client-delegate-notice.ts）：dreaming（活跃租约）→「进行中」、dreamed→「已完成」、状态未知按打点年龄兜底——<30min（租约硬上限）显示进行中，≥30min 显示「梦境记忆整理已中断，稍后自动重试」。根因：429 期间 dream 每周期 error 释放重试（语义正确）但 error 不发 dreamed → dreamed-sessions 永无该窗口 → 气泡对账永远对不上、刷新也无用（猫猫实证）。附 setDreamStatesForTest 测试钩子 + client 测试 +6 项。
 
+### 会话列表 dream 图标改追加式：修复侧边栏「工作区」以下整块空白（v0.24.0 发版后增量，未发版）
+
+- **真机 bug**：AI 回答结束（会话列表整体重渲染：running→done、按更新时间重排）后侧边栏「工作区」以下全部空白，Console 报 `NotFoundError: Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.`，刷新页面才恢复。根因：`applyDreamIcons` 曾用 `slot.replaceChildren()` 把月亮图标放进会话行状态槽位——slot 是 React（SessionNodeItem）渲染并持有子节点引用的元素，dsh 状态点被拔掉后 React 虚拟 DOM 仍持其引用，下一个触及该槽的 commit（running→done 移除状态点、subagent 状态增减、pending interaction 出现等）在 removeChild 时抛 NotFoundError，React 把错误边界内的树整体卸载。
+- **修复**：只追加/只移除自有节点——图标 `insertBefore` 到状态点左侧（`margin-right: 4px` 保持间距），dsh 状态点原样保留；移除路径只删 `data-meow-*` 自有图标。README 中英同步改写（顺带修正该段残留的 v0.23.0 前 SSE 长连接描述→共享 60s 轮询 diff）。测试同步：fake slot 不再实现 replaceChildren（回归成整槽改写会直接抛错），7 处断言补「React 状态点存活」校验。
+
 ## v0.23.1 (2026-09-05)
 
 ### dream 防重复烧钱加固

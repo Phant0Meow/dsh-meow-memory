@@ -115,16 +115,19 @@ frozen at the last conversation timestamp.
   inside the card are expandable for details.
 - **Session-list dream icon (client)**: sessions that have been dream-consolidated with no
   new conversation activity since show a **pale-yellow crescent-moon icon 🌙**; while a dream
-  turn is running the moon **breathes white→gold** (replacing dsh's running-blue animation so
-  it can't be mistaken for normal work); **skip-dreamed** sessions show a **muted-gray
+  turn is running the moon **breathes white→gold** (sitting to the left of dsh's status dots,
+  so it can't be mistaken for normal work); **skip-dreamed** sessions show a **muted-gray
   "moon with slash"** instead (un-skipping falls back to the crescent; priority: breathing >
-  skipped > crescent); new activity removes the icon. The icon lives inside
-  the dsh session row's status slot (replacing its content — no layout shift). Event-driven,
-  no polling: the `/meow-memory/dream-events` SSE stream pushes `state:'dreaming'` when a
+  skipped > crescent); new activity removes the icon. The icon is prepended into the dsh
+  session row's status slot, left of its status dots — only self-created nodes are added or
+  removed, never rewriting React-owned children (replacing the slot's content desyncs React's
+  virtual DOM: the next commit throws removeChild NotFoundError and unmounts the whole
+  sidebar tree). Data flows through a page-wide shared 60s polling diff (v0.23.0
+  connection-pool fix, replacing the former SSE stream): one GET each against
+  `/meow-memory/dreamed-sessions` and `/meow-memory/skip-dreams` — `state:'dreaming'` when a
   dream starts, `state:'dreamed'` when it finishes, `state:'active'` when a session gets new
   activity, and `state:'skip'/'unskip'` when the skip flag flips; the client reconciles once
-  against `/meow-memory/dreamed-sessions` and `/meow-memory/skip-dreams` on
-  mount/reconnect. Row targeting needs zero dsh changes: it reads the React 18 fiber
+  on mount. Row targeting needs zero dsh changes: it reads the React 18 fiber
   (`__reactFiber$` internal property) to get the row's render key = session id — no title
   matching.
 - **Dream anti-repeat**: DB-atomic 60s check gate + atomic start claim (`dream_pending`) +
