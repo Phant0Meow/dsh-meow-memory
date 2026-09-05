@@ -17,7 +17,7 @@ async function bundleSrc(entry) {
   return import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'))
 }
 
-const { computeDelegateNotices, delegateNoticeLabel, delegateNoticeLabelFor, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } = await bundleSrc('src/client-delegate-notice.ts')
+const { computeDelegateNotices, delegateNoticeLabel, delegateNoticeLabelFor, setDreamStatesForTest, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } = await bundleSrc('src/client-delegate-notice.ts')
 const { computeFoldGroups, computeInjectionGroups } = await bundleSrc('src/client-fold.ts')
 
 // ---- mock 快照（同 client-fold.mjs 模式） ----
@@ -229,6 +229,34 @@ console.log('=== 10. chat 缺失 fail-closed ===')
   check('snapshot.chat 缺失 → 空数组不抛错', Array.isArray(computeDelegateNotices({}, NOW)) && computeDelegateNotices({}, NOW).length === 0)
   check('chat 缺失时 computeFoldGroups 同款降级（守卫对齐）', computeFoldGroups({}).length === 0 && computeInjectionGroups({}).length === 0)
   check('snapshot 本身 undefined → 空数组不抛错', computeDelegateNotices(undefined, NOW).length === 0)
+}
+
+// ---- 11. dream 三态判定（2026-09-05：error 释放重试语义下的中断兜底） ----
+console.log('=== 11. dream 三态（dreaming/dreamed/打点年龄兜底） ===')
+{
+  const mk = (key, sid, time) => contextNode(key, DREAM_TEXT, { ...DREAM_SOURCE, memory: { kind: 'dream-marker', sessionId: sid } }, time)
+  const nodes = new Map([
+    // 状态表无条目 + 打点超 30min 租约窗 → 必然失败释放 → 已中断（猫猫 429 实证场景）
+    ['ctx-d1', mk('ctx-d1', 'session-d1', NOW - 40 * 60_000)],
+    // 状态表无条目 + 打点新鲜 → 租约窗内视为进行中
+    ['ctx-d2', mk('ctx-d2', 'session-d2', NOW - 5 * 60_000)],
+    // dreamed → 已完成（哪怕打点很老）
+    ['ctx-d3', mk('ctx-d3', 'session-d3', NOW - 40 * 60_000)],
+    // dreaming（活跃租约）→ 进行中
+    ['ctx-d4', mk('ctx-d4', 'session-d4', NOW - 40 * 60_000)],
+  ])
+  setDreamStatesForTest([['session-d3', 'dreamed'], ['session-d4', 'dreaming']])
+  const ns = computeDelegateNotices(snapshot(['ctx-d1', 'ctx-d2', 'ctx-d3', 'ctx-d4'], nodes), NOW)
+  check('超窗无 dreamed → interrupted（已中断）', ns[0]?.interrupted === true && ns[0]?.running === false)
+  check('中断文案正确', delegateNoticeLabel(ns[0]).includes('已中断，稍后自动重试'))
+  check('新鲜无状态 → 进行中（非中断）', ns[1]?.running === true && ns[1]?.interrupted !== true)
+  check('dreamed → 已完成（无中断标记）', ns[2]?.running === false && ns[2]?.interrupted !== true)
+  check('dreaming → 进行中', ns[3]?.running === true && ns[3]?.interrupted !== true)
+  // 手动触发新打点（<30min）在 dreamed 集合出现过又消失（active 去状态）时也回到进行中
+  setDreamStatesForTest([['session-d1', 'dreamed']])
+  const ns2 = computeDelegateNotices(snapshot(['ctx-d1'], nodes), NOW)
+  check('dreamed 覆盖：超窗打点仍显示已完成', ns2[0]?.running === false && ns2[0]?.interrupted !== true)
+  setDreamStatesForTest([]) // 清理，不污染后续用例
 }
 
 console.log(failures === 0 ? '\nALL DELEGATE-NOTICE TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)

@@ -56,6 +56,12 @@ export type DelegateVariant = 'reflect' | 'reflect-done' | 'dream'
 /** reflect 历史打点的「进行中」保鲜窗口：反思子代理几分钟内跑完，超窗视为早已结束。 */
 const REFLECT_FRESH_MS = 30 * 60_000
 
+/** dream「进行中」的租约硬上限（DREAM_LEASE_MS 同款 30min）：打点超窗仍无 dreamed
+ *  状态 = 租约必然已过期收尾（Llm 瞬态失败被 release 释放重试）——气泡改显
+ *  「已中断，稍后自动重试」，不再永远卡「进行中」（2026-09-05 猫猫实证：智谱 429
+ *  期间 dream 15min 周期性失败，气泡刷新也翻不了已完成）。 */
+const DREAM_RUNNING_STALE_MS = 30 * 60_000
+
 /** 一个 delegate 打点气泡（打点消息投影出的 context 节点）。 */
 export interface DelegateNotice {
   /** context 节点的 key（快照 chat 节点 key，= 原始行 DOM 的 data-chat-flow-key）。 */
@@ -63,6 +69,8 @@ export interface DelegateNotice {
   readonly variant: DelegateVariant
   /** 任务是否仍在进行（决定气泡文字；reflect-done 恒 false——它只隐藏不出气泡）。 */
   readonly running: boolean
+  /** dream 专属：任务已中断（租约超窗仍无 dreamed），稍后自动重试。 */
+  readonly interrupted?: boolean
   /** 打点所属会话 id（新打点消息 source.memory.sessionId；历史打点缺省）。 */
   readonly sessionId?: string
 }
@@ -123,12 +131,20 @@ function delegateTimeOf(node: NoticeNodeLike): number | undefined {
 // ── dream 状态同步（对账 + SSE，client-dream-icon 同数据源的独立轻量订阅） ──
 
 const dreamStateBySession = new Map<string, DreamTaskState>()
+
+/** 测试专用：直接注入 dream 状态表（模拟 dreamed-sessions 对账结果）。生产代码勿用。 */
+export function setDreamStatesForTest(entries: ReadonlyArray<readonly [string, DreamTaskState]>): void {
+  dreamStateBySession.clear()
+  for (const [id, state] of entries) dreamStateBySession.set(id, state)
+}
 /** 最近一次 apply 的气泡集合：SSE 状态变化时重放它（文本随状态翻转）。 */
 let lastApplied: readonly DelegateNotice[] = []
 
-/** dream 是否仍在进行：所属会话精确判定；无 sessionId 的历史打点全局退化
+/** dream 是否仍在进行（仅状态表查询；compute 的 dream 三态判定内联于 computeDelegateNotices）：
+ *  所属会话精确判定；无 sessionId 的历史打点全局退化
  *  （任一会话 dreaming=可能在说它；状态表空=未知=进行中；有信息且无 dreaming=已完成）。
- *  只有明确 dreamed 才算完成——打点的语义就是任务刚发出（猫猫：处理完了才显示已完成）。 */
+ *  只有明确 dreamed 才算完成——打点的语义就是任务刚发出（猫猫：处理完了才显示已完成）。
+ *  @deprecated 由 computeDelegateNotices 的三态判定（dreaming/dreamed/打点年龄）取代。 */
 function dreamRunning(sessionId: string | undefined): boolean {
   if (sessionId !== undefined) return dreamStateBySession.get(sessionId) !== 'dreamed'
   for (const state of dreamStateBySession.values()) {
@@ -136,23 +152,28 @@ function dreamRunning(sessionId: string | undefined): boolean {
   }
   return dreamStateBySession.size === 0
 }
+void dreamRunning
 
-/** 气泡文案（猫猫拍板文案 + 折叠横条同款 ▸ 箭头）——纯映射，可单测。 */
-export function delegateNoticeLabelFor(variant: DelegateVariant, running: boolean): string {
-  if (variant === 'dream') return running ? '▸ 梦境记忆整理任务进行中……' : '▸ 梦境记忆整理任务已完成。'
+/** 气泡文案（猫猫拍板文案 + 折叠横条同款 ▸ 箭头）——纯映射，可单测。
+ *  dream 的 interrupted 优先于 running（中断是终态观感，重试由 host 自动进行）。 */
+export function delegateNoticeLabelFor(variant: DelegateVariant, running: boolean, interrupted = false): string {
+  if (variant === 'dream') {
+    if (interrupted) return '▸ 梦境记忆整理已中断，稍后自动重试。'
+    return running ? '▸ 梦境记忆整理任务进行中……' : '▸ 梦境记忆整理任务已完成。'
+  }
   if (variant === 'reflect-done') return '▸ 记忆反思任务已完成。'
   return running ? '▸ 记忆反思任务进行中……' : '▸ 记忆反思任务已完成。'
 }
 
 /** 气泡文案：按打点的 running 状态渲染。 */
 export function delegateNoticeLabel(notice: DelegateNotice): string {
-  return delegateNoticeLabelFor(notice.variant, notice.running)
+  return delegateNoticeLabelFor(notice.variant, notice.running, notice.interrupted === true)
 }
 
 /**
  * 从会话快照计算全部 delegate 打点气泡（按渲染顺序）。
  * reflect 触发打点的 running=它是最后一条 reflect 系打点（触发/完成交替的防重入
- * 序列）且消息时间在保鲜窗口内；dream 的 running= dreamRunning（SSE 状态）。
+ * 序列）且消息时间在保鲜窗口内；dream 走三态判定（dreaming/dreamed/打点年龄兜底）。
  * reflect-done 打点也在输出里（apply 只隐藏、不出气泡——完成信号行同样不该露脸）。
  * @param snapshot - 会话快照（dock 组件收到的 point-in-time 快照）。
  * @param now - 当前时刻（默认 Date.now()；测试可注入）。
@@ -174,14 +195,27 @@ export function computeDelegateNotices(snapshot: ConversationSnapshot, now: numb
   for (let i = 0; i < found.length; i++) {
     if (found[i].variant === 'reflect' || found[i].variant === 'reflect-done') lastReflectIdx = i
   }
-  const out: DelegateNotice[] = found.map((f, i) => ({
-    id: f.key,
-    variant: f.variant,
-    sessionId: f.sessionId,
-    running: f.variant === 'dream'
-      ? dreamRunning(f.sessionId)
-      : f.variant === 'reflect' && i === lastReflectIdx && f.time !== undefined && now - f.time < REFLECT_FRESH_MS,
-  }))
+  const out: DelegateNotice[] = found.map((f, i) => {
+    if (f.variant !== 'dream') {
+      return {
+        id: f.key,
+        variant: f.variant,
+        sessionId: f.sessionId,
+        running: f.variant === 'reflect' && i === lastReflectIdx && f.time !== undefined && now - f.time < REFLECT_FRESH_MS,
+      }
+    }
+    // dream 三态判定（2026-09-05：error 释放重试语义下，失败窗口在 dreamed-sessions
+    // 里永不存在，仅按 dreamed/dreaming 二态会永远卡「进行中」——按打点年龄兜底）：
+    // dreaming（活跃租约）→ 进行中；dreamed → 已完成；状态未知时打点 <30min（租约窗）
+    // 视为进行中，≥30min 视为已中断（租约 30min 硬上限，超窗未 dreamed 必然失败释放，
+    // host 下个检查周期自动重试）。无 sessionId 的远古打点同走年龄兜底（可能把早已
+    // 完成的显示为已中断——好过永久「进行中」）。
+    const state = f.sessionId !== undefined ? dreamStateBySession.get(f.sessionId) : undefined
+    if (state === 'dreaming') return { id: f.key, variant: f.variant, sessionId: f.sessionId, running: true }
+    if (state === 'dreamed') return { id: f.key, variant: f.variant, sessionId: f.sessionId, running: false }
+    const stale = f.time !== undefined && now - f.time >= DREAM_RUNNING_STALE_MS
+    return { id: f.key, variant: f.variant, sessionId: f.sessionId, running: !stale, interrupted: stale }
+  })
   // 临时诊断（2026-09-03，定案后移除）：气泡识别结果。
   if (out.length > 0) console.debug('[meow-dg] notices:', out.map((n) => `${n.id.slice(0, 8)}:${n.variant}:${n.running ? 'run' : 'done'}`).join(', '))
   return out

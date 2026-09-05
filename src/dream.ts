@@ -396,8 +396,11 @@ function delegateLaunchFor(agent: unknown, dir: string, onDreamState?: DreamStat
           const db = getDb(ws, dir)
           if (db.getDreamLease(sessionId) !== null) {
             db.releaseDream(sessionId)
-            dreamLog(ws, dir, `dream failed session=${shortSessionId(sessionId)} group=${groupIdx + 1}/${groupsTotal} stop=${String(r.stopReason)} -> lease released, retry next check`)
-            env.logger.warn(`meow-memory: dream group ${groupIdx + 1}/${groupsTotal} failed (${r.stopReason}) — lease released for retry`)
+            // errorDetail：fork start 瞬间异常时 delegate.ts 透传（2026-09-05 排障
+            // 需要——logger.warn 只进宿主控制台，这里写进 dream-debug.log 才可查）。
+            const detail = typeof (r as { errorDetail?: unknown }).errorDetail === 'string' ? (r as { errorDetail: string }).errorDetail : ''
+            dreamLog(ws, dir, `dream failed session=${shortSessionId(sessionId)} group=${groupIdx + 1}/${groupsTotal} stop=${String(r.stopReason)}${detail ? ` err=${detail}` : ''} -> lease released, retry next check`)
+            env.logger.warn(`meow-memory: dream group ${groupIdx + 1}/${groupsTotal} failed (${r.stopReason})${detail ? `: ${detail}` : ''} — lease released for retry`)
           }
         } else {
           // 用户中止/被停止（aborted/interrupted 等）：立即收尾（组未完成，按 aborted 语义封存已写条目）

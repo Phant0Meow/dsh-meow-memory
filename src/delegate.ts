@@ -178,7 +178,7 @@ export function startDelegateSubagent(
     inFlight: Set<string>
     sessionKey: string
     /** 任务收尾回调（含失败；用于 dream 组推进等）。 */
-    done?: (outcome: { stopReason: string }) => void
+    done?: (outcome: { stopReason: string; errorDetail?: string }) => void
     /** workspace 服务（可选）：子代理 settle 后把子会话加进归档集合（双保险隐藏——
      *  GUI 列表本就过滤 origin='subagent'，归档兜底未来过滤变化；子会话成果在
      *  memory.db，log 无保留价值，宿主无删除 API 故不物理删除）。 */
@@ -198,7 +198,7 @@ export function startDelegateSubagent(
   opts.inFlight.add(opts.sessionKey)
   void (async () => {
     let run: Awaited<ReturnType<SubagentsLike['start']>> | undefined
-    let outcome: { stopReason: string } | undefined
+    let outcome: { stopReason: string; errorDetail?: string } | undefined
     try {
       run = await svc.start('fork', {
         label: opts.label,
@@ -211,8 +211,11 @@ export function startDelegateSubagent(
       logger.info(`meow-memory: delegate "${opts.label}" finished (${result.stopReason})`)
       outcome = { stopReason: result.stopReason }
     } catch (e) {
-      logger.warn(`meow-memory: delegate "${opts.label}" failed: ${e instanceof Error ? e.message : String(e)}`)
-      outcome = { stopReason: 'error' }
+      const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e)
+      logger.warn(`meow-memory: delegate "${opts.label}" failed: ${detail}`)
+      // 错误详情透传 done 回调（2026-09-05：fork start 秒败 26ms 的排障需要——
+      // logger.warn 只进宿主控制台，dream-debug.log 拿不到异常内容）。
+      outcome = { stopReason: 'error', errorDetail: detail }
     } finally {
       // 子会话归档双保险（成果在 memory.db，log 无保留价值）：失败只 warn。
       if (opts.workspace?.archiveSession && run !== undefined) {
