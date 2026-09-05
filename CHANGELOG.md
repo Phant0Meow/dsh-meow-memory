@@ -1,5 +1,26 @@
 # Changelog
 
+### dream 防重复烧钱加固（2026-09-05 发版前增量）
+
+- **windowNeedsDream 6h 冷却期**：dream 收尾后即使 last_event_time 被意外事件刷新（打点/压缩重注入/未知 bug），6h 内绝不重复自动 dream——"标记失败→重复 dream"类风险的最后防线。手动触发（/dream、memory_dream）不经此判定；error 重试不受影响（releaseDream 不写 last_dream_time）。代价：用户真实活动后的自动 dream 最多推迟到收尾+6h（保守取舍）。
+- **插件自身消息不再刷新窗口活跃度**：dream/reflect 打点（【记忆整理标记】等）与 steer 指令消息（含 [meow-memory-dream]）的 user 帧不再 touchWindow——实证打点会把 last_event_time 顶成 dream 时刻：掩盖真实活跃度，且让子代理窗口被 dream 一次就"永远年轻"不过 24h。用户亲手发的消息（source.kind='user'）绝不判 marker，防引用标记文本误伤。
+- **memory_dream 工具入口子代理守卫**：delegate fork 的子代理模型误调 memory_dream 时拒绝执行（与 /dream 命令守卫同语义），不进 windows 表不留痕迹；主窗口正常路径不受影响。底层 startWindowDream 的手动豁免保留。
+
+### dream 失败语义：error 释放租约重试，不再永久吞 dream（2026-09-05 发版前增量）
+
+- done 回调三分：completed→advanceDream 推进；error→`db.releaseDream` 只清租约、不动 last_dream_time→下一检查周期自动重试（日志 `dream failed ... lease released, retry next check`）；aborted/interrupted→照旧 finalizeDream 封存。steer 路径 endReason='error' 同样 releaseDream。旧版非 completed 一律按 aborted 封存 = LLM 瞬态故障（open.bigmodel.cn 连接抖动 / 429）永久吞 dream——2026-09-04 整夜全灭事故根因。09-05 晚智谱 429 1113「余额不足或无可用资源包」事故中 11 连败全部正确重试、余额恢复后自动续上清积压，实战验证通过。
+- resume not-found 6h 进程级退避：双实例共享 windows 表互试对方会话恒 `'session not found'`，按周期重试纯属浪费+日志刷屏；失败后 6h 内静默跳过本实例 resume（进程重启清零，每窗口每 6h 只多试一次）。
+
+### dream 递归修复：子代理会话不是 dream 目标（2026-09-05 发版前增量）
+
+- **真机实证的 bug**：delegate fork 出的 dream/反思子代理会话（origin='subagent'）也产生事件 → 进 windows 表/windowIndex → 被 dream 扫描器当作待整理窗口 → dream 时再 fork 孙子代理 → 再进表 → 再被 dream……depth 无限套娃（真机链 8fbc5d59(depth=1)→2f47c15b(depth=2)→63dad87b(depth=3)）。09-05 晚智谱 429 期间 11 次自动 dream 全部打在这些子代理窗口上。
+- **修复两层**（猫猫拍板：主窗口主 session 负责 dream，dream 执行从主窗口 fork 子代理）：
+  - **治本（index.ts）**：`session/event` 里子代理会话（`session.header.origin==='subagent'`，与注入链同口径）不 touchWindow、不进 windowIndex——从源头不进 dream 清单；压缩信号处理不受影响。
+  - **防御（dream.ts）**：`dreamSweepOnce`（live agent）与 `resumeAndDream`（恢复链）跳过 `origin==='subagent'` / `delegationDepth>0`；命中记进程级缓存 `autoDreamSkipWindows`，后续周期连 agent 都不取。另实测发现 resume 子代理会话 resolve 但返回**无可用 header 的句柄**（主会话恒返回完整 agent）——该分支同样标缓存跳过，不再每周期空 resume。
+- **手动 /dream 与 memory_dream 不受影响**（手动=明确意愿）。已进 windows 表的子代理窗口行留存无害（24h 自然沉降 + index.ts 治本后不再新增）。
+- scheduleDream 循环体提取为 `dreamSweepOnce`（导出供测试；峰时抑制与全局检查门仍在定时器壳里，每轮仍最多 start 一个窗口）。
+- 新增测试 12 项：判定口径 5（origin / depth / 主会话 / GUI fork / 缺 header）+ sweep 子代理跳过 / 缓存命中 / resume 链跳过 / 不可恢复句柄跳过+缓存 / 主窗口不受影响 / 手动路径豁免。主套件 399 全绿。
+
 ## v0.23.0 (2026-08-30)
 
 ### 反思/梦境独立执行：fork 子代理委托（delegate.reflect / delegate.dream，默认关闭）

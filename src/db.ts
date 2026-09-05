@@ -487,6 +487,17 @@ export class MemoryDb {
       .run(time, sessionId)
   }
 
+  /** dream 失败释放：只清租约，**不动 last_dream_time**——窗口保持「待整理」状态，
+   *  下个检查周期 windowNeedsDream 仍成立即自动重试。
+   *  与 finishDream 的语义区分：finish=完成/用户中止（封存，last_dream_time=收尾时刻）；
+   *  release=执行失败（网络/服务瞬态故障，非用户意愿，2026-09-05 教训：把失败窗口
+   *  按 aborted 封存会让一次断网整夜吞掉所有窗口的 dream 且永不重试）。 */
+  releaseDream(sessionId: string): void {
+    this.db
+      .prepare(`UPDATE windows SET dream_owner = NULL, dream_started_at = NULL, dream_progress_at = NULL, dream_group_idx = NULL, dream_T = NULL WHERE session_id = ?`)
+      .run(sessionId)
+  }
+
   /** 是否有进行中/未收尾的 dream（租约存在，无论是否过期）。 */
   isDreamPending(sessionId: string): boolean {
     const row = this.db.prepare(`SELECT dream_owner FROM windows WHERE session_id = ?`).get(sessionId) as

@@ -28,7 +28,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { closeAllDbs, getDb, memoryDbPath } from './db.js'
-import { appendDelegateMarker, parseModelSpec, resolveSubagents, resolveWorkspace, startDelegateSubagent, type AgentOptionsSpec } from './delegate.js'
+import { appendDelegateMarker, parseModelSpec, resolveSubagents, resolveWorkspace, startDelegateSubagent, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
 
 import {
   abortDream,
@@ -573,20 +573,39 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           content?: Array<{ type?: string; text?: string }>
         } | undefined
         const src = data?.source
-        if (src?.kind === 'plugin' && src.plugin === 'meow-memory') {
+        // 插件自身消息识别（2026-09-05 扩大：原只认 source.kind='plugin'，漏掉两类——
+        // ①steer 模式 dream/reflect 指令消息（agent.steer 的 user 帧无 source，含
+        // [meow-memory-dream]/[meow-memory-reflect]）；②delegate 打点（session.append
+        // ('user/message') 无 source，含【记忆整理标记】等）——实证打点会 touchWindow
+        // 把 last_event_time 顶成 dream 时刻：掩盖真实活跃度，且 error 重试窗口被
+        // 反复刷新永不超 24h。用户亲手发的消息（source.kind='user'）绝不判 marker，
+        // 防引用标记文本误伤。命中 → 指令/打点：不 touchWindow 不刷新活跃度。
+        if (src?.kind !== 'user') {
           const msgText = (data?.content ?? [])
             .filter((b) => b.type === 'text' && typeof b.text === 'string')
             .map((b) => b.text ?? '')
             .join(' ')
-          if (msgText.includes(REFLECT_MARKER) || msgText.includes(DREAM_MARKER)) {
-            isPluginTurn.set(sid, true) // 反思/dream 指令轮
-            return // 指令消息本身也不刷新活跃度
+          if (
+            msgText.includes(REFLECT_MARKER) ||
+            msgText.includes(DREAM_MARKER) ||
+            msgText.includes(REFLECT_DELEGATE_MARKER) ||
+            msgText.includes(DREAM_DELEGATE_MARKER) ||
+            msgText.includes(REFLECT_DONE_DELEGATE_MARKER)
+          ) {
+            isPluginTurn.set(sid, true) // 反思/dream 指令轮或打点
+            return // 不刷新活跃度
           }
         }
       }
       if (isPluginTurn.get(sid)) return // 插件轮内：不 touchWindow
     }
     if (t !== 'user/message' && t !== 'turn/end' && t !== 'assistant/message' && t !== 'tool/result') return
+    // 子代理会话不进窗口表/windowIndex：origin==='subagent'（dsh 权威标记，与注入链
+    // 同口径）。子代理的记忆活动按归属语义记父窗口名下，自身不是 dream 目标——否则
+    // dream fork 出的子代理会话也成待 dream 窗口，dream→再进表→再 dream 递归套娃
+    // （2026-09-05 真机实证 8fbc5d59→2f47c15b→63dad87b，depth 无限增长）。
+    // 压缩信号处理在上方，不受此 return 影响。
+    if (session?.header?.origin === 'subagent') return
     if (typeof sid !== 'string' || typeof cwd !== 'string' || typeof event?.time !== 'number') return
     const now = Date.now()
     const last = lastWindowWrite.get(sid) ?? 0
@@ -762,6 +781,15 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       return
     }
     if (dreamTurn) {
+      if (endReason === 'error') {
+        // steer 模式 dream 轮执行失败（LLM/网络瞬态故障，非用户中止）：释放租约不封存，
+        // 下个检查周期自动重试（与 delegate 路径 done 回调的 error 分支同语义，
+        // 2026-09-05 教训：封存会让一次断网永久吞掉窗口的 dream）。
+        try {
+          if (wsTs && sidTs) getDb(wsTs, resolved.projectDir).releaseDream(sidTs)
+        } catch { /* 释放失败不阻塞（租约 30min 过期自愈兜底） */ }
+        return
+      }
       advanceDream(agent, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays) // dream 轮：推进下一组或收尾（含孤儿收尾）
       return
     }
@@ -1101,4 +1129,4 @@ export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectio
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition, setDreamDelegateEnv, type DreamLaunchFn, type DreamDelegateEnv } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition, setDreamDelegateEnv, isSubagentAgent, dreamSweepOnce, type DreamLaunchFn, type DreamDelegateEnv } from './dream.js'

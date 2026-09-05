@@ -40,6 +40,8 @@ import {
   windowNeedsDream,
   startWindowDream,
   resumeAndDream,
+  dreamSweepOnce,
+  isSubagentAgent,
   advanceDream,
   abortDream,
   recoverInterruptedDream,
@@ -140,7 +142,11 @@ dbW.touchWindow('win-1', ws, 1000)
 dbW.touchWindow('win-1', ws, 2000)
 check('window touch max time', dbW.getWindow('win-1')?.last_event_time === 2000)
 check('window needs dream (no dream yet)', windowNeedsDream({ last_event_time: Date.now(), last_dream_time: null }))
-check('window needs dream (new chat after dream)', windowNeedsDream({ last_event_time: Date.now(), last_dream_time: Date.now() - 1000 }))
+// 冷却期（2026-09-05）：dream 收尾后 6h 内即使有新活动也不重复自动 dream
+// （防"标记失败/意外刷新 last_event_time"类 bug 重复烧钱；error 重试不受影响——
+// releaseDream 不写 last_dream_time，走 last_dream_time=null 路径）
+check('window no dream (cooldown: new chat within 6h after dream)', windowNeedsDream({ last_event_time: Date.now(), last_dream_time: Date.now() - 1000 }) === false)
+check('window needs dream (cooldown expired: new chat 7h after dream)', windowNeedsDream({ last_event_time: Date.now() - 1000, last_dream_time: Date.now() - 7 * 3600_000 }))
 check('window no dream (dream after chat)', windowNeedsDream({ last_event_time: Date.now(), last_dream_time: Date.now() + 1000 }) === false)
 check('window no dream (older than 24h)', windowNeedsDream({ last_event_time: Date.now() - 25 * 3600_000, last_dream_time: null }) === false)
 
@@ -177,6 +183,12 @@ dbW.claimDream('win-1', 'o5', 1000, LEASE)
 dbW.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * LEASE, 'win-1')
 check('claimDream reclaims expired lease', dbW.claimDream('win-1', 'o6', 2000, LEASE) === true)
 check('getDreamLease reads reclaimed owner/T', (() => { const l = dbW.getDreamLease('win-1'); return l !== null && l.owner === 'o6' && l.T === 2000 })())
+// releaseDream（2026-09-05 error 重试语义）：只清租约，last_dream_time 不动
+dbW.finishDream('win-1', 5000)
+dbW.claimDream('win-1', 'o7', 1000, LEASE)
+dbW.releaseDream('win-1')
+check('releaseDream clears lease', dbW.isDreamPending('win-1') === false && dbW.getDreamLease('win-1') === null)
+check('releaseDream keeps last_dream_time', dbW.getWindow('win-1')?.last_dream_time === 5000)
 dbW.finishDream('win-1', 0)
 
 // 全局检查门：minIntervalMs 内只有一个调用方通过（防多实例/多定时器叠加重复检查）
@@ -223,6 +235,89 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   releaseResume()
   await Promise.all([p1, p2])
   check('resume: in-flight dedup (single resume call)', resumeCalls === 1)
+
+  // not-found 退避（2026-09-05）：跨实例/已删除窗口的 resume 永久失败，6h 内不再重试
+  const wsR4 = mkdtempSync(join(tmpdir(), 'mm-resume-backoff-'))
+  const dbR4 = getDb(wsR4, '.dsh-meow')
+  const widR4 = 'win-resume-backoff-1'
+  dbR4.touchWindow(widR4, wsR4, Date.now() - 4 * 3600_000)
+  dbR4.insert({ level: 'fact', content: 'not-found 退避窗口的记忆', project: 'dsh', source_session: widR4, created_at: 100 })
+  let resumeCalls4 = 0
+  const ctxR4 = { get: (name) => (name === 'agents' ? { resume: async () => { resumeCalls4++; throw new Error('session "win-resume-backoff-1" not found') } } : undefined) }
+  await resumeAndDream(ctxR4, widR4, wsR4, '.dsh-meow', undefined, cfgR)
+  check('resume: not-found degrades silently (no lease)', dbR4.getDreamLease(widR4) === null && resumeCalls4 === 1)
+  await resumeAndDream(ctxR4, widR4, wsR4, '.dsh-meow', undefined, cfgR)
+  check('resume: not-found backed off (no retry within window)', resumeCalls4 === 1)
+  dbR4.close()
+  rmSync(wsR4, { recursive: true, force: true })
+}
+
+// 递归 dream 修复（2026-09-05 猫猫拍板）：delegate fork 的子代理会话会进 windows 表，
+// 但 dream 只归主窗口——dream 子代理→再进表→再被 dream，depth 无限套娃（真机实证
+// 8fbc5d59→2f47c15b→63dad87b）。自动扫描跳过 origin=subagent；手动路径不受影响。
+{
+  // 判定函数口径（与 index.ts 注入链同源）：origin 权威 + depth 双保险；parentSession 不参与
+  check('isSubagentAgent: origin=subagent → true', isSubagentAgent({ session: { header: { origin: 'subagent' } } }) === true)
+  check('isSubagentAgent: depth>0 without origin → true', isSubagentAgent({ session: { header: { delegationDepth: 2 } } }) === true)
+  check('isSubagentAgent: main session (no origin/depth) → false', isSubagentAgent({ session: { header: { id: 'x' } } }) === false)
+  check('isSubagentAgent: GUI fork main session (parentSession only) → false', isSubagentAgent({ session: { header: { id: 'x', parentSession: 'p' } } }) === false)
+  check('isSubagentAgent: missing header → false', isSubagentAgent({}) === false)
+
+  const cfgS = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2 }
+  const wsS = mkdtempSync(join(tmpdir(), 'mm-subagent-'))
+  const dbS = getDb(wsS, '.dsh-meow')
+  const widS = 'win-subagent-1'
+  dbS.touchWindow(widS, wsS, Date.now() - 4 * 3600_000) // 空闲 4h，need=true
+  dbS.insert({ level: 'fact', content: '子代理窗口的记忆', project: 'dsh', source_session: widS, created_at: 100 })
+
+  // ① sweep 单轮：live agent 是子代理 → 不 start，且窗口进缓存（下轮连 agent 都不取）
+  const subAgent = { session: { header: { id: widS, origin: 'subagent', delegationDepth: 1 } }, steer: () => {} }
+  let getS = 0
+  const ctxS = { get: (name) => (name === 'agents' ? { get: () => { getS++; return subAgent } } : undefined) }
+  const winIndexS = new Map([[widS, wsS]])
+  dreamSweepOnce(ctxS, cfgS, '.dsh-meow', winIndexS)
+  check('sweep: subagent window not dreamed (no lease)', dbS.getDreamLease(widS) === null)
+  // ② 缓存命中：第二轮不再取 agent（无 resume/无重复判定开销）
+  dreamSweepOnce(ctxS, cfgS, '.dsh-meow', winIndexS)
+  check('sweep: subagent cache hit (agent fetched only once)', getS === 1)
+
+  // ③ resume 链：resume 成功但 header.origin=subagent → 不 start
+  const widS2 = 'win-subagent-2'
+  dbS.touchWindow(widS2, wsS, Date.now() - 4 * 3600_000)
+  dbS.insert({ level: 'fact', content: '子代理恢复窗口的记忆', project: 'dsh', source_session: widS2, created_at: 100 })
+  const ctxS2 = { get: (name) => (name === 'agents' ? { resume: async () => ({ session: { header: { id: widS2, origin: 'subagent' } } }) } : undefined) }
+  await resumeAndDream(ctxS2, widS2, wsS, '.dsh-meow', undefined, cfgS)
+  check('resume: subagent restored but not dreamed (no lease)', dbS.getDreamLease(widS2) === null)
+
+  // ③b resume 链：resume resolve 但 agent 无可用 header（真机实测=子代理会话的 resume
+  // 行为，主会话恒返回完整 agent）→ 不 start 且标缓存，下轮 sweep 直接跳过
+  const widS2b = 'win-subagent-2b'
+  dbS.touchWindow(widS2b, wsS, Date.now() - 4 * 3600_000)
+  dbS.insert({ level: 'fact', content: '不可恢复句柄窗口的记忆', project: 'dsh', source_session: widS2b, created_at: 100 })
+  let resumeCalls2b = 0
+  const ctxS2b = { get: (name) => (name === 'agents' ? { resume: async () => { resumeCalls2b++; return undefined } } : undefined) }
+  await resumeAndDream(ctxS2b, widS2b, wsS, '.dsh-meow', undefined, cfgS)
+  check('resume: unusable agent not dreamed (no lease)', dbS.getDreamLease(widS2b) === null)
+  const winIndexS2b = new Map([[widS2b, wsS]])
+  dreamSweepOnce(ctxS, cfgS, '.dsh-meow', winIndexS2b)
+  check('resume: unusable agent cached (sweep skips without resume)', resumeCalls2b === 1)
+
+  // ④ 主窗口不受影响：同库主窗口 agent（无 origin）正常 start
+  const widS3 = 'win-main-1'
+  dbS.touchWindow(widS3, wsS, Date.now() - 4 * 3600_000)
+  dbS.insert({ level: 'fact', content: '主窗口的记忆', project: 'dsh', source_session: widS3, created_at: 100 })
+  const mainAgent = { session: { header: { id: widS3 } }, steer: () => {} }
+  dreamSweepOnce({ get: (name) => (name === 'agents' ? { get: () => mainAgent } : undefined) }, cfgS, '.dsh-meow', new Map([[widS3, wsS]]))
+  check('sweep: main window still dreamed (lease held)', dbS.getDreamLease(widS3) !== null)
+
+  // ⑤ 手动路径豁免：startWindowDream 直呼（/dream、memory_dream 走这里）不被判定拦截
+  const steeredS = []
+  const manualAgent = { session: { header: { id: widS, origin: 'subagent' } }, steer: (m) => steeredS.push(m) }
+  startWindowDream({ get: () => undefined }, manualAgent, wsS, '.dsh-meow')
+  check('manual startWindowDream not blocked for subagent', steeredS.length === 1)
+
+  dbS.close()
+  rmSync(wsS, { recursive: true, force: true })
 }
 
 // dream 分轮结构：原子（project/fact/lesson）/ topic / 项目总结；本窗口建立 ∪ 提取过的记忆；project 小标题
@@ -555,6 +650,25 @@ const { ctx, tools, handlers } = makeCtx()
 await apply(ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
 check('seven tools registered', tools.length === 7 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project']
   .every((name) => tools.some((t) => t.name === name)), `got ${tools.map((t) => t.name).join(',')}`)
+
+// memory_dream 工具入口：子代理会话拒绝（与 /dream 命令守卫同语义——fork 播种父
+// 会话 turn，工具 schema 对子代理可见，误调在此拦下，不进 windows 表不留痕迹）。
+// 底层 startWindowDream 的手动豁免不受影响（见上方"manual startWindowDream"用例）。
+{
+  const wsT = mkdtempSync(join(tmpdir(), 'mm-dream-tool-'))
+  const dbT = getDb(wsT, '.dsh-meow')
+  const dreamToolT = tools.find((t) => t.name === 'memory_dream')
+  const subExec = { agent: { session: { header: { cwd: wsT, id: 'win-subagent-tool', origin: 'subagent' } } } }
+  const rSubTool = await dreamToolT.execute({}, subExec)
+  check('memory_dream tool rejects subagent session', rSubTool.ok === false && rSubTool.note.includes('子代理'), JSON.stringify(rSubTool))
+  check('memory_dream tool reject leaves no window/lease', dbT.getWindow('win-subagent-tool') === undefined && dbT.getDreamLease('win-subagent-tool') === null)
+  const mainExec = { agent: { session: { header: { cwd: wsT, id: 'win-main-tool' } } } }
+  const rMainTool = await dreamToolT.execute({}, mainExec)
+  check('memory_dream tool allows main window (dream starts, topic round)', rMainTool.ok === true && dbT.getDreamLease('win-main-tool') !== null, JSON.stringify(rMainTool))
+  dbT.finishDream('win-main-tool', Date.now()) // 清理：收尾不留悬挂租约
+  dbT.close()
+  rmSync(wsT, { recursive: true, force: true })
+}
 
 // 返回结果引导语：search 的 note 与 read 的渲染文本都提示可去聊天记录搜更多细节
 const searchTool = tools.find((t) => t.name === 'memory_search')
@@ -1545,7 +1659,8 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
     setDreamDelegateEnv(null)
   }
 
-  // 失败路径：组 2 error → 立即收尾（aborted），不再推进下一组。
+  // 失败路径：组 2 error → **释放租约不封存**（2026-09-05 改：LLM/网络瞬态故障不吞 dream，
+  // 下个检查周期重试），不推进下一组、不发 dreamed 信号；重试 startWindowDream 可重新抢占。
   // s-dd2 需有自己的条目（source_session='s-dd2'）凑出 ≥2 组（原子轮 + 恒触发的 topic 轮）。
   {
     dbDD.insert({ level: 'fact', content: 'delegate dream 错误路径条目 特异词dr', project: 'dsh', source_session: 's-dd2' })
@@ -1579,9 +1694,53 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
       gates2[0].release()
       await new Promise((r) => setTimeout(r, 0))
       check('dream delegate error path: group 2 launched', calls2.length === 2 && calls2[1].req.label === 'meow-memory dream 2/3', `calls=${calls2.length} labels=${calls2.map((c) => c.req.label).join(',')}`)
-      gates2[1].release()
+      gates2[1].release() // stopReason 'error'（模拟 LLM/网络瞬态故障）
       await new Promise((r) => setTimeout(r, 0))
-      check('dream delegate error path: error finalizes without next group', calls2.length === 2 && dreamed2.includes('s-dd2') && dbDD.getDreamLease('s-dd2') === null)
+      check('dream delegate error path: error releases lease without finalize',
+        calls2.length === 2 && dbDD.getDreamLease('s-dd2') === null &&
+        !(dbDD.getWindow('s-dd2').last_dream_time > 0) && !dreamed2.includes('s-dd2'))
+      // 重试：窗口仍待整理，重新 start 成功抢占并重启组 1
+      const ok3 = startWindowDream({ logger: { info: () => {}, warn: () => {} } }, agentDD2, wsDD, '.dsh-meow', (sid, st) => { if (st === 'dreamed') dreamed2.push(sid) })
+      check('dream delegate error path: retry re-claims and restarts group 1',
+        ok3 === true && calls2.length === 3 && calls2[2].req.label === 'meow-memory dream 1/3' && dbDD.getDreamLease('s-dd2') !== null,
+        `ok=${ok3} calls=${calls2.length}`)
+      // 清理：abortDream 收尾（用户中止语义：封存 last_dream_time）
+      abortDream(agentDD2, '.dsh-meow')
+      check('dream delegate error path: abort after retry finalizes', dbDD.getDreamLease('s-dd2') === null && dbDD.getWindow('s-dd2').last_dream_time > 0)
+      gates2[2].release() // 迟到的组 1 done（'completed'）：租约已清，advanceDream 应为 no-op
+      await new Promise((r) => setTimeout(r, 0))
+      check('dream delegate error path: late completed done is no-op', dbDD.getDreamLease('s-dd2') === null && calls2.length === 3)
+    } finally {
+      setDreamDelegateEnv(null)
+    }
+  }
+
+  // aborted 路径：组 1 stopReason='aborted'（用户中止）→ 照旧立即封存（stamped + dreamed 信号）
+  {
+    dbDD.insert({ level: 'fact', content: 'delegate dream 用户中止路径条目 特异词ds', project: 'dsh', source_session: 's-dd3' })
+    dbDD.touchWindow('s-dd3', wsDD, Date.now())
+    const calls3 = []
+    let release3
+    const subMock3 = {
+      start: (name, req) => {
+        calls3.push({ name, req })
+        return { id: `child3-${calls3.length}`, result: new Promise((res) => { release3 = () => res({ stopReason: 'aborted', output: [] }) }), dispose: async () => {} }
+      },
+    }
+    const dreamed3 = []
+    setDreamDelegateEnv({
+      logger: { info: () => {}, warn: () => {} },
+      ctx: { get: (name) => (name === 'subagents' ? subMock3 : undefined) },
+      signal: new AbortController().signal,
+      inFlight: new Set(),
+    })
+    try {
+      const agentDD3 = { session: { header: { cwd: wsDD, id: 's-dd3' } }, steer: () => {} }
+      const ok4 = startWindowDream({ logger: { info: () => {}, warn: () => {} } }, agentDD3, wsDD, '.dsh-meow', (sid, st) => { if (st === 'dreamed') dreamed3.push(sid) })
+      check('dream delegate aborted path: started', ok4 === true && calls3.length === 1)
+      release3()
+      await new Promise((r) => setTimeout(r, 0))
+      check('dream delegate aborted path: finalized as before', dreamed3.includes('s-dd3') && dbDD.getDreamLease('s-dd3') === null && dbDD.getWindow('s-dd3').last_dream_time > 0)
     } finally {
       setDreamDelegateEnv(null)
     }
