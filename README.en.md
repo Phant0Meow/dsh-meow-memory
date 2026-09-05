@@ -192,30 +192,18 @@ All fields are optional (profile patch or `cordis.patch.yml`). **You don't have 
       rulesReviewDays: 2    # stable rules whose updated_at is older than this many
                             # days are skipped in dream round 1 (anti-churn); 0 = off
     delegate:
-      reflect: false       # hand the reflection turn to a standalone fork subagent:
-                           # it inherits every completed turn of the main session
-                           # (tool results included) and runs in its own session,
-                           # writing nothing into the main session context;
-                           # false = spliced into the main session (legacy behavior)
-      dream: false         # run each dream group in a fork subagent: one child per
-                           # group, chained via the done callback; the lease state
-                           # machine / peak suppression / skip semantics unchanged
-      model: ''            # subagent model: empty = follow the main session route
-                           # (request prefix matches the main session's, so provider
-                           # prompt cache can hit); 'provider/model' sets both,
-                           # 'model' swaps the model only (provider inherited)
+      model: ''            # model override for memory work (optional): when set,
+                           # reflection turns and dream rounds automatically run on
+                           # this model and switch back to the main model afterwards;
+                           # 'provider/model' sets both, 'model' swaps the model only
+                           # (provider inherited); empty = always the main model
 ```
 
-### delegate: reflection & dream outside the main session context (optional)
+### Model override for memory work (optional)
 
-By default the reflection turn and each dream group are spliced into the main session (steer) — their prompts, the model's replies, and every tool call land in the main session log (the fold UI only hides them visually; the model's context still pays for them). `delegate.reflect` / `delegate.dream` hand the work to a **fork subagent**: the child is seeded with every completed turn of the main session (it sees everything so far, tool results included), does its memory work in its own session, and writes nothing back — the main conversation's context footprint and compaction rhythm are untouched.
+The reflection turn and each dream group always run in the main window (steer) — prompts, replies, and tool calls land in the main session log (the fold UI keeps them tidy). The standalone fork-subagent execution mode was removed in v0.24; there is no longer an "independent execution" switch.
 
-`delegate.model` also covers "use a different model for memory work" (a main session has one route per session, so the spliced approach cannot swap models per turn). The decision matrix:
-
-- **Follow the main model + delegate**: the child's request prefix matches the main session's, so the provider-side prompt cache can hit while the main session stays untouched;
-- **Swap the model**: setting `delegate.model` force-enables `reflect`/`dream` — a swapped-model request is an independent stream that cannot hit the main model's cache anyway, so occupying the main session's context would be pure loss.
-
-Three companion behaviors in delegate mode: ① the child session carries `origin='subagent'`, which the GUI session list never shows; after settling it is additionally added to the persistent archive set as a double guard; ② a very short plugin marker message (【记忆反思标记】/【记忆整理标记】, no model call) is appended to the main session log, so the main model knows memory work happened there and future runs treat the marker as the increment boundary; ③ a failed child run finalizes the window dream as aborted — entries already written are stamped as usual.
+To run memory work on a different (cheaper) model: with `delegate.model` set, every LLM request issued during reflection/dream turns gets its provider/model overridden via dsh's `agent/request` waterfall, and the main model takes over again once the turn ends — normal conversation and tool rounds are untouched. The implementation is stateless: each request is judged by whether the current turn carries a reflection/dream directive marker, so user aborts, crashes, and hot reloads can never leave a stuck "overridden" state.
 
 ### promptLang: prompt & retrieval language (important)
 

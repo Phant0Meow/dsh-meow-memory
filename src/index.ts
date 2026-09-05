@@ -28,7 +28,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { closeAllDbs, getDb, memoryDbPath } from './db.js'
-import { appendDelegateMarker, parseModelSpec, resolveSubagents, resolveWorkspace, startDelegateSubagent, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
+import { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
 
 import {
   abortDream,
@@ -40,7 +40,6 @@ import {
   noteActivity,
   registerLiveAgent,
   scheduleDream,
-  setDreamDelegateEnv,
   shortSessionId,
   type DreamConfig,
 } from './dream.js'
@@ -176,18 +175,13 @@ export const Config = z.object({
       rulesReviewDays: z.number().min(0).default(DEFAULT_RULES_REVIEW_DAYS),
     })
     .default({}),
-  /** 反思/梦境的独立执行（fork 子代理，不占主会话上下文）。 */
+  /** 整理任务的模型（可选换模型）。反思/梦境永远在主窗口执行（steer）——配置了
+   *  model 时仅在这两类轮的请求上经 agent/request waterfall 覆盖 provider/model，
+   *  轮次结束自动换回主模型；不再提供"独立执行"开关（v0.24 移除）。 */
   delegate: z
     .object({
-      /** 反思轮交给 fork 子代理：继承主会话全部已完成 turn（含工具结果），零写主 log，
-       *  不占主会话上下文。false = steer 进主会话（旧行为）。 */
-      reflect: z.boolean().default(false),
-      /** dream 各组交给 fork 子代理：每组一个子代理（继承主会话已完成 turn），
-       *  done 回调链式推进，DB 租约状态机不变。false = steer 进主会话（旧行为）。 */
-      dream: z.boolean().default(false),
-      /** 子代理模型：留空 = 跟随主会话 route（请求前缀与主会话同源，provider prompt
-       *  cache 可命中）；'provider/model'（dsh route 格式）指定 provider+model，
-       *  'model' 只换 model（provider 继承父）。 */
+      /** 反思/梦境轮换用模型：留空 = 全程主模型；'provider/model'（dsh route 格式）
+       *  指定 provider+model，'model' 只换 model（provider 继承主会话）。 */
       model: z.string().required(false),
     })
     .default({}),
@@ -220,7 +214,7 @@ export const CONFIG_DEFAULTS = {
     timeZone: 'Asia/Shanghai',
     rulesReviewDays: DEFAULT_RULES_REVIEW_DAYS,
   },
-  delegate: { reflect: false, dream: false, model: '' },
+  delegate: { model: '' },
 }
 
 /** 单个时间点（suppressWindows 的 start/end）。 */
@@ -278,8 +272,8 @@ export function validateConfigUserLayer(value: unknown): void {
   if (dg !== undefined) {
     if (dg === null || typeof dg !== 'object' || Array.isArray(dg)) throw new Error('delegate 必须是对象')
     const ddg = dg as Record<string, unknown>
-    if (ddg.reflect !== undefined && typeof ddg.reflect !== 'boolean') throw new Error('delegate.reflect 必须是布尔')
-    if (ddg.dream !== undefined && typeof ddg.dream !== 'boolean') throw new Error('delegate.dream 必须是布尔')
+    // v0.24 移除 delegate.reflect/dream（独立执行不再可选）；历史 settings.yaml
+    // user 层里残留的这两个键只忽略不报错（手编配置宽容，读取方不再消费）。
     if (ddg.model !== undefined && typeof ddg.model !== 'string') throw new Error('delegate.model 必须是字符串')
   }
 }
@@ -315,7 +309,7 @@ interface ResolvedConfig {
   /** undefined = 用户未配置（首次设置引导的触发信号）；运行时语言兜底 zh。 */
   promptLang: string | undefined
   dream: DreamConfig
-  delegate: { reflect: boolean; dream: boolean; modelSpec: AgentOptionsSpec | undefined }
+  delegate: { modelSpec: AgentOptionsSpec | undefined }
 }
 
 function resolveConfig(config: unknown): ResolvedConfig {
@@ -341,16 +335,9 @@ function resolveConfig(config: unknown): ResolvedConfig {
       rulesReviewDays: d.rulesReviewDays ?? DEFAULT_RULES_REVIEW_DAYS,
     },
     delegate: (() => {
-      // 换模型（modelSpec 存在）⇒ 强制 delegate：换模型的请求是独立流，命不中主模型
-      // 的缓存链，此时占主会话上下文纯亏（猫猫拍板 2026-09-02：换模型必须不加入上下文；
-      // 主模型才允许用户在拼接（持续命中缓存）/独立（零占用）之间选）。
-      const modelSpec = parseModelSpec(dg.model)
-      const forced = modelSpec !== undefined
-      return {
-        reflect: forced ? true : (dg.reflect ?? false),
-        dream: forced ? true : (dg.dream ?? false),
-        modelSpec,
-      }
+      // 反思/梦境永远 steer（主窗口执行，v0.24 拍板）；modelSpec 仅供 agent/request
+      // waterfall 在插件轮请求上覆盖模型（轮次结束自动换回主模型）。
+      return { modelSpec: parseModelSpec(dg.model) }
     })(),
   }
 }
@@ -397,6 +384,37 @@ function wasDreamTurn(events: readonly unknown[]): boolean {
     if (e?.type === 'user/message' && e.data?.source?.kind === 'plugin' && e.data.source.plugin === 'meow-memory') {
       if ((e.data.content ?? []).some((b) => b.type === 'text' && b.text?.includes(DREAM_MARKER))) return true
     }
+  }
+  return false
+}
+
+/**
+ * 当前 turn 是否为 meow-memory 的反思/梦境轮（换模型覆盖判定，agent/request 用）。
+ * 判定口径与事件链的插件消息识别一致：最后一个 turn/start 之后的 user/message 帧，
+ * source.kind !== 'user'（用户亲手发的消息绝不判 marker，防引用标记文本误伤）且
+ * 文本含 [meow-memory-reflect] / [meow-memory-dream]。steer 指令消息在请求发出前
+ * 已落 log（agent-loop：pre-step decision → append user/message → step/buildRequest），
+ * 因此请求时判定读到的数据完备；轮次结束不再 steer，下个 turn 无 marker → 自动
+ * 换回主模型，无需任何状态清理。
+ */
+export function isMemoryTaskTurn(events: readonly unknown[]): boolean {
+  let startIdx = -1
+  for (let i = events.length - 1; i >= 0; i--) {
+    if ((events[i] as { type?: string })?.type === 'turn/start') {
+      startIdx = i
+      break
+    }
+  }
+  if (startIdx < 0) return false
+  for (let i = startIdx; i < events.length; i++) {
+    const e = events[i] as { type?: string; data?: { source?: { kind?: string }; content?: Array<{ type?: string; text?: string }> } }
+    if (e?.type !== 'user/message') continue
+    if (e.data?.source?.kind === 'user') continue
+    const text = (e.data?.content ?? [])
+      .filter((b) => b.type === 'text' && typeof b.text === 'string')
+      .map((b) => b.text ?? '')
+      .join(' ')
+    if (text.includes(REFLECT_MARKER) || text.includes(DREAM_MARKER)) return true
   }
   return false
 }
@@ -488,37 +506,6 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays))
   if (typeof disposeDreamTool === 'function') toolDisposers.push(disposeDreamTool)
   ctx.logger.info('meow-memory: memory_remember/search/read/update + memory_dream registered')
-
-  // delegate（fork 子代理）状态：同会话防重入 + 插件卸载时中断 in-flight 子代理
-  //（热重载/卸载时 fiber dispose → abort；子代理内部 catch 记日志自清 inFlight）。
-  // ⚠️ dispose 只 abort、不清 dreamDelegateEnv（2026-09-04 竞态修复）：热重载时旧
-  // fiber 的 async dispose 与新 fiber 的 applyInner 并发，旧 dispose 的清 env 晚于
-  // 新 apply 的 set → env 被清成 null → dream 静默回退 steer（真机踩坑：sleep 窗口
-  // 自动 dream 三轮落主会话上下文，dream-debug.log 'dream start' 无 delegated 后缀）。
-  // env 的最终归属由下方 applyInner 同步决定（开=设新值 / 关=显式 null）；卸载后
-  // env 残留但 dream 触发链（定时器/命令）已随 fiber 消失，无调用方——安全。
-  const reflectInFlight = new Set<string>()
-  const delegateAbort = new AbortController()
-  ;(ctx as { effect?: (fn: unknown, name?: string) => unknown }).effect?.(() => async () => {
-    delegateAbort.abort()
-  }, 'meow-memory delegate lifecycle')
-  setDreamDelegateEnv(resolved.delegate.dream
-    ? {
-        // dream 组执行体换成 fork 子代理：每组一个子代理（播种主会话已完成 turn），
-        // done 回调链式推进；租约状态机/峰时抑制/skip 语义全部不变。
-        // subagents/workspace 不能在 apply 期解析：此刻服务尚未启动，ctx.get 拿不到、
-        // 直取属性直接抛 without inject（真机踩坑 2026-09-03，炸掉插件树加载）——
-        // 只存 ctx，delegateLaunchFor 每次起组时现场解析（那时 host 已就绪）。
-        logger: ctx.logger,
-        ctx,
-        signal: delegateAbort.signal,
-        inFlight: new Set<string>(),
-        modelSpec: resolved.delegate.modelSpec,
-      }
-    : null)
-  if (resolved.delegate.dream) {
-    ctx.logger.info('meow-memory: dream delegated to fork subagents')
-  }
 
   // 记忆系统手册挂进 system prompt（静态文本 → KV 缓存友好；order 130 = 工具指南区间末尾，
   // 与各 tool:* 说明（100–116）列在一起，不独占开头）。
@@ -803,35 +790,38 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     if (lastToolName !== undefined && lastToolName.startsWith('memory_')) return // 已主动记忆
     if (consecutiveToolSteps(sessionEventsOf(agent.session)) < resolved.reflectTurns) return // 单任务内连续工具 step 不足
     const message = buildReflectMessage(ws, turnText, resolved.projectDir)
-    if (resolved.delegate.reflect) {
-      // fork 子代理执行（不占主会话上下文；steer 无法单轮换模型，delegate.model 是
-      // 唯一换模型路径）。in-flight 防重入：同会话上一轮反思未结束前不重复触发。
-      // 服务不可用回退 steer（功能降级而非消失）。
-      const outcome = startDelegateSubagent(ctx.logger, resolveSubagents(ctx), {
-        parent: agent,
-        promptText: message.content.map((b) => (b.type === 'text' ? b.text : '')).join(''),
-        label: 'meow-memory reflect',
-        modelSpec: resolved.delegate.modelSpec,
-        signal: delegateAbort.signal,
-        inFlight: reflectInFlight,
-        sessionKey: sidTs,
-        workspace: resolveWorkspace(ctx),
-        // 完成打点：client 气泡「进行中→已完成」的翻转信号（settle 后追加，不出气泡）。
-        done: () => appendDelegateMarker(agent, 'reflect-done'),
-      })
-      if (outcome === 'started') {
-        appendDelegateMarker(agent, 'reflect')
-        ctx.logger.info(`meow-memory: reflect delegated to fork subagent after ${resolved.reflectTurns}+ tool turns`)
-      } else if (outcome === 'unavailable') {
-        agent.steer(message)
-        ctx.logger.info('meow-memory: reflect steered (delegate unavailable, fell back)')
-      } // 'in-flight'：已有反思在跑，静默跳过
-    } else {
-      agent.steer(message)
-      ctx.logger.info(`meow-memory: reflect steered after ${resolved.reflectTurns}+ tool turns`)
-    }
+    // 反思永远 steer 进主会话（v0.24 拍板：独立执行已移除）。换模型由下方
+    // agent/request waterfall 承接——本 turn 带 REFLECT_MARKER 时自动覆盖模型。
+    agent.steer(message)
+    ctx.logger.info(`meow-memory: reflect steered after ${resolved.reflectTurns}+ tool turns`)
     if (Date.now() - t0 > 20) perf(`turn-stopping slow ${Date.now() - t0}ms`)
   })
+
+  // 2.5) 整理任务换模型（agent/request waterfall，dsh 官方单请求模型覆盖扩展点）：
+  //   配置了 delegate.model 时，本会话「反思轮/梦境轮」的请求把 provider/model 覆盖为
+  //   配置值，其余请求（正常对话/工具轮）原样放行——触发前换上、轮次结束自动换回，
+  //   无状态：判定=当前 turn 的指令消息是否带 [meow-memory-reflect]/[meow-memory-dream]
+  //   文本标记（steer 指令消息在请求前已落 log，agent-loop L554 实证；与 wasDreamTurn/
+  //   isPluginTurn 同口径），不存在需要清理的"覆盖中"状态——用户中止/崩溃/热重载
+  //   都不留脏覆盖。
+  // waterfall 契约：listener 必须 return 最终 config（不改也要透传 next() 结果）。
+  if (resolved.delegate.modelSpec !== undefined) {
+    const spec = resolved.delegate.modelSpec
+    ctx.on('agent/request', async (payload: { agent?: { session?: { header?: SessionHeaderLike } } }, next: () => Promise<unknown>) => {
+      const config = await next() as { provider?: string; model?: string }
+      const agent = payload?.agent
+      // 子代理请求不覆盖（fork 子代理已不再由本插件产生；GUI 手动 fork 的照常放行）
+      if (agent === undefined || agent.session?.header?.origin === 'subagent') return config
+      if (!isMemoryTaskTurn(sessionEventsOf(agent.session as never))) return config
+      ctx.logger.info(`meow-memory: memory task turn → model override ${spec.provider ?? '(inherit)'}/${spec.model ?? ''}`)
+      return {
+        ...config,
+        ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
+        ...(spec.model !== undefined ? { model: spec.model } : {}),
+      }
+    })
+    ctx.logger.info(`meow-memory: model override armed for reflect/dream turns (${spec.provider ?? '(inherit)'}/${spec.model ?? ''})`)
+  }
 
   // 3) 空闲整理（按窗口；windowIndex 记录 sessionId → workspace）。
   const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex, signalDreamState)
@@ -1121,7 +1111,7 @@ function persistWindowIndex(): void {
 
 // re-export 供测试/调试/其他插件
 export { PLUGIN_SOURCE, REFLECT_MARKER }
-export { appendDelegateMarker, buildDelegateMarkerMessage, parseModelSpec, resolveSubagents, resolveWorkspace, startDelegateSubagent, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } from './delegate.js'
+export { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } from './delegate.js'
 export { collectDreamStates } from './dream-signal.js'
 export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, globalProjectMarker, GLOBAL_PROJECT_CANON } from './db.js'
 export { migrateLegacy } from './migrate.js'
@@ -1129,4 +1119,4 @@ export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectio
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition, setDreamDelegateEnv, isSubagentAgent, dreamSweepOnce, type DreamLaunchFn, type DreamDelegateEnv } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'

@@ -1393,7 +1393,7 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
 
 // ── 设置页数据层：mergeConfigLayer（user 层字段级覆盖+子对象浅合并）/ validateConfigUserLayer ──
 {
-  const patch = { enabled: true, hitTopK: 2, dream: { enabled: true, idleMinutes: 180, timeZone: 'UTC' }, delegate: { reflect: false, dream: false, model: '' } }
+  const patch = { enabled: true, hitTopK: 2, dream: { enabled: true, idleMinutes: 180, timeZone: 'UTC' }, delegate: { model: '' } }
   const merged = mergeConfigLayer(patch, { hitTopK: 5, dream: { idleMinutes: 60 } })
   check('settings merge: top-level field overridden', merged.hitTopK === 5 && merged.enabled === true)
   check('settings merge: dream sub-fields shallow-merged (patch keys kept)', merged.dream.enabled === true && merged.dream.idleMinutes === 60 && merged.dream.timeZone === 'UTC')
@@ -1405,132 +1405,57 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   }
   check('settings validate: bool/type violations rejected', bad({ enabled: 'yes' }) && bad({ hitTopK: 'many' }) && bad({ dream: { timeZone: 8 } }) && bad({ delegate: { model: 7 } }))
   check('settings validate: bad suppressWindows rejected', bad({ dream: { suppressWindows: [{ start: '9点', end: '12点' }] } }) && bad({ dream: { suppressWindows: '09:00-12:00' } }))
+  // v0.24：delegate.reflect/dream 已移除——历史 settings.yaml user 层残留键宽容（忽略不报错）
+  check('settings validate: legacy delegate.reflect/dream keys tolerated', !bad({ delegate: { reflect: false, dream: true, model: '' } }))
 }
 
-// delegate.reflect=true：不 steer，起 fork 子代理 + agentOptions 模型覆盖
+// 反思永远 steer（v0.24 拍板：独立执行移除，配置了 model 也不 fork）
 {
-  const calls = []
-  let release
-  const gate = new Promise((r) => { release = r })
-  const subMock = {
-    start: (name, req) => {
-      calls.push({ name, req })
-      return { id: 'child-1', result: gate.then(() => ({ stopReason: 'completed', output: [] })), dispose: async () => {} }
-    },
-  }
-  const d = makeCtx(subMock)
-  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { reflect: true, model: 'prov/main' } })
-  const dStop = d.handlers['agent/turn-stopping']
-  const dSteered = []
-  const dAgent = { session: { header: { cwd: ws, id: 's-del' }, events: sevenSteps }, steer: (m) => dSteered.push(m) }
-  dStop({ agent: dAgent, turn: 1, signal: new AbortController().signal })
-  check('delegate: fork subagent started, not steered', calls.length === 1 && dSteered.length === 0)
-  check('delegate: provider name = fork', calls[0]?.name === 'fork')
-  check('delegate: agentOptions overrides provider+model', JSON.stringify(calls[0]?.req.agentOptions) === JSON.stringify({ provider: 'prov', model: 'main' }))
-  check('delegate: prompt carries reflect message', calls[0]?.req.prompt?.[0]?.text.includes('记忆反思任务'))
-  check('delegate: label set', calls[0]?.req.label === 'meow-memory reflect')
-  // in-flight 防重入：结果未 settle 前再触发 → 不重复 start
-  dStop({ agent: dAgent, turn: 2, signal: new AbortController().signal })
-  check('delegate: in-flight suppresses second trigger', calls.length === 1)
-  // settle 后 inFlight 清除 → 可再次触发
-  release()
-  await new Promise((r) => setTimeout(r, 0))
-  dStop({ agent: dAgent, turn: 3, signal: new AbortController().signal })
-  check('delegate: settled run clears in-flight', calls.length === 2)
-}
-
-// delegate.reflect=true 无 model：agentOptions 缺省（继承父 route = 缓存命中形态）
-{
-  const calls = []
-  const subMock = {
-    start: (name, req) => {
-      calls.push({ name, req })
-      return { id: 'child-2', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} }
-    },
-  }
-  const d = makeCtx(subMock)
-  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { reflect: true } })
-  d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-del2' }, events: sevenSteps } }, steer: () => {} }, { turn: 1, signal: new AbortController().signal })
-  check('delegate: no model → no agentOptions (inherit parent route)', calls.length === 1 && calls[0].req.agentOptions === undefined)
-}
-
-// delegate 服务不可用 → 回退 steer（功能降级而非消失）
-{
-  const d = makeCtx(null)
-  delete d.ctx.subagents
-  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { reflect: true } })
-  const fSteered = []
-  d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-del3' }, events: sevenSteps }, steer: (m) => fSteered.push(m) } }, { turn: 1, signal: new AbortController().signal })
-  check('delegate: unavailable falls back to steer', fSteered.length === 1 && fSteered[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
-}
-
-// delegate 无 model 配置时 Config 默认关闭 → steer 现状（agentD 系列已覆盖，此处防回归断言 delegate 缺省）
-{
-  const d = makeCtx()
-  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
-  const calls = []
-  d.ctx.subagents = { start: (name, req) => { calls.push({ name, req }); return { id: 'x', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} } } }
-  const gSteered = []
-  d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-del4' }, events: sevenSteps }, steer: (m) => gSteered.push(m) } }, { turn: 1, signal: new AbortController().signal })
-  check('delegate: default off → steer unchanged, subagents untouched', gSteered.length === 1 && calls.length === 0)
-}
-
-// 换模型强制 delegate（猫猫拍板：换模型缓存命中无意义，必须不占主会话上下文）
-{
-  const { setDreamDelegateEnv } = await import('./lib/index.js')
   const calls = []
   const d = makeCtx({ start: (name, req) => { calls.push({ name, req }); return { id: 'c', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} } } })
-  try {
-    await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'cheap/m' } })
-    const fSteered = []
-    d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-forced' }, events: sevenSteps }, steer: (m) => fSteered.push(m) } }, { turn: 1, signal: new AbortController().signal })
-    check('delegate: model set forces delegate without explicit reflect', calls.length === 1 && fSteered.length === 0)
-  } finally {
-    setDreamDelegateEnv(null) // mock ctx.effect 不执行清理，手动清模块级 env 防泄漏到 /dream 用例
-  }
+  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
+  const dSteered = []
+  d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-steer-always' }, events: sevenSteps }, steer: (m) => dSteered.push(m) } }, { turn: 1, signal: new AbortController().signal })
+  check('reflect: always steered even with model configured', dSteered.length === 1 && dSteered[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
+  check('reflect: fork subagents never started', calls.length === 0)
 }
 
-// 子会话归档双保险：settle 后 workspace.archiveSession(childId) 被调
+// 换模型（v0.24）：agent/request waterfall 在反思/梦境轮覆盖 provider/model，其余请求放行
 {
-  const { setDreamDelegateEnv } = await import('./lib/index.js')
-  const archived = []
-  const released = []
-  const d = makeCtx({
-    start: () => {
-      let release
-      const p = new Promise((res) => { release = res })
-      released.push(release)
-      return { id: 'child-arch', result: p.then(() => ({ stopReason: 'completed', output: [] })), dispose: async () => {} }
-    },
-  })
-  try {
-    d.ctx.get = (name) => (name === 'workspace' ? { archiveSession: (id) => archived.push(id) } : undefined)
-    await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { reflect: true } })
-    d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-arch' }, events: sevenSteps }, steer: () => {} } }, { turn: 1, signal: new AbortController().signal })
-    check('delegate: archive not called before settle', archived.length === 0)
-    released[0]()
-    await new Promise((r) => setTimeout(r, 0))
-    check('delegate: workspace.archiveSession(childId) after settle', archived.includes('child-arch'))
-  } finally {
-    setDreamDelegateEnv(null)
-  }
+  const d = makeCtx()
+  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
+  const reqHandler = d.handlers['agent/request']
+  check('model override: agent/request waterfall registered when model set', typeof reqHandler === 'function')
+  const seed = async () => ({ provider: 'base', model: 'base-model' })
+  // 反思轮（turn 内带 [meow-memory-reflect] 指令消息）→ 覆盖
+  const reflectEvents = [events.turnStart(), { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-reflect] 反思任务' }] } }]
+  const out1 = await reqHandler({ agent: { session: { header: { cwd: ws, id: 's-ovr-1' }, events: reflectEvents } }, turn: 1, step: 1, signal: new AbortController().signal }, seed)
+  check('model override: reflect turn swaps provider+model', out1.provider === 'prov' && out1.model === 'main', JSON.stringify(out1))
+  // 梦境轮 → 覆盖
+  const dreamEvents = [events.turnStart(), { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-dream] 梦境整理' }] } }]
+  const out2 = await reqHandler({ agent: { session: { header: { cwd: ws, id: 's-ovr-2' }, events: dreamEvents } }, turn: 2, step: 1, signal: new AbortController().signal }, seed)
+  check('model override: dream turn swaps model', out2.provider === 'prov' && out2.model === 'main')
+  // 普通对话轮 → 原样放行（自动换回主模型的形态）
+  const out3 = await reqHandler({ agent: { session: { header: { cwd: ws, id: 's-ovr-3' }, events: [events.turnStart(), events.userMsg('你好')] } }, turn: 3, step: 1, signal: new AbortController().signal }, seed)
+  check('model override: normal turn untouched', out3.provider === 'base' && out3.model === 'base-model')
+  // 用户消息引用标记文本 → 不误伤（source.kind='user' 绝不判 marker）
+  const out4 = await reqHandler({ agent: { session: { header: { cwd: ws, id: 's-ovr-4' }, events: [events.turnStart(), events.userMsg('帮我看看 [meow-memory-dream] 这个标记是什么')] } }, turn: 4, step: 1, signal: new AbortController().signal }, seed)
+  check('model override: user-quoted marker not overridden', out4.provider === 'base' && out4.model === 'base-model')
+  // 子代理请求 → 不覆盖
+  const out5 = await reqHandler({ agent: { session: { header: { cwd: ws, id: 's-ovr-5', origin: 'subagent' }, events: reflectEvents } }, turn: 5, step: 1, signal: new AbortController().signal }, seed)
+  check('model override: subagent request untouched', out5.provider === 'base' && out5.model === 'base-model')
+  // 未配置模型 → 完全不注册 waterfall（零开销路径）
+  const d2 = makeCtx()
+  await apply(d2.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+  check('model override: no model → no waterfall registered', d2.handlers['agent/request'] === undefined)
 }
 
-// 主会话打点：delegate started 后 session.append 收到带【记忆反思标记】的 user/message
+// isMemoryTaskTurn 单元：跨 turn 边界（marker 只认当前 turn，上一轮的 marker 不残留）
 {
-  const { setDreamDelegateEnv } = await import('./lib/index.js')
-  const appended = []
-  const d = makeCtx({ start: () => ({ id: 'c2', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} }) })
-  try {
-    await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { reflect: true } })
-    const mAgent = { session: { header: { cwd: ws, id: 's-marker' }, events: sevenSteps, append: (type, data) => appended.push({ type, data }) }, steer: () => {} }
-    d.handlers['agent/turn-stopping']({ agent: mAgent, turn: 1, signal: new AbortController().signal })
-    check('delegate: marker appended to main session log', appended.length === 1 && appended[0].type === 'user/message' &&
-      appended[0].data.content.some((b) => b.type === 'text' && b.text.includes('【记忆反思标记】')) &&
-      appended[0].data.source.kind === 'plugin' && appended[0].data.source.form === 'notice')
-  } finally {
-    setDreamDelegateEnv(null)
-  }
+  const { isMemoryTaskTurn } = await import('./lib/index.js')
+  const prevTurnReflect = [events.turnStart(), { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-reflect] 上一轮反思' }] } }, { type: 'turn/end', data: {} }, events.turnStart(), events.userMsg('新一轮正常对话')]
+  check('isMemoryTaskTurn: marker from previous turn does not leak', isMemoryTaskTurn(prevTurnReflect) === false)
+  check('isMemoryTaskTurn: no turn/start → false', isMemoryTaskTurn([{ type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-dream] x' }] } }]) === false)
 }
 
 // ═══════════════════════ /dream 用户命令（dsh 命令平面） ═══════════════════════
@@ -1603,152 +1528,6 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
     JSON.stringify(registeredC.map((d) => d.name)))
 }
 
-// ═══════════════════════ delegate.dream：fork 子代理执行 dream 组链 ═══════════════════════
-{
-  const { setDreamDelegateEnv } = await import('./lib/index.js')
-  const wsDD = mkdtempSync(join(tmpdir(), 'mm-dd-'))
-  const dbDD = getDb(wsDD, '.dsh-meow')
-  dbDD.insert({ level: 'fact', content: 'delegate dream 测试原子条目 特异词dq', project: 'dsh', source_session: 's-dd' })
-  dbDD.insert({ level: 'topic', content: '【起因】委托dream测试【经过】链式推进【结果】验证', title: '委托dream', goal: '验证组推进', source_session: 's-dd' })
-  dbDD.insert({ level: 'fact', content: 'delegate dream 项目总结素材 特异词dp', project: 'femwa', source_session: 's-dd' })
-  dbDD.touchWindow('s-dd', wsDD, Date.now())
-
-  const calls = []
-  const gates = []
-  const makeGate = (stop) => {
-    let release
-    const p = new Promise((res) => { release = res })
-    gates.push({ release })
-    return p.then(() => ({ stopReason: stop, output: [] }))
-  }
-  const subMock = {
-    start: (name, req) => {
-      calls.push({ name, req })
-      return { id: `child-${calls.length}`, result: makeGate('completed'), dispose: async () => {} }
-    },
-  }
-  const dreamed = []
-  const dreamAbort = new AbortController()
-  setDreamDelegateEnv({
-    logger: { info: () => {}, warn: () => {} },
-    // 2026-09-03 契约：env 传 ctx 现场解析（apply 期服务未就绪的坑），不再固化 subagents。
-    ctx: { get: (name) => (name === 'subagents' ? subMock : undefined) },
-    signal: dreamAbort.signal,
-    inFlight: new Set(),
-    modelSpec: { provider: 'prov', model: 'm1' },
-  })
-  try {
-    // 组链：start（组1）→ release → 组2 → release → 组3 → release → 收尾
-    const agentDD = { session: { header: { cwd: wsDD, id: 's-dd' } }, steer: () => { throw new Error('delegate mode must not steer') } }
-    const ok = startWindowDream({ logger: { info: () => {}, warn: () => {} } }, agentDD, wsDD, '.dsh-meow', (sid, st) => { if (st === 'dreamed') dreamed.push(sid) })
-    check('dream delegate: started without steering', ok === true && calls.length === 1 && dbDD.getDreamLease('s-dd') !== null)
-    check('dream delegate: fork provider + model override + label', calls[0].name === 'fork' &&
-      JSON.stringify(calls[0].req.agentOptions) === JSON.stringify({ provider: 'prov', model: 'm1' }) &&
-      calls[0].req.label === 'meow-memory dream 1/3' && calls[0].req.prompt[0].text.includes('[meow-memory-dream]'))
-    gates[0].release()
-    await new Promise((r) => setTimeout(r, 0))
-    check('dream delegate: done callback advances to group 2', calls.length === 2 && calls[1].req.label === 'meow-memory dream 2/3')
-    gates[1].release()
-    await new Promise((r) => setTimeout(r, 0))
-    check('dream delegate: advances to group 3', calls.length === 3 && calls[2].req.label === 'meow-memory dream 3/3')
-    gates[2].release()
-    await new Promise((r) => setTimeout(r, 0))
-    check('dream delegate: final group finalizes (lease cleared + dreamed signal)', dreamed.includes('s-dd') && dbDD.getDreamLease('s-dd') === null)
-    check('dream delegate: last_dream_time stamped', dbDD.getWindow('s-dd').last_dream_time > 0)
-  } finally {
-    setDreamDelegateEnv(null)
-  }
-
-  // 失败路径：组 2 error → **释放租约不封存**（2026-09-05 改：LLM/网络瞬态故障不吞 dream，
-  // 下个检查周期重试），不推进下一组、不发 dreamed 信号；重试 startWindowDream 可重新抢占。
-  // s-dd2 需有自己的条目（source_session='s-dd2'）凑出 ≥2 组（原子轮 + 恒触发的 topic 轮）。
-  {
-    dbDD.insert({ level: 'fact', content: 'delegate dream 错误路径条目 特异词dr', project: 'dsh', source_session: 's-dd2' })
-    dbDD.touchWindow('s-dd2', wsDD, Date.now())
-    const calls2 = []
-    const gates2 = []
-    const makeGate2 = (stop) => {
-      let release
-      const p = new Promise((res) => { release = res })
-      gates2.push({ release })
-      return p.then(() => ({ stopReason: stop, output: [] }))
-    }
-    const subMock2 = {
-      start: (name, req) => {
-        calls2.push({ name, req })
-        return { id: `child2-${calls2.length}`, result: makeGate2(calls2.length === 2 ? 'error' : 'completed'), dispose: async () => {} }
-      },
-    }
-    const dreamed2 = []
-    setDreamDelegateEnv({
-      logger: { info: () => {}, warn: () => {} },
-      // 同上：ctx 现场解析契约。
-      ctx: { get: (name) => (name === 'subagents' ? subMock2 : undefined) },
-      signal: new AbortController().signal,
-      inFlight: new Set(),
-    })
-    try {
-      const agentDD2 = { session: { header: { cwd: wsDD, id: 's-dd2' } }, steer: () => {} }
-      const ok2 = startWindowDream({ logger: { info: () => {}, warn: () => {} } }, agentDD2, wsDD, '.dsh-meow', (sid, st) => { if (st === 'dreamed') dreamed2.push(sid) })
-      check('dream delegate error path: started', ok2 === true && calls2.length === 1, `ok=${ok2} calls=${calls2.length}`)
-      gates2[0].release()
-      await new Promise((r) => setTimeout(r, 0))
-      check('dream delegate error path: group 2 launched', calls2.length === 2 && calls2[1].req.label === 'meow-memory dream 2/3', `calls=${calls2.length} labels=${calls2.map((c) => c.req.label).join(',')}`)
-      gates2[1].release() // stopReason 'error'（模拟 LLM/网络瞬态故障）
-      await new Promise((r) => setTimeout(r, 0))
-      check('dream delegate error path: error releases lease without finalize',
-        calls2.length === 2 && dbDD.getDreamLease('s-dd2') === null &&
-        !(dbDD.getWindow('s-dd2').last_dream_time > 0) && !dreamed2.includes('s-dd2'))
-      // 重试：窗口仍待整理，重新 start 成功抢占并重启组 1
-      const ok3 = startWindowDream({ logger: { info: () => {}, warn: () => {} } }, agentDD2, wsDD, '.dsh-meow', (sid, st) => { if (st === 'dreamed') dreamed2.push(sid) })
-      check('dream delegate error path: retry re-claims and restarts group 1',
-        ok3 === true && calls2.length === 3 && calls2[2].req.label === 'meow-memory dream 1/3' && dbDD.getDreamLease('s-dd2') !== null,
-        `ok=${ok3} calls=${calls2.length}`)
-      // 清理：abortDream 收尾（用户中止语义：封存 last_dream_time）
-      abortDream(agentDD2, '.dsh-meow')
-      check('dream delegate error path: abort after retry finalizes', dbDD.getDreamLease('s-dd2') === null && dbDD.getWindow('s-dd2').last_dream_time > 0)
-      gates2[2].release() // 迟到的组 1 done（'completed'）：租约已清，advanceDream 应为 no-op
-      await new Promise((r) => setTimeout(r, 0))
-      check('dream delegate error path: late completed done is no-op', dbDD.getDreamLease('s-dd2') === null && calls2.length === 3)
-    } finally {
-      setDreamDelegateEnv(null)
-    }
-  }
-
-  // aborted 路径：组 1 stopReason='aborted'（用户中止）→ 照旧立即封存（stamped + dreamed 信号）
-  {
-    dbDD.insert({ level: 'fact', content: 'delegate dream 用户中止路径条目 特异词ds', project: 'dsh', source_session: 's-dd3' })
-    dbDD.touchWindow('s-dd3', wsDD, Date.now())
-    const calls3 = []
-    let release3
-    const subMock3 = {
-      start: (name, req) => {
-        calls3.push({ name, req })
-        return { id: `child3-${calls3.length}`, result: new Promise((res) => { release3 = () => res({ stopReason: 'aborted', output: [] }) }), dispose: async () => {} }
-      },
-    }
-    const dreamed3 = []
-    setDreamDelegateEnv({
-      logger: { info: () => {}, warn: () => {} },
-      ctx: { get: (name) => (name === 'subagents' ? subMock3 : undefined) },
-      signal: new AbortController().signal,
-      inFlight: new Set(),
-    })
-    try {
-      const agentDD3 = { session: { header: { cwd: wsDD, id: 's-dd3' } }, steer: () => {} }
-      const ok4 = startWindowDream({ logger: { info: () => {}, warn: () => {} } }, agentDD3, wsDD, '.dsh-meow', (sid, st) => { if (st === 'dreamed') dreamed3.push(sid) })
-      check('dream delegate aborted path: started', ok4 === true && calls3.length === 1)
-      release3()
-      await new Promise((r) => setTimeout(r, 0))
-      check('dream delegate aborted path: finalized as before', dreamed3.includes('s-dd3') && dbDD.getDreamLease('s-dd3') === null && dbDD.getWindow('s-dd3').last_dream_time > 0)
-    } finally {
-      setDreamDelegateEnv(null)
-    }
-  }
-
-  dbDD.close() // 显式关库：Windows WAL 句柄挡 rmSync
-  rmSync(wsDD, { recursive: true, force: true })
-}
 
 // disabled
 const { ctx: ctxOff, tools: toolsOff, handlers: handlersOff } = makeCtx()

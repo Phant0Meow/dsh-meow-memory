@@ -163,26 +163,17 @@ dsh plugin --profile web remove meow-memory
       rulesReviewDays: 2    # updated_at 距今超该天数的稳定准则不进 dream 第 1 轮
                             # 清单（防反复整理不变化的条目）；0 = 不过滤
     delegate:
-      reflect: false       # 反思轮交给独立 fork 子代理：继承主会话全部已完成轮次
-                           # （含工具结果），在自己会话里跑、零写主会话上下文；
-                           # false = 拼接进主会话（旧行为）
-      dream: false         # dream 各组交给 fork 子代理：每组一个子代理，done 回调
-                           # 链式推进，租约状态机/峰时抑制/skip 语义不变
-      model: ''            # 子代理模型：留空 = 跟随主会话（请求前缀与主会话同源，
-                           # 可命中 provider 缓存）；'provider/model' 指定 provider+model，
-                           # 'model' 只换模型（provider 继承主会话）
+      model: ''            # 整理任务换模型（可选）：填写后反思轮与梦境轮自动换用
+                           # 该模型执行，轮次结束自动换回主模型；'provider/model'
+                           # 指定 provider+model，'model' 只换模型（provider 继承
+                           # 主会话）；留空 = 全程主模型
 ```
 
-### delegate：反思/梦境脱离主会话上下文（可选）
+### 整理任务换模型（可选）
 
-反思轮和 dream 各组默认拼接进主会话（steer）——prompt、模型回应、工具调用全部落在主会话 log 里（折叠 UI 只是视觉隐藏，模型上下文仍被占用）。`delegate.reflect` / `delegate.dream` 把执行体换成 **fork 子代理**：子代理播种主会话全部已完成轮次（看得见此前的一切，包括工具结果），在自己独立的会话里执行记忆整理，主会话 log 零写入——主对话的上下文占用与压缩节奏完全不受记忆整理影响。
+反思轮和 dream 各组始终在主窗口执行（steer）——prompt、模型回应、工具调用落在主会话 log（折叠 UI 负责视觉收纳）。独立 fork 子代理执行方式已于 v0.24 移除，不再提供"独立执行"开关。
 
-`delegate.model` 同时解决"整理想换个模型"的需求（主会话一个会话一个模型路由，拼接方案下无法单轮换模型）。配置决策矩阵：
-
-- **跟随主模型 + delegate**：子代理请求前缀与主会话请求同源，可命中 provider 侧 prompt 缓存，同时零占用主会话上下文；
-- **换模型**：`delegate.model` 一填，`reflect`/`dream` 自动强制开启——换模型的请求是独立流，命不中主模型的缓存链，此时占主会话上下文纯亏。
-
-delegate 模式的三个配套行为：①子代理会话 `origin='subagent'`，GUI 会话列表天然不显示，结束后再写入持久化归档集合双保险；②主会话 log 里补一条极短的「【记忆反思标记】/【记忆整理标记】」插件消息（不触发模型调用）——主模型知道此处整理过记忆，后续整理以标记为界取增量；③子代理任务失败自动按中止收尾，已写条目照常封存。
+如果想让记忆整理换个（更便宜的）模型跑：配置 `delegate.model` 后，反思/梦境轮发起的每个 LLM 请求会经 dsh 的 `agent/request` waterfall 自动覆盖 provider/model，轮次结束自动换回主模型——正常对话、工具轮完全不受影响。实现是无状态的：按"当前 turn 是否携带反思/梦境指令标记"逐请求判定，用户中止、崩溃、热重载都不会留下"卡在换模型"的脏状态。
 
 ### promptLang：prompt 与检索语言（重要）
 

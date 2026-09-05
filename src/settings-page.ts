@@ -83,11 +83,9 @@ const FIELDS: GroupSpec[] = [
     ],
   },
   {
-    title: '独立执行（fork 子代理）',
+    title: '整理任务模型',
     fields: [
-      { key: 'reflect', sub: 'delegate', label: '反思轮独立执行', type: 'bool', hint: '开启后反思在独立子代理里跑：看得见主会话全部已完成轮次，但不占主会话上下文；关闭=拼接进主会话（旧行为）' },
-      { key: 'dream', sub: 'delegate', label: '梦境独立执行', type: 'bool', hint: 'dream 每组一个子代理，done 回调链式推进；租约状态机/峰时抑制语义不变' },
-      { key: 'model', sub: 'delegate', label: '子代理模型', type: 'str', hint: "留空=跟随主会话（请求前缀同源，可命中 provider 缓存）；'provider/model' 指定路由；'model' 只换模型名。填了会自动强制上面两项独立执行（换模型的请求是独立流，占主会话上下文纯亏）", placeholder: "如 zai-coding-cn/glm-5.3-flash" },
+      { key: 'model', sub: 'delegate', label: '反思/梦境换模型', type: 'str', hint: "留空=全程主模型。填写后反思轮与梦境轮自动换用该模型执行，轮次结束自动换回主模型（其余对话不受影响）；'provider/model' 指定路由，'model' 只换模型名", placeholder: '如 zai-coding-cn/glm-5.3-flash' },
     ],
   },
   {

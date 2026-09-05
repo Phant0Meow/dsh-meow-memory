@@ -1,17 +1,31 @@
 # Changelog
 
-### dream 防重复烧钱加固（2026-09-05 发版前增量）
+## v0.24.0 (2026-09-06)
+
+### 移除独立执行，反思/梦境永远在主窗口执行
+
+- **`delegate.reflect` / `delegate.dream` 设置项整个移除**（猫猫拍板）：不再允许用户选择"独立执行"，反思轮与梦境轮永远 steer 进主窗口执行；fork 子代理执行链路（`startDelegateSubagent` / dream 组链 / 打点追加 / 子会话归档）从代码中整体拆除。历史 settings.yaml user 层残留的这两个键宽容忽略（不报错、不消费）。
+- **换模型功能保留并改走官方扩展点**：`delegate.model`（键名不变，已保存配置继续有效）配置后，反思/梦境轮的 LLM 请求经 dsh `agent/request` waterfall 覆盖 provider/model，轮次结束自动换回主模型——正常对话/工具轮零影响。判定无状态：按当前 turn 是否携带 [meow-memory-reflect]/[meow-memory-dream] 指令标记逐请求实时判定（steer 指令消息在请求前已落 log），用户中止/崩溃/热重载都不留脏覆盖；用户亲手消息引用标记文本不误伤（source.kind='user' 不判 marker）；子代理请求不覆盖。
+- 设置页「喵记忆」标签页：「独立执行（fork 子代理）」组替换为「整理任务模型」组，仅保留模型一项；README 中英同步改写。
+
+### 气泡卡 dream 三态判定（v0.23.1 后增量的补记）
+
+- 气泡 dream 三态判定（client-delegate-notice.ts）：dreaming（活跃租约）→「进行中」、dreamed→「已完成」、状态未知按打点年龄兜底——<30min（租约硬上限）显示进行中，≥30min 显示「梦境记忆整理已中断，稍后自动重试」。根因：429 期间 dream 每周期 error 释放重试（语义正确）但 error 不发 dreamed → dreamed-sessions 永无该窗口 → 气泡对账永远对不上、刷新也无用（猫猫实证）。附 setDreamStatesForTest 测试钩子 + client 测试 +6 项。
+
+## v0.23.1 (2026-09-05)
+
+### dream 防重复烧钱加固
 
 - **windowNeedsDream 6h 冷却期**：dream 收尾后即使 last_event_time 被意外事件刷新（打点/压缩重注入/未知 bug），6h 内绝不重复自动 dream——"标记失败→重复 dream"类风险的最后防线。手动触发（/dream、memory_dream）不经此判定；error 重试不受影响（releaseDream 不写 last_dream_time）。代价：用户真实活动后的自动 dream 最多推迟到收尾+6h（保守取舍）。
 - **插件自身消息不再刷新窗口活跃度**：dream/reflect 打点（【记忆整理标记】等）与 steer 指令消息（含 [meow-memory-dream]）的 user 帧不再 touchWindow——实证打点会把 last_event_time 顶成 dream 时刻：掩盖真实活跃度，且让子代理窗口被 dream 一次就"永远年轻"不过 24h。用户亲手发的消息（source.kind='user'）绝不判 marker，防引用标记文本误伤。
 - **memory_dream 工具入口子代理守卫**：delegate fork 的子代理模型误调 memory_dream 时拒绝执行（与 /dream 命令守卫同语义），不进 windows 表不留痕迹；主窗口正常路径不受影响。底层 startWindowDream 的手动豁免保留。
 
-### dream 失败语义：error 释放租约重试，不再永久吞 dream（2026-09-05 发版前增量）
+### dream 失败语义：error 释放租约重试，不再永久吞 dream
 
 - done 回调三分：completed→advanceDream 推进；error→`db.releaseDream` 只清租约、不动 last_dream_time→下一检查周期自动重试（日志 `dream failed ... lease released, retry next check`）；aborted/interrupted→照旧 finalizeDream 封存。steer 路径 endReason='error' 同样 releaseDream。旧版非 completed 一律按 aborted 封存 = LLM 瞬态故障（open.bigmodel.cn 连接抖动 / 429）永久吞 dream——2026-09-04 整夜全灭事故根因。09-05 晚智谱 429 1113「余额不足或无可用资源包」事故中 11 连败全部正确重试、余额恢复后自动续上清积压，实战验证通过。
 - resume not-found 6h 进程级退避：双实例共享 windows 表互试对方会话恒 `'session not found'`，按周期重试纯属浪费+日志刷屏；失败后 6h 内静默跳过本实例 resume（进程重启清零，每窗口每 6h 只多试一次）。
 
-### dream 递归修复：子代理会话不是 dream 目标（2026-09-05 发版前增量）
+### dream 递归修复：子代理会话不是 dream 目标
 
 - **真机实证的 bug**：delegate fork 出的 dream/反思子代理会话（origin='subagent'）也产生事件 → 进 windows 表/windowIndex → 被 dream 扫描器当作待整理窗口 → dream 时再 fork 孙子代理 → 再进表 → 再被 dream……depth 无限套娃（真机链 8fbc5d59(depth=1)→2f47c15b(depth=2)→63dad87b(depth=3)）。09-05 晚智谱 429 期间 11 次自动 dream 全部打在这些子代理窗口上。
 - **修复两层**（猫猫拍板：主窗口主 session 负责 dream，dream 执行从主窗口 fork 子代理）：
