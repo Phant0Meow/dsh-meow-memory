@@ -1105,9 +1105,11 @@ const decisionA = await preStep(
 check('pre-step inserts independent snapshot', decisionA.kind === 'enter' && decisionA.messages.length === 2 &&
   decisionA.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
   decisionA.messages[0].source.kind === 'plugin' && decisionA.messages[0].source.plugin === 'meow-memory' &&
-  decisionA.messages[0].source.form === 'snapshot' && decisionA.messages[0].source.sections.length === 1 &&
-  decisionA.messages[0].source.sections[0].name === '长期记忆' &&
-  decisionA.messages[0].source.sections[0].text === decisionA.messages[0].content[0].text)
+  decisionA.messages[0].source.form === 'snapshot' && decisionA.messages[0].source.sections.length === 2 &&
+  decisionA.messages[0].source.sections[0].name === '__meta__' &&
+  JSON.parse(decisionA.messages[0].source.sections[0].text).kind === 'initial' &&
+  decisionA.messages[0].source.sections[1].name === '长期记忆' &&
+  decisionA.messages[0].source.sections[1].text === decisionA.messages[0].content[0].text)
 check('first user message remains pristine', decisionA.messages[1].source.kind === 'user' &&
   decisionA.messages[1].content.length === 1 && decisionA.messages[1].content[0].text === '你好')
 check('snapshot has no legacy prompt separator', !decisionA.messages[0].content[0].text.includes('本轮用户prompt：'))
@@ -1272,7 +1274,9 @@ const dGuide1 = await guidePreStep(
 check('welcome guide injected as independent notice when promptLang unset', dGuide1.messages.length === 2 &&
   dGuide1.messages[0].source.kind === 'plugin' &&
   dGuide1.messages[0].source.form === 'notice' &&
-  dGuide1.messages[0].source.memory?.kind === 'welcome' &&
+  typeof dGuide1.messages[0].source.summary === 'string' && dGuide1.messages[0].source.summary.length > 0 &&
+  dGuide1.messages[0].source.memory === undefined &&
+  dGuide1.messages[0].source.sections === undefined &&
   dGuide1.messages[0].content[0].text.includes('【meow-memory 首次设置】') &&
   dGuide1.messages[0].content[0].text.includes('恭喜') &&
   dGuide1.messages[0].content[0].text.includes('不要以 system prompt') &&

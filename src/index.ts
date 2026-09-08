@@ -62,6 +62,13 @@ export interface MemorySourceMeta {
   ids?: string[]
 }
 
+/** v0 会话格式兼容：MemorySourceMeta 编码为 sections 的保留节 __meta__。 */
+const META_SECTION_NAME = '__meta__'
+
+function encodeMetaSection(meta: MemorySourceMeta): { name: string; text: string } {
+  return { name: META_SECTION_NAME, text: JSON.stringify(meta) }
+}
+
 /** 把动态记忆作为独立上下文消息交给模型，不改写人类 user 消息。 */
 function createMemorySnapshotMessage(text: string, meta: MemorySourceMeta): ReturnType<typeof createUserMessage> {
   return createUserMessage({
@@ -70,16 +77,16 @@ function createMemorySnapshotMessage(text: string, meta: MemorySourceMeta): Retu
       kind: 'plugin',
       plugin: 'meow-memory',
       form: 'snapshot',
-      memory: meta,
-      sections: [{ name: '长期记忆', text }],
+      sections: [encodeMetaSection(meta), { name: '长期记忆', text }],
     },
   })
 }
 
-/** 构造独立的插件通知消息（如语言引导），不改写人类 user 消息。
- *  notice form 按 dsh-llm ContextFormed 契约须带 summary（折叠行一行摘要，≤120 字符）；
- *  snapshot form 才用 sections（见 createMemorySnapshotMessage）。 */
-function createMemoryNoticeMessage(text: string, meta: MemorySourceMeta): ReturnType<typeof createUserMessage> {
+/** 构造独立的插件通知消息（如首次语言引导），不改写人类 user 消息。
+ *  notice form 按 dsh-llm ContextFormed 契约带 summary（折叠行一行摘要，≤120 字符）；
+ *  v0 迁移器对 plugin source 只允许 kind/plugin/form/sections/summary —— 因此不复用
+ *  source.memory 顶层字段（迁移器拒绝），welcome 类一次性通知的元数据本就无消费者。 */
+function createMemoryNoticeMessage(text: string): ReturnType<typeof createUserMessage> {
   return createUserMessage({
     content: [{ type: 'text', text }],
     source: {
@@ -87,7 +94,6 @@ function createMemoryNoticeMessage(text: string, meta: MemorySourceMeta): Return
       plugin: 'meow-memory',
       form: 'notice',
       summary: boundContextSummary(text.replace(/\s+/g, ' ').trim()),
-      memory: meta,
     },
   })
 }
@@ -711,7 +717,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           markAccessed(ws, sid, [WELCOME_GUIDE_SEEN_ID], resolved.projectDir)
           const guide = resolveSlotText('welcome-guide', { homePath: homedir() })
           const rewritten = [...decision.messages]
-          rewritten.splice(rewritten.indexOf(lastUser), 0, createMemoryNoticeMessage(guide, { kind: 'welcome' }))
+          rewritten.splice(rewritten.indexOf(lastUser), 0, createMemoryNoticeMessage(guide))
           ctx.logger.info('meow-memory: first-run lang guide injected as independent notice (promptLang unset)')
           return { ...decision, messages: rewritten }
         }

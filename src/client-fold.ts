@@ -51,6 +51,26 @@ interface ContextLike {
   readonly content?: readonly { type?: string; text?: string }[]
 }
 
+interface MemorySourceLike {
+  kind?: string
+  plugin?: string
+  form?: string
+  sections?: readonly { name?: string; text?: string }[]
+  memory?: { kind?: 'initial' | 'hit' | 'reinjection' | 'welcome' }
+}
+
+const META_SECTION_NAME = '__meta__'
+
+/** 从 source.sections 提取 __meta__ 元数据（sections 保留在 source 内，与 dsh 快照一致）。 */
+function extractMetaFromSections(
+  sections?: readonly { name?: string; text?: string }[],
+): { kind?: 'initial' | 'hit' | 'reinjection' | 'welcome'; sessionId?: string } | undefined {
+  if (!Array.isArray(sections)) return undefined
+  const raw = sections.find((s) => s?.name === META_SECTION_NAME)?.text
+  if (raw === undefined) return undefined
+  try { return JSON.parse(raw) } catch { return undefined }
+}
+
 /** 从节点 location 提取 turn 号（unresolved/session 定位无法确定时返回 undefined，
  *  调用方对 undefined 一律跳过=不折叠保持可见）。location 与 location.turn 均做
  *  缺失防护：异常快照/版本偏差下节点可能无 location（GitHub issue #2），缺失时
@@ -207,14 +227,13 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
     const node = snapshot.chat.nodes.get(key)
     if (node === undefined) continue
     if (node.kind === 'context') {
-      const source = (node.data as ContextLike).source as {
-        kind?: string
-        plugin?: string
-        form?: string
-        memory?: { kind?: 'initial' | 'hit' | 'reinjection' | 'welcome' }
-      } | undefined
+      const ctx = node.data as ContextLike
+      const source = ctx.source as MemorySourceLike | undefined
       if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) continue
-      const memKind = source.memory?.kind
+      // 元数据在 source.sections 的 __meta__ 节（与 dsh 快照一致；host v0.25+ 写入）；
+      // 回退旧 source.memory（v0.24- 历史会话）。
+      const meta = extractMetaFromSections(source.sections) ?? source.memory
+      const memKind = meta?.kind
       if (memKind === 'initial' || memKind === 'reinjection') {
         groups.push({ id: key, kind: 'first', injectedText: contextText(node) })
         continue
@@ -223,6 +242,9 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
         groups.push({ id: key, kind: 'hit', injectedText: contextText(node) })
         continue
       }
+      // 已知机器元数据但非注入组（如 welcome / delegate 打点）→ 权威跳过，不做文本嗅探，
+      // 避免把首次引导/打点行误折成"关键词命中"。
+      if (meta !== undefined) continue
       if (source.form === 'snapshot') {
         const injectedText = contextText(node)
         const isFirst = injectedText.startsWith(FIRST_INJECTION_MARKER) || injectedText.includes('LONG-TERM MEMORY')
