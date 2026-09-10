@@ -82,6 +82,7 @@ interface NoticeSourceLike {
   kind?: unknown
   plugin?: unknown
   memory?: { kind?: unknown; sessionId?: unknown }
+  sections?: readonly { name?: string; text?: string }[]
 }
 
 interface NoticeNodeLike {
@@ -91,6 +92,18 @@ interface NoticeNodeLike {
     readonly content?: readonly { type?: string; text?: string }[]
     readonly time?: unknown
   }
+}
+
+const META_SECTION_NAME = '__meta__'
+
+/** 从 source.sections 提取 __meta__ 元数据（v0.27.0+ 兼容）。 */
+function extractMetaFromSections(
+  sections?: readonly { name?: string; text?: string }[],
+): { kind?: string; sessionId?: string } | undefined {
+  if (!Array.isArray(sections)) return undefined
+  const raw = sections.find((s) => s?.name === META_SECTION_NAME)?.text
+  if (raw === undefined) return undefined
+  try { return JSON.parse(raw) } catch { return undefined }
 }
 
 /** 从 content blocks 提取纯文本（与 client-fold blocksToText 同规则）。 */
@@ -105,8 +118,9 @@ function delegateVariantOf(node: NoticeNodeLike): DelegateVariant | undefined {
   const source = node.data?.source
   if (source === undefined || source === null || typeof source !== 'object') return undefined
   if (source.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) return undefined
-  // 机器元数据：打点消息专有的 memory.kind（注入 initial/hit/reinjection、welcome 之外）。
-  const memKind = source.memory?.kind
+  // v0.27.0+: 优先从 sections.__meta__ 读取；回退到旧 source.memory（兼容历史会话）
+  const meta = extractMetaFromSections(source.sections) ?? source.memory
+  const memKind = meta?.kind
   if (memKind === 'reflect-marker') return 'reflect'
   if (memKind === 'reflect-done-marker') return 'reflect-done'
   if (memKind === 'dream-marker') return 'dream'
@@ -119,7 +133,9 @@ function delegateVariantOf(node: NoticeNodeLike): DelegateVariant | undefined {
 }
 
 function delegateSessionIdOf(node: NoticeNodeLike): string | undefined {
-  const sid = node.data?.source?.memory?.sessionId
+  // v0.27.0+: 优先从 sections.__meta__ 读取；回退到旧 source.memory（兼容历史会话）
+  const meta = extractMetaFromSections(node.data?.source?.sections) ?? node.data?.source?.memory
+  const sid = meta?.sessionId
   return typeof sid === 'string' && sid !== '' ? sid : undefined
 }
 
