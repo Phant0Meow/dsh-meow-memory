@@ -734,13 +734,15 @@ export async function resumeAndDream(ctx: Context, sessionId: string, workspace:
       log(`check agent-resume-unavailable sid=${sid} service=${agentsSvc ? 'yes' : 'no'}`)
       return
     }
-    const agent = await agentsSvc.resume({ resumeSessionId: sessionId })
+    const resumed = await agentsSvc.resume({ resumeSessionId: sessionId })
+    // dsh 的 agents.resume() 返回 handle { agent, dispose }，不是 agent 本身
+    const agent = (resumed as { agent?: unknown })?.agent ?? resumed
     const header = (agent as { session?: { header?: { id?: unknown; origin?: unknown; delegationDepth?: unknown } } })
       ?.session?.header
     if (header === undefined || header === null || typeof header.id !== 'string' || header.id.length === 0) {
       // resume resolve 但 agent 无可用 header——实测=子代理会话（dsh 对 fork 子代理的
-      // resume 返回不可用句柄；主会话 resume 恒返回完整 agent，e95f149b 真机实证
-      // 2026-09-05）。标缓存：后续周期 sweep 直接跳过，不再反复 resume。
+      // resume 返回不可用句柄）。注意主会话返回的同样是 handle，已在上面解包 .agent，
+      // 解包后仍无 header 才落到这里。标缓存：后续周期 sweep 直接跳过，不再反复 resume。
       autoDreamSkipWindows.add(sessionId)
       log(`check resume unusable-agent sid=${sid} -> skip`)
       return
