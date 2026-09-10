@@ -38,9 +38,11 @@ import {
   DREAM_MARKER,
   dreamCommandDefinition,
   dreamTool,
+  disposeDreamHeartbeats,
   noteActivity,
   registerLiveAgent,
   scheduleDream,
+  sendMemoryTurn,
   shortSessionId,
   type DreamConfig,
 } from './dream.js'
@@ -52,7 +54,7 @@ import { resolveSlotText, setPromptLang } from './prompt-loader.js'
 
 /** 首次欢迎引导的 seen 记账 id（accessed 通道，非真实记忆 id；releaseSeen 不清除）。 */
 const WELCOME_GUIDE_SEEN_ID = '__welcomeGuide__'
-import { collectDreamStates, DreamStateBroadcast } from './dream-signal.js'
+import { collectDreamStates, headerOf, DreamStateBroadcast, type PersistedSessionLike } from './dream-signal.js'
 
 export const name = 'meow-memory'
 export const inject = ['tools']
@@ -588,11 +590,40 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
 
   // 记忆系统手册挂进 system prompt（静态文本 → KV 缓存友好；order 130 = 工具指南区间末尾，
   // 与各 tool:* 说明（100–116）列在一起，不独占开头）。
-  // systemPrompt 是可选服务（别的 profile 可能没加载 dsh-system-prompt），取不到就跳过。
-  const sp = (ctx as { get?: (name: string) => unknown }).get?.('systemPrompt') as
-    | { section?: (section: { name: string; order: number; text: string }) => unknown }
-    | undefined
-  sp?.section?.({ name: 'meow-memory:guide', order: 130, text: getMemoryGuide() })
+  // systemPrompt 是可选服务（别的 profile 可能没加载 dsh-system-prompt），且 fiber 并发
+  // 启动时可能晚于本插件就绪（与 webServer 路由同款竞态）→ 立即试；未就绪每 1s 重试
+  // （最多 20 次，同 tryRegisterDreamCommand 模式）。
+  // disposer 必须接住（0.1.2 / 0.1.3+ 的 section() 都返回 cordis effect disposer）：
+  // 热重载时 fiber dispose 先注销旧段，否则同名重复 insert 抛错会打断整个 apply。
+  // 双版本兼容：不假设返回值形状，typeof 校验后才登记（对旧版零影响）。
+  let guideRegistered = false
+  let guideTimer = 0
+  const tryRegisterGuideSection = (attempt: number): void => {
+    if (guideRegistered) return
+    const svc = (ctx as { get?: (name: string) => unknown }).get?.('systemPrompt') as
+      | { section?: (section: { name: string; order: number; text: string }) => unknown }
+      | undefined
+    if (svc === undefined || typeof svc.section !== 'function') {
+      if (attempt < 20) {
+        guideTimer = setTimeout(() => tryRegisterGuideSection(attempt + 1), 1000) as unknown as number
+      } else {
+        ctx.logger.warn('meow-memory: systemPrompt 服务 20s 内未就绪，记忆手册未挂进 system prompt（memory_* 工具不受影响）')
+      }
+      return
+    }
+    try {
+      const dispose = svc.section({ name: 'meow-memory:guide', order: 130, text: getMemoryGuide() })
+      guideRegistered = true
+      if (typeof dispose === 'function') toolDisposers.push(dispose)
+      ctx.logger.info('meow-memory: guide section registered into system prompt')
+    } catch (e) {
+      // 重复名冲突等注册错误：重试无意义（旧代未 dispose 时再试还是撞），记日志放弃。
+      ctx.logger.warn(`meow-memory: guide section 注册失败（记忆手册缺失，不影响其余功能）: ${e instanceof Error ? e.message : String(e)}`)
+      guideRegistered = true
+    }
+  }
+  tryRegisterGuideSection(0)
+  toolDisposers.push(() => clearTimeout(guideTimer))
 
   // 窗口表：只处理低频事件类型（流式 assistant/chunk 每块一个事件，绝不逐块写库）。
   // 节流：同一窗口 5 秒内最多落库一次（内存记 lastWrite，事件循环零阻塞）。
@@ -695,9 +726,26 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 首条消息：只注入长期记忆快照，绝不跑命中链路（用户拍板：命中从第二轮起）。
   // 进程重启后恢复的会话：日志已有 user/message → 视为首轮已注入，只走命中链路。
   const firstUserHandled = new Set<string>()
-  ctx.on('agent/pre-step', async ({ agent, messages, signal }, next): Promise<unknown> => {
-    const t0 = Date.now()
+  // 热路径 fail-open（2026-09-10）：pre-step 是 async 监听器，插件逻辑抛错会沿
+  // agent-loop 传播改变宿主 turn 的错误语义。包装器单独持有 next()——宿主 step
+  // 自身的错误原样上抛（abort 语义在内），只有本插件自己的注入/检索失败才吞掉
+  // （放弃本轮注入、放行原始 decision，与本插件其余路径的 fail-open 同风格）。
+  ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
     const decision = await next()
+    try {
+      // preStepInject 内部把 decision 当透传黑盒（any）；出口 cast 回宿主形状。
+      return (await preStepInject({ agent, signal }, decision)) as typeof decision
+    } catch (e) {
+      try {
+        ctx.logger.warn(`meow-memory: pre-step 注入失败（fail-open 放行原始消息）: ${e instanceof Error ? e.message : String(e)}`)
+      } catch { /* 日志失败不阻塞 */ }
+      return decision
+    }
+  })
+
+  // decision 形状来自宿主事件映射，这里透传不重塑（内部只做 kind/messages 只读访问）。
+  const preStepInject = async ({ agent, signal }: { agent: any; signal: { aborted: boolean } }, decision: any): Promise<unknown> => {
+    const t0 = Date.now()
     if (decision === undefined || decision.kind !== 'enter' || signal.aborted) return decision
     if (decision.messages.length === 0) return decision
     // 子代理不注入（origin === 'subagent'，dsh 权威标记）：它们的 prompt 由父代理提供
@@ -709,7 +757,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     const ws = workspaceOfAgent(agent)
 
     // 真实用户消息（跳过插件通知等，source.kind='plugin' 的进不来）。
-    const userMsgs = decision.messages.filter((m) => m.source?.kind === 'user')
+    const userMsgs = decision.messages.filter((m: { source?: { kind?: string } }) => m.source?.kind === 'user')
     if (userMsgs.length === 0) return decision // 工具轮/纯插件消息：不注入
 
     // 压缩重注入（v0.21.0）：compaction/end 成功后置位的待办——下一个含真实用户
@@ -785,7 +833,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     if (resolved.promptLang === undefined && ws) {
       const seen = readSeen(ws, sid, resolved.projectDir)
       if (!seen.has(WELCOME_GUIDE_SEEN_ID)) {
-        const lastUser = [...decision.messages].reverse().find((m) => m.source?.kind === 'user')
+        const lastUser = [...decision.messages].reverse().find((m: { source?: { kind?: string } }) => m.source?.kind === 'user')
         if (lastUser !== undefined) {
           markAccessed(ws, sid, [WELCOME_GUIDE_SEEN_ID], resolved.projectDir)
           const guide = resolveSlotText('welcome-guide', { homePath: homedir() })
@@ -801,7 +849,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     // （top-K）。工具轮/子步骤的请求消息不含真实用户消息 → 不触发；
     // 命中 id 记入已见，不再重复。
     if (ws) {
-      const lastUser = [...decision.messages].reverse().find((m) => m.source?.kind === 'user')
+      const lastUser = [...decision.messages].reverse().find((m: { source?: { kind?: string } }) => m.source?.kind === 'user')
       if (lastUser !== undefined) {
         const text = lastUser.content
           .filter((b: { type?: string; text?: string }) => b.type === 'text' && typeof b.text === 'string')
@@ -813,7 +861,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           titleMax: resolved.titleMax,
         }, resolved.projectDir)
         try {
-          appendFileSync(join(ws, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] hit-chain pid=${process.pid} sid=${shortSessionId(sid)} text=${text.slice(0, 40).replace(/\n/g, ' ')} hit=${hit === null ? 'null' : 'yes'}\n`)
+          appendFileSync(join(ws, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] hit-chain pid=${process.pid} sid=${shortSessionId(sid)} textLen=${text.length} hit=${hit === null ? 'null' : 'yes'}\n`)
         } catch { /* 日志失败不阻塞 */ }
         if (hit !== null) {
           const rewritten = [...decision.messages]
@@ -824,10 +872,23 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       if (Date.now() - t0 > 10) perf(`pre-step hit ${Date.now() - t0}ms sid=${shortSessionId(sid)}`) // 热路径超 10ms 有鬼
     }
     return decision
-  })
+  }
 
   // 2) turn 结束：dream 轮推进 / 自动反思。
+  // 同 pre-step 的 fail-open：同步监听器里抛错（如 advanceDream→steer、DB 读）不允许
+  // 改变宿主 turn 收尾语义，吞掉记日志（dream 租约有过期自愈兜底，不会因此卡死）。
   ctx.on('agent/turn-stopping', ({ agent }) => {
+    try {
+      turnStoppingCore(agent)
+    } catch (e) {
+      try {
+        ctx.logger.warn(`meow-memory: turn-stopping 处理失败（已忽略）: ${e instanceof Error ? e.message : String(e)}`)
+      } catch { /* 日志失败不阻塞 */ }
+    }
+  })
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- agent 形状来自宿主事件映射，透传不重塑
+  const turnStoppingCore = (agent: any): void => {
     const t0 = Date.now()
     if (agent.session.header.origin === 'subagent') return // 子代理不参与（origin 权威判定）
     registerLiveAgent(agent)
@@ -869,12 +930,16 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     if (lastToolName !== undefined && lastToolName.startsWith('memory_')) return // 已主动记忆
     if (consecutiveToolSteps(sessionEventsOf(agent.session)) < resolved.reflectTurns) return // 单任务内连续工具 step 不足
     const message = buildReflectMessage(ws, turnText, resolved.projectDir)
-    // 反思永远 steer 进主会话（v0.24 拍板：独立执行已移除）。换模型由下方
-    // agent/request waterfall 承接——本 turn 带 REFLECT_MARKER 时自动覆盖模型。
-    agent.steer(message)
-    ctx.logger.info(`meow-memory: reflect steered after ${resolved.reflectTurns}+ tool turns`)
+    // 反思任务送主会话独立新轮（v0.24 拍板进主会话；2026-09-10 起走 followup 另起
+    // 一轮——steer 延续同 turn 会把 AI 的工作汇报顶成中间步骤，见 sendMemoryTurn）。
+    // 换模型由下方 agent/request waterfall 承接——本 turn 带 REFLECT_MARKER 时自动覆盖模型。
+    if (sendMemoryTurn(agent, message, ws, resolved.projectDir, `reflect sid=${shortSessionId(sidTs)}`)) {
+      ctx.logger.info(`meow-memory: reflect sent as standalone turn after ${resolved.reflectTurns}+ tool turns`)
+    } else {
+      ctx.logger.warn('meow-memory: reflect 发送失败（本轮不反思，下轮重试）')
+    }
     if (Date.now() - t0 > 20) perf(`turn-stopping slow ${Date.now() - t0}ms`)
-  })
+  }
 
   // 2.5) 整理任务换模型（agent/request waterfall，dsh 官方单请求模型覆盖扩展点）：
   //   配置了 delegate.model 时，本会话「反思轮/梦境轮」的请求把 provider/model 覆盖为
@@ -937,7 +1002,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           void (async () => {
             try {
               const sessionPersistence = (ctx as { get?: (name: string) => unknown }).get?.('sessionPersistence') as
-                | { list?: () => Promise<Array<{ id: string; cwd?: string }>> }
+                | { list?: () => Promise<ReadonlyArray<PersistedSessionLike>> }
                 | undefined
               const sessions = typeof sessionPersistence?.list === 'function' ? await sessionPersistence.list() : []
               const states = collectDreamStates(sessions, resolved.projectDir)
@@ -1060,6 +1125,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     clearTimeout(routeTimer)
     clearTimeout(commandTimer)
     stopDream()
+    disposeDreamHeartbeats() // 热重载不残留 dream 租约心跳定时器
     broadcast.dispose()
     try {
       closeAllDbs()
@@ -1121,10 +1187,11 @@ async function resolveWorkspaceForSession(ctx: Context, sessionId: string): Prom
   if (typeof direct === 'string' && direct.length > 0) return direct
   try {
     const sp = (ctx as { get?: (name: string) => unknown }).get?.('sessionPersistence') as
-      | { list?: () => Promise<Array<{ id: string; cwd?: string }>> }
+      | { list?: () => Promise<ReadonlyArray<PersistedSessionLike>> }
       | undefined
     const sessions = typeof sp?.list === 'function' ? await sp.list() : []
-    const hit = sessions.find((s) => s.id === sessionId)
+    // 双版本形状（2026-09-10）：0.1.2- 扁平 SessionHeader / 0.1.3+ Snapshot{header}，headerOf 统一取。
+    const hit = sessions.map(headerOf).find((h) => h.id === sessionId)
     if (hit && typeof hit.cwd === 'string' && hit.cwd.length > 0) {
       windowIndex.set(sessionId, hit.cwd)
       persistWindowIndex()
@@ -1191,7 +1258,7 @@ function persistWindowIndex(): void {
 // re-export 供测试/调试/其他插件
 export { PLUGIN_SOURCE, REFLECT_MARKER }
 export { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } from './delegate.js'
-export { collectDreamStates } from './dream-signal.js'
+export { collectDreamStates, headerOf, type PersistedSessionLike } from './dream-signal.js'
 export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, globalProjectMarker, GLOBAL_PROJECT_CANON } from './db.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markWritten, readWritten, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, MAX_REINJECT_WRITTEN, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'

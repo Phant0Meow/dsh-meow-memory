@@ -190,6 +190,16 @@ dbW.releaseDream('win-1')
 check('releaseDream clears lease', dbW.isDreamPending('win-1') === false && dbW.getDreamLease('win-1') === null)
 check('releaseDream keeps last_dream_time', dbW.getWindow('win-1')?.last_dream_time === 5000)
 dbW.finishDream('win-1', 0)
+// 轮内心跳（2026-09-10）：touch 只刷 progress_at，不动 group_idx/T；租约清掉后返回 false
+// ——心跳据此自动停表，僵尸 dream 不会被续命。
+dbW.claimDream('win-hb', 'o-hb', 1000, LEASE)
+const beforeTouch = dbW.getDreamLease('win-hb')
+check('touchDreamLease refreshes active lease', dbW.touchDreamLease('win-hb') === true)
+const afterTouch = dbW.getDreamLease('win-hb')
+check('touchDreamLease keeps group_idx/T', afterTouch !== null && beforeTouch !== null && afterTouch.group_idx === beforeTouch.group_idx && afterTouch.T === beforeTouch.T && afterTouch.progress_at >= beforeTouch.progress_at)
+dbW.releaseDream('win-hb')
+check('touchDreamLease false after lease cleared', dbW.touchDreamLease('win-hb') === false)
+check('touchDreamLease false for unknown window', dbW.touchDreamLease('win-never') === false)
 
 // 全局检查门：minIntervalMs 内只有一个调用方通过（防多实例/多定时器叠加重复检查）
 check('check gate passes first', dbW.claimCheckGate(0) === true)
@@ -415,6 +425,28 @@ check('advanceDream advances to topic round', dbClaim.getDreamLease('win-claim')
 advanceDream(agentClaim, '.dsh-meow') // topic 轮完成 → 收尾
 check('advanceDream finishes after topic round', dbClaim.getDreamLease('win-claim') === null)
 check('advanceDream sets last_dream_time', dbClaim.getWindow('win-claim')?.last_dream_time !== null)
+
+// 双版本投递契约（2026-09-10）：第 0 组 followup（另起轮），后续组 steer（连着同轮
+// ——dream 多组不分轮，一个任务一个 turn）。有 followup 也必须走 steer 推进。
+{
+  const wsDual = mkdtempSync(join(tmpdir(), 'mm-dual-'))
+  const dbDual = new MemoryDb(memoryDbPath(wsDual))
+  dbDual.touchWindow('win-dual', wsDual, Date.now())
+  dbDual.insert({ level: 'fact', content: '双模式投递的待整理记忆', source_session: 'win-dual' })
+  const fuCalled = []
+  const stCalled = []
+  const agentDual = {
+    session: { header: { id: 'win-dual', cwd: wsDual } },
+    followup: (m) => fuCalled.push(m),
+    steer: (m) => stCalled.push(m),
+  }
+  check('startWindowDream uses followup (standalone turn)', startWindowDream({}, agentDual, wsDual, '.dsh-meow') === true && fuCalled.length === 1 && stCalled.length === 0)
+  advanceDream(agentDual, '.dsh-meow') // 原子轮完成 → 推进到 topic 轮
+  check('advanceDream uses steer (rounds stay in one turn)', fuCalled.length === 1 && stCalled.length === 1 && dbDual.getDreamLease('win-dual')?.group_idx === 1)
+  advanceDream(agentDual, '.dsh-meow') // topic 轮完成 → 收尾
+  check('advanceDream finishes dual-mode dream (heartbeat stopped too)', dbDual.getDreamLease('win-dual') === null && stCalled.length === 1)
+  dbDual.close()
+}
 check('startWindowDream: ok again after finish', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === true)
 // 模拟中断：start 后不 advance（如同进程崩溃/重载），租约过期后补收尾恢复
 dbClaim.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * 30 * 60_000, 'win-claim')
@@ -524,10 +556,16 @@ dbIcon.touchWindow('s-active', wsIcon, Date.now() - 1000) // dream 后有新活�
 dbIcon.touchWindow('s-nodream', wsIcon, Date.now()) // 从未 dream
 dbIcon.touchWindow('s-dreaming', wsIcon, Date.now() - 4000)
 dbIcon.claimDream('s-dreaming', 'owner-test', Date.now() - 3000, 30 * 60_000) // dream 进行中（活跃租约）
-const iconStates = collectDreamStates([{ id: 'any', cwd: wsIcon }])
-check('dream-states: dreamed/dreaming split', JSON.stringify(iconStates) === JSON.stringify({ dreamed: ['s-dreamed'], dreaming: ['s-dreaming'] }), JSON.stringify(iconStates))
+// 双版本形状（2026-09-10 修复 P0：sessionPersistence.list() 契约随宿主版本变了）：
+// dsh 0.1.2 及以下返回扁平 SessionHeader[]（{id, cwd}）；
+// dsh 0.1.3+ 返回 SessionPersistenceSnapshot[]（{header:{id,cwd}, revision,...}）。
+// 两种形状都必须能判定——旧版假数据曾把「只认扁平」的错误契约固化进测试。
+const iconStatesFlat = collectDreamStates([{ id: 'any', cwd: wsIcon }]) // 旧宿主（0.1.2-）形状
+check('dream-states: flat shape (dsh<=0.1.2) dreamed/dreaming split', JSON.stringify(iconStatesFlat) === JSON.stringify({ dreamed: ['s-dreamed'], dreaming: ['s-dreaming'] }), JSON.stringify(iconStatesFlat))
+const iconStates = collectDreamStates([{ header: { id: 'any', cwd: wsIcon }, revision: 'r1' }]) // 新宿主（0.1.3+）形状
+check('dream-states: snapshot shape (dsh>=0.1.3) dreamed/dreaming split', JSON.stringify(iconStates) === JSON.stringify({ dreamed: ['s-dreamed'], dreaming: ['s-dreaming'] }), JSON.stringify(iconStates))
 const wsNoDb = mkdtempSync(join(tmpdir(), 'mm-nodb-'))
-const iconStates2 = collectDreamStates([{ id: 'any', cwd: wsNoDb }])
+const iconStates2 = collectDreamStates([{ header: { id: 'any', cwd: wsNoDb }, revision: 'r1' }])
 check('dream-states: workspace without memory db skipped (no db created)', iconStates2.dreamed.length === 0 && iconStates2.dreaming.length === 0 && !existsSync(join(wsNoDb, '.dsh-meow', 'memory.db')))
 dbIcon.close()
 

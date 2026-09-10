@@ -232,14 +232,18 @@ export function computeDelegateNotices(snapshot: ConversationSnapshot, now: numb
     const stale = f.time !== undefined && now - f.time >= DREAM_RUNNING_STALE_MS
     return { id: f.key, variant: f.variant, sessionId: f.sessionId, running: !stale, interrupted: stale }
   })
-  // 临时诊断（2026-09-03，定案后移除）：气泡识别结果。
-  if (out.length > 0) console.debug('[meow-dg] notices:', out.map((n) => `${n.id.slice(0, 8)}:${n.variant}:${n.running ? 'run' : 'done'}`).join(', '))
   return out
 }
 
-/** 注入模块 CSS（幂等：先移除旧标签再注入，防热重载堆积）。 */
+/** 注入模块 CSS（幂等：内容一致即复用；不一致（升级换 CSS/热重载）才删旧建新）。 */
 function ensureCss(): void {
   if (typeof document === 'undefined') return
+  // 已存在且内容一致即复用（2026-09-10）：applyDelegateNotices 由 80ms 防抖 observer
+  // 反复驱动（流式期间 ~12 次/秒），此前每次都删了重建 style 标签（纯浪费，无功能问题）。
+  // 注意不能无脑「存在即 return」——热重载时 dispose 不删 style，升级换 CSS 后旧规则
+  // 会残留（同 client.ts 注释的教训），所以比对内容：一致复用、不一致才重建。
+  const existing = document.querySelector(`style[data-plugin-css="${CSS_ID}"]`)
+  if (existing !== null && existing.textContent === NOTICE_CSS) return
   for (const stale of Array.from(document.querySelectorAll(`style[data-plugin-css="${CSS_ID}"]`))) {
     stale.remove()
   }
@@ -263,8 +267,6 @@ export function applyDelegateNotices(groups: readonly DelegateNotice[]): void {
   ensureCss()
   const containers = Array.from(document.querySelectorAll<HTMLElement>('[data-chat-flow]'))
   if (containers.length === 0) return
-  // 临时诊断（2026-09-03，定案后移除）：气泡落 DOM 情况。
-  if (groups.length > 0) console.debug('[meow-dg] apply:', groups.length, 'group(s),', containers.length, 'container(s)')
   const liveIds = new Set(groups.map((group) => group.id))
   for (const container of containers) {
     // 清理已不存在的组的锚点。
@@ -295,7 +297,7 @@ export function applyDelegateNotices(groups: readonly DelegateNotice[]): void {
         bubble.style.cssText = [
           'display:block;margin:4px 0;padding:5px 12px;',
           'font-size:12px;line-height:1.6;text-align:left;',
-          'color:var(--dsw-text-secondary, rgba(127,127,127,.9));',
+          'color:var(--dsw-alias-label-secondary, rgba(127,127,127,.9));',
           'background:rgba(127,127,127,.07);border:1px solid rgba(127,127,127,.14);',
           'border-radius:999px;',
         ].join('')
@@ -326,10 +328,7 @@ export function startDelegateStateSync(): () => void {
   const refresh = async (): Promise<void> => {
     try {
       const response = await fetch('/meow-memory/dreamed-sessions', { cache: 'no-store' })
-      if (!response.ok) {
-        console.debug('[meow-dg] dreamed-sessions HTTP', response.status)
-        return
-      }
+      if (!response.ok) return
       const data = await response.json() as { sessionIds?: unknown; dreamingIds?: unknown }
       dreamStateBySession.clear()
       if (Array.isArray(data.sessionIds)) {
@@ -338,8 +337,6 @@ export function startDelegateStateSync(): () => void {
       if (Array.isArray(data.dreamingIds)) {
         for (const id of data.dreamingIds) if (typeof id === 'string') dreamStateBySession.set(id, 'dreaming')
       }
-      // 临时诊断（2026-09-03，定案后移除）。
-      console.debug('[meow-dg] state sync:', dreamStateBySession.size, 'session(s)')
       notify()
     } catch {
       // 路由不可用：静默降级。

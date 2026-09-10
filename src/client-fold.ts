@@ -3,13 +3,17 @@
  *
  * 识别：会话快照 chat 节点里 kind='context' 且 source 为
  * { kind: 'plugin', plugin: 'meow-memory' } 的节点 = 反思/dream 轮 prompt
- * （steer 注入的 user/message 事件，非 append 改写，渲染为 context 行）。
- * 范围：该 prompt 所在 turn 内、位于 prompt 之后的全部节点（排除 user/steering，
- * 防止误折叠反思期间用户插入的消息；排除 turn-tail——dsh 每个完成 turn 唯一的
- * 操作 footer（复制/分支/耗时行）。反思 prompt 经 agent/turn-stopping steer 注入，
- * dsh 契约是「延续同一个 turn」，即正常轮与反思轮共用这一个 turn-tail，藏掉它
- * 正常轮工作汇报的复制/点赞行也会消失，必须保持可见），用快照的
- * locations.getTurn(turn) 获取。
+ * （steer/followup 注入的 user/message 事件，非 append 改写，渲染为 context 行）。
+ * 范围（2026-09-10 双形状）：
+ * - 独立轮（host 走 followup：prompt 即 turn 首节点）：整个 turn 折叠，
+ *   含该轮自己的 turn-tail footer；
+ * - 共享轮（旧会话数据 / 宿主回退 steer）：prompt 所在 turn 内、位于 prompt 之后的
+ *   全部节点（排除 user/steering，防止误折叠反思期间用户插入的消息；保留 turn-tail
+ *   ——它与正常轮工作汇报共用，藏掉会连复制/点赞行一起消失），用快照的
+ *   locations.getTurn(turn) 获取。
+ * 合并：同一 turn 内同 variant 的多个 prompt（dream 多组连着一个 turn，2026-09-10
+ * 用户拍板「一个 dream 任务一个 turn 一根横条」）只出一条横条，锚在首个 prompt，
+ * 覆盖到 turn 末尾。
  * 计数：范围内 kind='tool' 节点中 memory_remember / memory_update 的调用次数。
  * 状态：范围内有 running assistant → 进行中；interrupted → 已中断；否则已完成。
  */
@@ -124,20 +128,38 @@ export function computeFoldGroups(snapshot: ConversationSnapshot): FoldGroup[] {
   if (snapshot?.chat === undefined) return []
   const order = snapshot.chat.order
   const nodes = snapshot.chat.nodes
-  const groups: FoldGroup[] = []
+  // 同轮同任务合并（2026-09-10）：dream 多组连在同一个 turn 里（第 0 组 followup
+  // 另起轮，后续组 steer 连着），每个组的 prompt 都是独立 context 节点——按
+  // (turn, variant) 只保留首个 prompt 作横条锚点，一组覆盖整个任务。
+  // Map 保插入序 = 渲染序，天然按首个 prompt 排序。
+  const anchors = new Map<string, { key: string; turn: number; variant: FoldVariant }>()
   for (const key of order) {
     const node = nodes.get(key)
     if (node === undefined || !isMemoryPrompt(node)) continue
     const turn = turnOf(node)
     if (turn === undefined) continue // 定位未解析（历史窗口外）：不折叠，保持可见
-    const turnKeys = snapshot.chat.locations.getTurn(turn)
-    const startIdx = turnKeys.indexOf(key)
+    const variant = variantOf(node)
+    const mapKey = `${turn}:${variant}`
+    if (anchors.has(mapKey)) continue
+    anchors.set(mapKey, { key, turn, variant })
+  }
+  const groups: FoldGroup[] = []
+  for (const anchor of anchors.values()) {
+    const turnKeys = snapshot.chat.locations.getTurn(anchor.turn)
+    const startIdx = turnKeys.indexOf(anchor.key)
+    // 轮的归属（2026-09-10 双形状）：
+    // - startIdx === 0：独立 memory 轮（host 走 followup，0.1.2/0.1.3+ 都支持）——
+    //   整个 turn 都是 memory 的，turn-tail（该轮自己的复制/耗时 footer）一并折叠，
+    //   展开横条即见；
+    // - startIdx > 0：共享轮（旧会话数据，或宿主无 followup 回退 steer）——prompt
+    //   在正常轮中间，turn-tail 是正常轮工作汇报的操作行，必须保持可见。
+    const ownsTurn = startIdx === 0
     const keys = turnKeys
       .slice(startIdx === -1 ? 0 : startIdx)
       .filter((k) => {
         const n = nodes.get(k)
-        // turn-tail = 该 turn 的操作 footer（复制/点赞/耗时行），保持可见不折叠。
-        return n !== undefined && n.kind !== 'user' && n.kind !== 'steering' && n.kind !== 'turn-tail'
+        return n !== undefined && n.kind !== 'user' && n.kind !== 'steering'
+          && (n.kind !== 'turn-tail' || ownsTurn)
       })
     let rememberCount = 0
     let updateCount = 0
@@ -154,14 +176,27 @@ export function computeFoldGroups(snapshot: ConversationSnapshot): FoldGroup[] {
         else if (data.status === 'interrupted' && status !== 'running') status = 'interrupted'
       }
     }
-    groups.push({ id: key, variant: variantOf(node), keys, rememberCount, updateCount, status })
+    groups.push({ id: anchor.key, variant: anchor.variant, keys, rememberCount, updateCount, status })
   }
   return groups
 }
 
+/** memory 任务占据的 turn 号集合（2026-09-10，0.1.5 右侧 turn 导航条隐藏用）：
+ *  含任一 reflect/dream prompt 的 turn。快照缺 chat 时返回空集。 */
+export function memoryTurnNumbers(snapshot: ConversationSnapshot): ReadonlySet<number> {
+  const out = new Set<number>()
+  if (snapshot?.chat === undefined) return out
+  for (const key of snapshot.chat.order) {
+    const node = snapshot.chat.nodes.get(key)
+    if (node === undefined || !isMemoryPrompt(node)) continue
+    const turn = turnOf(node)
+    if (turn !== undefined) out.add(turn)
+  }
+  return out
+}
+
 /** 横条文案（产品 copy，中文）。 */
-export function foldLabel(group: FoldGroup, expanded: boolean): string {
-  const arrow = expanded ? '▾' : '▸'
+export function foldLabel(group: FoldGroup, expanded: boolean): string {  const arrow = expanded ? '▾' : '▸'
   const title = group.variant === 'dream' ? '记忆梦境任务' : '记忆反思'
   if (group.status === 'running') return `${arrow} ${title}进行中…`
   if (group.status === 'interrupted') return `${arrow} ${title}已中断`

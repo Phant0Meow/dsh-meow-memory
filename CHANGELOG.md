@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.26.0 (2026-09-10)
+
+### 反思/梦境任务独立成轮（dsh 0.1.5 工作汇报被折叠的根治）
+
+- **问题**：dsh 0.1.5 的 turn-process 折叠以「turn 最终答案」为界。反思/梦境任务经 `agent.steer` 注入时落 inbox "next-step"——agent-loop 的 turn 循环只在 nextStep 为空时收尾，任务变成正常轮的延续 step，AI 真正的工作汇报被降级成中间步骤折叠进过程视图，memory 的行也被宿主过程视图收编、折叠横条无从挂载。
+- **修法**：新增 `sendMemoryTurn`——反思任务与 dream 第 0 组改走 `agent.followup`（inbox "next-turn"）：turn 正常收尾（AI 汇报 = 本 turn 最终答案，保持展开），memory 以全新 turn 落盘。**dream 多组不分轮**（用户拍板）：第 1 组起仍走 `steer` 连在 dream 自己的 turn 里，一个 dream 任务一个 turn 一根横条。
+- **双版本兼容**：`followup` 0.1.2 起即存在（agent.d.ts 三方法同款），能力探测分流，缺失时回退 `steer`——旧宿主行为逐字节不变（共享轮 + 旧折叠形状）。
+
+### 折叠横条在 dsh 0.1.5 复活（composer.dock props 契约跟随）
+
+- **根因**：0.1.5 的 `conversation.composer.dock` 条目 props 从 `{ session: ConversationSnapshot }`（含 `.chat`）改为 hooks 式 `{ useChat, useProjection, t }`（与第一方 StatsPills 同款）。dock 读不到 `.chat` → 四套横条（反思/梦境/注入折叠/委托气泡）在 0.1.5 全部静默失效。
+- **修法**：`MemoryFoldDock` 能力探测取快照——有 `useChat` 走 hook 响应式读取，否则回退 `props.session`（旧宿主路径不变）。
+- **同轮同任务合并**：dream 多组连在一个 turn 后，同 turn 同 variant 的多个 prompt 只出一根横条（锚在首个 prompt、计数跨组累计、独立轮含自己的 turn-tail footer）；旧会话共享轮形状的折叠规则原样保留（正常轮操作行绝不误折）。
+
+### 0.1.5 右侧 turn 导航条不再为 memory 轮加刻度
+
+- 反思/梦境独立成轮后会在 0.1.5 右侧导航条各加一道刻度。新增客户端隐藏：导航框按唯一内联变量 `--turn-rail-inset` 定位（语义命名非哈希类名），刻度按钮 aria-label 内插的 turn 号（数字不随语言变）比对 `memoryTurnNumbers(snapshot)` 命中即隐藏；挂在布局效果与 80ms 自愈 observer 上，React 重建刻度后自动补隐。旧宿主无导航条，纯 no-op。
+
+### 会话列表契约修复：`sessionPersistence.list()` 双形状兼容
+
+- dsh 0.1.3+ 把 `list()` 返回从扁平 `SessionHeader[]` 改为 `SessionPersistenceSnapshot[]`（id/cwd 包进 `header`），插件按扁平结构直读 → 右侧月牙图标全空、skip-dreams 兜底解析 404。新增 `headerOf` 形状探测统一取值，两版各取各的字段；测试假数据补双形状，旧契约不再被测试固化。
+
+### 稳定性：SQLite 写锁与热路径兜底
+
+- `busy_timeout = 5000`（node:sqlite 默认 0ms 直接抛 "database is locked"，多实例共享库场景必踩）；pre-step / turn-stopping 包装 fail-open：宿主 step 自身错误原样上抛，仅插件注入/检索失败时放行原始消息。dream 租约新增轮内心跳（60s touch，收尾/释放自愈停表，6h 封顶），单组 >30min 不再被判死收尾吞掉剩余轮。
+- systemPrompt 注册接住 disposer + 20×1s 就绪重试（与 commands/webServer 同模式，热重载不再同名冲突）。
+- 检查门工作区按字典序取首个（多实例 insertion 序不同导致门失效）；`--dsw-text-secondary`（两版宿主均不存在）换 `--dsw-alias-label-secondary`；`ensureCss` 内容一致即复用（流式期间 ~12 次/秒的重建消除）；`titleMax` 按设置页承诺落地为导引项目名截断；命中日志改记 `textLen` 不再落用户正文明文；删除语法坏损的 `Delete_client-dream-skip.ts`（该文件自 v0.19.0 起让 tsc 跳过程序级语义检查，掩盖约 30 个存量类型错误）。
+
+### 测试
+
+- 主套件 405 + client-fold 24 + delegate-notice 22，全部通过（新增：list 双形状、touchDreamLease、followup/steer 投递契约、同轮合并、memoryTurnNumbers）；`npm test` 前置构建（新克隆直接可测）。
+
 ## v0.25.1 (2026-09-10)
 
 ### 兼容性修复：settings 注册双版本分流（0.1.2 及以下旧版 / 0.1.3+ 新版）

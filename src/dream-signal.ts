@@ -18,10 +18,25 @@ import { existsSync } from 'node:fs'
 import { getDb, memoryDbPath } from './db.js'
 import { DREAM_LEASE_MS } from './dream.js'
 
-/** 会话持久层的最小视图（sessionPersistence.list() 的 SessionHeader 子集）。 */
-export interface PersistedSessionMeta {
-  id: string
+/** sessionPersistence.list() 元素的双版本形状（2026-09-10）：
+ *  - dsh 0.1.2 及以下旧宿主：返回扁平 SessionHeader[]（id/cwd 直接在元素上）；
+ *  - dsh 0.1.3+ 新宿主：返回 SessionPersistenceSnapshot[]（id/cwd 包在 header 里，
+ *    另有 revision/eventCount/sizeBytes）。
+ *  兼容方式与 settings 注册（installSettingsSectionCompat）同思路：按形状探测分流，
+ *  不依赖宿主版本号——两版各取各的字段，互不干扰。 */
+export interface PersistedSessionLike {
+  id?: string
   cwd?: string
+  header?: { id?: string; cwd?: string }
+}
+
+/** 取会话 id/cwd：0.1.3+ 快照读 header，0.1.2 及以下扁平结构直读。 */
+export function headerOf(s: PersistedSessionLike): { id: string; cwd?: string } {
+  const h = s.header
+  if (h !== null && typeof h === 'object') {
+    return { id: typeof h.id === 'string' ? h.id : '', cwd: typeof h.cwd === 'string' && h.cwd.length > 0 ? h.cwd : undefined }
+  }
+  return { id: typeof s.id === 'string' ? s.id : '', cwd: typeof s.cwd === 'string' && s.cwd.length > 0 ? s.cwd : undefined }
 }
 
 /** 一个会话的 dream 状态：'dreamed'=整理完成且无新活动；'dreaming'=dream 轮进行中。 */
@@ -31,21 +46,22 @@ export type DreamState = 'dreamed' | 'dreaming'
  * 收集全部会话的 dream 状态（全量快照用）。
  * 按 cwd 去重打开记忆库；某工作区没有记忆库（.dsh-meow/memory.db 不存在）直接跳过，
  * 绝不新建空库；单个工作区库损坏只跳过该工作区，不抛。
- * @param sessions - 全部会话（sessionPersistence.list() 结果）。
+ * @param sessions - 全部会话（sessionPersistence.list() 结果；0.1.2- 扁平 / 0.1.3+ 快照两种形状都收）。
  * @param dir - 记忆库目录名（默认 .dsh-meow）。
  * @returns { dreamed, dreaming } 两个会话 id 数组（可能包含传入列表之外的 id——
  *   windows 表记录过该工作区所有会话；client 按行实际 id 比对，多余的自动忽略）。
  */
-export function collectDreamStates(sessions: ReadonlyArray<PersistedSessionMeta>, dir = '.dsh-meow'): { dreamed: string[]; dreaming: string[] } {
+export function collectDreamStates(sessions: ReadonlyArray<PersistedSessionLike>, dir = '.dsh-meow'): { dreamed: string[]; dreaming: string[] } {
   const dreamed: string[] = []
   const dreaming: string[] = []
   const opened = new Set<string>()
   for (const s of sessions) {
-    if (typeof s.cwd !== 'string' || s.cwd.length === 0 || opened.has(s.cwd)) continue
-    opened.add(s.cwd)
-    if (!existsSync(memoryDbPath(s.cwd, dir))) continue
+    const { cwd } = headerOf(s)
+    if (typeof cwd !== 'string' || cwd.length === 0 || opened.has(cwd)) continue
+    opened.add(cwd)
+    if (!existsSync(memoryDbPath(cwd, dir))) continue
     try {
-      const db = getDb(s.cwd, dir)
+      const db = getDb(cwd, dir)
       for (const w of db.listWindows()) {
         const lease = db.getDreamLease(w.session_id)
         if (lease !== null && Date.now() - lease.progress_at <= DREAM_LEASE_MS) {

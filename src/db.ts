@@ -192,6 +192,10 @@ export class MemoryDb {
     mkdirSync(dirname(path), { recursive: true })
     this.db = new DatabaseSync(path)
     this.db.exec('PRAGMA journal_mode = WAL')
+    // 多实例共享同一 memory.db 是设计内场景（dream.ts 跨实例注释、claimCheckGate）。
+    // node:sqlite 默认 busy_timeout=0：写锁冲突 0ms 直接抛 "database is locked"（2026-09-10
+    // 实测探针）。WAL 下自旋等待 5s，绝大多数瞬时争用直接消失；超时仍抛由上层兜底。
+    this.db.exec('PRAGMA busy_timeout = 5000')
     for (const level of LEVELS) this.db.exec(SCHEMAS[level])
     this.db.exec(`CREATE TABLE IF NOT EXISTS dream_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -534,6 +538,15 @@ export class MemoryDb {
         )
         .run(now, sessionId, fromIdx, now - leaseMs).changes === 1
     )
+  }
+
+  /** 轮内租约心跳：只刷新 progress_at，不动 group_idx（推进仍归 advanceDreamLease 的 CAS）。
+   *  安全性：只 touch 梦的活跃租约——finalize/release/abort 清租约后 changes=0，
+   *  调用方据此自动停表，僵尸 dream 永远不会被心跳续命。 */
+  touchDreamLease(sessionId: string): boolean {
+    return this.db
+      .prepare(`UPDATE windows SET dream_progress_at = ? WHERE session_id = ? AND dream_owner IS NOT NULL`)
+      .run(Date.now(), sessionId).changes === 1
   }
 
   // ── dream_skip 跳过表（v0.16.0：用户按会话跳过自动 dream；侧边栏菜单 toggle） ──

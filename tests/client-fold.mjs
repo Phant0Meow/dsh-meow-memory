@@ -15,7 +15,7 @@ const { outputFiles } = await build({
 })
 const code = new TextDecoder().decode(outputFiles[0].contents)
 const modUrl = 'data:text/javascript;base64,' + Buffer.from(code).toString('base64')
-const { computeFoldGroups, foldLabel, toolCallDetail, blocksToText, computeInjectionGroups, formatInjectionClock } = await import(modUrl)
+const { computeFoldGroups, foldLabel, toolCallDetail, blocksToText, computeInjectionGroups, formatInjectionClock, memoryTurnNumbers } = await import(modUrl)
 
 // ---- mock 快照 ----
 function turnLoc(turn) {
@@ -88,8 +88,9 @@ console.log('=== 1. 反思轮识别/范围/计数 ===')
   const g = groups[0]
   check('组 id = 起点 key', g.id === 'ctx-1')
   check('变体 = reflect', g.variant === 'reflect')
-  check('范围含反思段全部节点', g.keys.length === 5)
-  check('范围排除 turn-tail（操作行保持可见）', !g.keys.includes('tail-1'))
+  check('范围含反思段全部节点', g.keys.length === 6)
+  // 独立 memory 轮（prompt 即 turn 首节点，followup 形状）：该轮自己的 turn-tail 一并折叠
+  check('独立轮：范围含 turn-tail（整轮都是 memory 的）', g.keys.includes('tail-1'))
   check('remember 计数 = 2', g.rememberCount === 2)
   check('update 计数 = 1', g.updateCount === 1)
   check('status = done', g.status === 'done')
@@ -115,8 +116,87 @@ console.log('=== 2. 排除 user/steering、只取起点之后 ===')
   check('范围排除起点之前的 user-0', !g.keys.includes('user-0'))
   check('范围排除 steering', !g.keys.includes('steer-1'))
   check('范围含 asst-1', g.keys.includes('asst-1'))
-  check('范围排除 turn-tail（正常轮与反思轮共用，保持可见）', !g.keys.includes('tail-1'))
+  check('共享轮：范围排除 turn-tail（正常轮工作汇报的操作行，保持可见）', !g.keys.includes('tail-1'))
   check('group 起点 ctx-1 在内', g.keys.includes('ctx-1'))
+}
+
+// ---- 2.5 独立轮 vs 共享轮（2026-09-10 followup 双形状）----
+console.log('=== 2.5 独立轮折叠 turn-tail / 共享轮保留 turn-tail ===')
+{
+  // 独立轮：prompt 是 turn 首节点（host followup，0.1.5 新会话形状）
+  const nodesA = new Map([
+    ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(7))],
+    ['tool-1', toolNode('tool-1', turnLoc(7), 'memory_remember')],
+    ['tail-1', { key: 'tail-1', kind: 'turn-tail', location: turnLoc(7), data: { turn: 7 } }],
+  ])
+  const sA = snapshot(['ctx-1', 'tool-1', 'tail-1'], nodesA, (t) => t === 7 ? ['ctx-1', 'tool-1', 'tail-1'] : [])
+  const [gA] = computeFoldGroups(sA)
+  check('独立轮：tail 在折叠范围内（横条下方无残留 footer）', gA.keys.includes('tail-1') && gA.keys.length === 3)
+}
+{
+  // 共享轮：prompt 之前有正常轮节点（旧会话数据 / 宿主回退 steer 的形状）
+  const nodesB = new Map([
+    ['user-0', userNode('user-0', turnLoc(3))],
+    ['asst-0', assistantNode('asst-0', turnLoc(3), 'settled')],
+    ['ctx-1', contextNode('ctx-1', DREAM, turnLoc(3))],
+    ['tool-1', toolNode('tool-1', turnLoc(3), 'memory_remember')],
+    ['tail-1', { key: 'tail-1', kind: 'turn-tail', location: turnLoc(3), data: { turn: 3 } }],
+  ])
+  const sB = snapshot(
+    ['user-0', 'asst-0', 'ctx-1', 'tool-1', 'tail-1'],
+    nodesB,
+    (t) => t === 3 ? ['user-0', 'asst-0', 'ctx-1', 'tool-1', 'tail-1'] : [],
+  )
+  const [gB] = computeFoldGroups(sB)
+  check('共享轮：正常轮 asst-0 不折叠', !gB.keys.includes('asst-0'))
+  check('共享轮：tail 不折叠（正常轮的操作行）', !gB.keys.includes('tail-1'))
+  check('共享轮：memory 段照常折叠', gB.keys.includes('ctx-1') && gB.keys.includes('tool-1'))
+}
+{
+  // memoryTurnNumbers（2026-09-10 导航条隐藏用）：含 reflect/dream prompt 的 turn 集合
+  const nodesD = new Map([
+    ['user-1', userNode('user-1', turnLoc(2))],
+    ['ctx-r', contextNode('ctx-r', REFLECT, turnLoc(2))],
+    ['asst-1', assistantNode('asst-1', turnLoc(2), 'settled')],
+    ['ctx-d0', contextNode('ctx-d0', DREAM, turnLoc(5))],
+    ['ctx-d1', contextNode('ctx-d1', DREAM, turnLoc(5))],
+    ['user-9', userNode('user-9', turnLoc(9))],
+    ['asst-9', assistantNode('asst-9', turnLoc(9), 'settled')],
+  ])
+  const sD = snapshot(
+    ['user-1', 'ctx-r', 'asst-1', 'ctx-d0', 'ctx-d1', 'user-9', 'asst-9'],
+    nodesD,
+    () => [],
+  )
+  const turnsD = memoryTurnNumbers(sD)
+  check('memoryTurnNumbers：reflect turn 入集合', turnsD.has(2))
+  check('memoryTurnNumbers：dream 多 prompt 同 turn 去重', turnsD.has(5) && [...turnsD].filter((t) => t === 5).length === 1)
+  check('memoryTurnNumbers：正常轮不进集合', !turnsD.has(9) && turnsD.size === 2)
+  check('memoryTurnNumbers：无 chat 快照返回空集', memoryTurnNumbers(undefined).size === 0)
+}
+{
+  // 同轮同任务合并（2026-09-10）：dream 三组连在一个独立 turn 里 → 只出一根横条
+  const nodesC = new Map([
+    ['ctx-g0', contextNode('ctx-g0', DREAM, turnLoc(9))],
+    ['tool-g0', toolNode('tool-g0', turnLoc(9), 'memory_remember')],
+    ['ctx-g1', contextNode('ctx-g1', DREAM, turnLoc(9))],
+    ['tool-g1', toolNode('tool-g1', turnLoc(9), 'memory_remember')],
+    ['ctx-g2', contextNode('ctx-g2', DREAM, turnLoc(9))],
+    ['asst-g2', assistantNode('asst-g2', turnLoc(9), 'settled')],
+    ['tail-g', { key: 'tail-g', kind: 'turn-tail', location: turnLoc(9), data: { turn: 9 } }],
+  ])
+  const sC = snapshot(
+    ['ctx-g0', 'tool-g0', 'ctx-g1', 'tool-g1', 'ctx-g2', 'asst-g2', 'tail-g'],
+    nodesC,
+    (t) => t === 9 ? ['ctx-g0', 'tool-g0', 'ctx-g1', 'tool-g1', 'ctx-g2', 'asst-g2', 'tail-g'] : [],
+  )
+  const groupsC = computeFoldGroups(sC)
+  check('dream 三组同轮：只出一根横条', groupsC.length === 1)
+  const gC = groupsC[0]
+  check('合并组锚在首个 prompt', gC.id === 'ctx-g0')
+  check('合并组覆盖全部三组的节点', gC.keys.includes('ctx-g2') && gC.keys.includes('tool-g1') && gC.keys.length === 7)
+  check('合并组计数跨组累计（remember=2）', gC.rememberCount === 2)
+  check('合并组含 turn-tail（独立轮）', gC.keys.includes('tail-g'))
 }
 
 // ---- 3. 状态：running / interrupted ----

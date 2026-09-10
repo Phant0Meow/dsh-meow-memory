@@ -247,7 +247,6 @@ function buildInjectionBody(
   db: MemoryDb,
   o: InjectOptions,
 ): { body: string; injectedIds: string[] } | null {
-  void o // 导引不再截断标题；保留参数位以维持两链路签名对称
   // 框架词外置（v0.19.0）：labels.md 的 inject.* 键；记忆条目正文本身是数据不是文案，不外置。
   const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
   const soul = db.list('soul', { status: 'active' })
@@ -274,12 +273,17 @@ function buildInjectionBody(
   pushEntries(lbl('inject.rules'), globalRules)
 
   // 记忆导引：说明 + 项目列表（正文/标题一律自取，不列）。
+  // titleMax 落地（2026-09-10）：schema/设置页一直承诺「导引里项目名的截断长度」，
+  // 此前是死配置（shortTitle 被 void）。这里按承诺截断项目名——只影响导引一行展示，
+  // 记忆条目正文/标题依旧不截断（v0.19.0 拍板不变）。
   const projectNames = db.listProjectNames()
   if (projectNames.length > 0) {
+    const max = o.titleMax
+    const shown = projectNames.map((n) => (n.length > max ? n.slice(0, max) + '…' : n))
     lines.push(lbl('inject.sectionFormat', { label: lbl('inject.guide') }))
     lines.push(lbl('inject.guideSearchLine'))
     lines.push(lbl('inject.guideProjectLine'))
-    lines.push(lbl('inject.guideProjects', { list: projectNames.join(' / ') }))
+    lines.push(lbl('inject.guideProjects', { list: shown.join(' / ') }))
     lines.push('')
   }
 

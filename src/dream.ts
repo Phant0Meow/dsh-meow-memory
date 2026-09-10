@@ -291,6 +291,76 @@ function safeSteer(agent: unknown, msg: unknown, workspace: string, dir: string,
   }
 }
 
+/**
+ * 把 memory 任务消息送入「独立新轮」（2026-09-10 用户拍板）。
+ *
+ * 根因：steer() = inbox "next-step"——在 turn-stopping 里 steer 会让 turn 不结束
+ * （agent-loop 的 turn 循环只在 nextStep 为空时收尾），memory 任务变成正常轮的
+ * 延续 step。0.1.5 的 turn-process 折叠以「turn 最终答案」为界，memory 一延续，
+ * AI 真正的工作汇报就被降级成中间步骤折叠进过程视图，且 memory 的行被过程视图
+ * 收编、插件横条无从挂载。
+ * followup() = inbox "next-turn"：turn 正常收尾（AI 汇报 = 本 turn 最终答案，
+ * 保持展开可见），memory 以全新 turn 落盘。
+ * 使用范围：reflect（单轮任务）与 dream 的第 0 组。dream 的后续组走 steer 连在
+ * dream 自己的 turn 里（多组不分轮，一个 dream 任务一个 turn 一根横条）。
+ * 兼容：followup 0.1.2 起即存在（agent.d.ts 三方法同款）；能力探测，缺失时回退
+ * steer——旧宿主行为逐字节不变（继续走共享轮 + 旧折叠形状）。
+ */
+export function sendMemoryTurn(agent: unknown, msg: unknown, workspace: string, dir: string, tag: string): boolean {
+  const followup = (agent as { followup?: (m: unknown) => void } | undefined)?.followup
+  if (typeof followup !== 'function') return safeSteer(agent, msg, workspace, dir, tag)
+  try {
+    followup.call(agent, msg)
+    return true
+  } catch (error: unknown) {
+    const text = error instanceof Error ? error.message : String(error)
+    dreamLog(workspace, dir, `${tag} followup-failed err=${text}`)
+    console.warn(`[meow-memory] ${tag}: agent.followup failed, memory task skipped (${text})`)
+    return false
+  }
+}
+
+// ── dream 租约轮内心跳（2026-09-10）────────────────────────────────────────
+// 心跳原本只在轮边界刷（advanceDreamLease 的 CAS 推进），LEASE=30min 必须 > 单组
+// 最长处理时间；单组一旦超 30min（LLM 停顿/重试），扫描线程按过期租约判死收尾 →
+// 剩余组永不 steered，但 UI 已广播 dreamed，且新租约可被立刻抢占并发双跑。
+// 修法：dream 进行中每 60s touch 一次租约（只刷 progress_at，不动 group_idx）。
+// 自愈：touchDreamLease 只 touch 活跃租约，收尾/释放/中止后 changes=0 自动停表；
+// 进程死亡心跳随之消失，租约照常 30min 过期被 recoverInterruptedDream 接管——
+// 死亡判定语义完全不变。HEARTBEAT_MAX_MS 封顶：极端挂死的组最多续 6h，之后放过期。
+const DREAM_HEARTBEAT_MS = 60_000
+const HEARTBEAT_MAX_MS = 6 * 3600_000
+const dreamHeartbeats = new Map<string, { timer: ReturnType<typeof setInterval>; startedAt: number }>()
+
+function armDreamHeartbeat(sessionId: string, workspace: string, dir: string): void {
+  if (dreamHeartbeats.has(sessionId)) return // 一次 dream 只挂一个心跳（advanceDream 重入幂等）
+  const startedAt = Date.now()
+  const timer = setInterval(() => {
+    const hb = dreamHeartbeats.get(sessionId)
+    if (hb === undefined) return
+    try {
+      if (Date.now() - hb.startedAt > HEARTBEAT_MAX_MS || !getDb(workspace, dir).touchDreamLease(sessionId)) {
+        stopDreamHeartbeat(sessionId) // 到封顶 或 租约已不在（收尾/释放/被别实例接管）→ 停表
+      }
+    } catch {
+      stopDreamHeartbeat(sessionId) // 库已关（热重载 dispose）/瞬时锁错误：心跳退役，绝不带崩宿主
+    }
+  }, DREAM_HEARTBEAT_MS)
+  dreamHeartbeats.set(sessionId, { timer, startedAt })
+}
+
+function stopDreamHeartbeat(sessionId: string): void {
+  const hb = dreamHeartbeats.get(sessionId)
+  if (hb === undefined) return
+  dreamHeartbeats.delete(sessionId)
+  clearInterval(hb.timer)
+}
+
+/** 停掉全部心跳（插件 dispose 调用；热重载不残留定时器）。 */
+export function disposeDreamHeartbeats(): void {
+  for (const sid of [...dreamHeartbeats.keys()]) stopDreamHeartbeat(sid)
+}
+
 export function startWindowDream(ctx: Context, agent: { session?: { header?: { id?: string } } }, workspace: string, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS): boolean {
   const sessionId = agent.session?.header?.id
   if (!sessionId) return false
@@ -309,11 +379,12 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
   if (!db.claimDream(sessionId, newDreamOwner(), T, DREAM_LEASE_MS)) return false // 别处活跃租约未过期
   onDreamState?.(sessionId, 'dreaming')
   const msg = buildDreamMessage(db, sessionId, T, rounds, 0)
-  if (!safeSteer(agent, msg, workspace, dir, `dream start sid=${shortSessionId(sessionId)}`)) {
+  if (!sendMemoryTurn(agent, msg, workspace, dir, `dream start sid=${shortSessionId(sessionId)}`)) {
     // 没送达：释放租约让下个周期自然重试，不把窗口卡在"进行中"。
     db.releaseDream(sessionId)
     return false
   }
+  armDreamHeartbeat(sessionId, workspace, dir) // 轮内心跳：单组 >30min 不再被判死收尾
   dreamLog(workspace, dir, `dream start pid=${process.pid} session=${shortSessionId(sessionId)} rounds=${rounds.length} T=${T}`)
   return true
 }
@@ -323,6 +394,9 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
  * 状态完全从 DB 租约读：跨实例、热重载残留、中止都不影响推进正确性。
  * 推进按「sessionId + 租约未过期」判定，不校验 owner（owner 只用于抢占判断 + 诊断）。
  * 执行体：steer 主会话（由 turn-stopping 驱动进入，组消息落主 log）。
+ * 后续组用 steer（next-step）连在 dream 自己的 turn 里（2026-09-10 用户拍板：
+ * 多组不分轮——只有第 0 组经 sendMemoryTurn 另起 turn，整个 dream 任务一个
+ * turn、一根折叠横条）；steer 失败同旧行为：租约 30min 过期自愈兜底。
  */
 export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS): void {
   const sessionId = (agent as { session?: { header?: { id?: string } } })?.session?.header?.id
@@ -345,8 +419,10 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
   if (nextIdx < rounds.length) {
     // CAS 推进：多实例同收 turn-stopping 时只有一个成功，其余跳过
     if (db.advanceDreamLease(sessionId, lease.group_idx, DREAM_LEASE_MS)) {
+      armDreamHeartbeat(sessionId, ws, dir) // 热重载后新模块实例没有旧心跳：推进时补挂（幂等）
       const msg = buildDreamMessage(db, sessionId, lease.T, rounds, nextIdx)
       const tag = `dream group ${nextIdx + 1}/${rounds.length}`
+      // 后续组用 steer（非 followup）：连在 dream 自己的 turn 里，多组不分轮
       if (safeSteer(agent, msg, ws, dir, tag)) dreamLog(ws, dir, `${tag} steered`)
     }
     return
@@ -357,6 +433,7 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
 
 /** 收尾：封存全部条目（updated_at=T）+ 清租约 + 记 last_dream_time。失败不阻塞（日志兜底）。 */
 function finalizeDream(db: ReturnType<typeof getDb>, sessionId: string, workspace: string, dir: string, T: number, reason: 'done' | 'aborted', groupsCount: number, onDreamState?: DreamStateCallback): void {
+  stopDreamHeartbeat(sessionId) // 租约即清，心跳立刻退役（不等下一个 60s tick 自愈）
   try {
     const stamped = db.stampDream(sessionId, T)
     db.finishDream(sessionId, Date.now())
@@ -777,12 +854,11 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow',
       // 根因：热重载/多 fiber 并存时 dispose 未必清理旧 setInterval → 检查频率
       // 远高于 checkMinutes → 同一窗口被反复 start。用共享库的原子抢占做节流，
       // 与 claimDream（start 幂等）+ recoverInterruptedDream（中断自愈）闭环。
-      let gatePassed = false
-      for (const [, ws] of windowIndex) {
-        if (getDb(ws, dir).claimCheckGate(60_000)) gatePassed = true
-        break
-      }
-      if (!gatePassed) return
+      // 工作区按字典序取首个：windowIndex 是插入序 Map，两实例插入序不同时会各自
+      // 抢不同库的门 → 门失效（2026-09-10 复核）；排序后只要有公共工作区，必然
+      // 选中同一块库的同一条门记录。零交集的多实例本来无共享状态，无需共门。
+      const gateWorkspaces = [...new Set(windowIndex.values())].sort()
+      if (gateWorkspaces.length === 0 || !getDb(gateWorkspaces[0], dir).claimCheckGate(60_000)) return
       dreamSweepOnce(ctx, cfg, dir, windowIndex, onDreamState)
     } catch (error: unknown) {
       console.warn(`[meow-memory] dream sweep failed: ${error instanceof Error ? error.message : String(error)}`)

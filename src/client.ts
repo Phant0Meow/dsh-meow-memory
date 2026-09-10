@@ -6,7 +6,8 @@
  * 显示在卡片里面；再点收起。原始消息流里的行始终隐藏。
  *
  * 机制（纯插件，不改 dsh 本体）：
- * - 挂 conversation.composer.dock（InputZone 提供会话快照，随快照重渲染）；
+ * - 挂 conversation.composer.dock（随宿主形态取会话快照：0.1.2- 读 session prop，
+ *   0.1.3+/0.1.5 用 useChat hook，见 MemoryFoldDock）；
  * - computeFoldGroups 从快照识别 meow-memory 注入的 context 节点及其 turn 范围；
  * - DOM：chat 视图每个节点行有稳定 data-chat-flow-key 锚点，隐藏 + 原位插入
  *   横条锚点（细条 bar + 展开卡片 body）；展开时把原始行 cloneNode 进卡片
@@ -18,9 +19,8 @@
 
 import { createElement, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ConversationSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
-import type { InputZone } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { AssistantChatData, ChatNode, ToolChatData } from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { blocksToText, computeFoldGroups, computeInjectionGroups, foldLabel, formatInjectionClock, toolCallDetail, type FoldGroup, type InjectionGroup } from './client-fold.ts'
+import { blocksToText, computeFoldGroups, computeInjectionGroups, foldLabel, formatInjectionClock, memoryTurnNumbers, toolCallDetail, type FoldGroup, type InjectionGroup } from './client-fold.ts'
 import {
   applyVanishDom,
   computeVanishDecision,
@@ -179,7 +179,7 @@ function ensureAnchor(
     bar.style.cssText = [
       'display:block;width:100%;margin:4px 0;padding:5px 12px;',
       'font-size:12px;line-height:1.6;text-align:left;cursor:pointer;',
-      'color:var(--dsw-text-secondary, rgba(127,127,127,.9));',
+      'color:var(--dsw-alias-label-secondary, rgba(127,127,127,.9));',
       'background:rgba(127,127,127,.07);border:1px solid rgba(127,127,127,.14);',
       'border-radius:999px;',
     ].join('')
@@ -373,7 +373,7 @@ function applyInjectionFold(
         bar.style.cssText = [
           'display:block;margin:4px 0 4px auto;max-width:82%;padding:5px 12px;',
           'font-size:12px;line-height:1.6;text-align:left;cursor:pointer;',
-          'color:var(--dsw-text-secondary, rgba(127,127,127,.9));',
+          'color:var(--dsw-alias-label-secondary, rgba(127,127,127,.9));',
           'background:rgba(127,127,127,.07);border:1px solid rgba(127,127,127,.14);',
           'border-radius:999px;',
         ].join('')
@@ -476,15 +476,64 @@ function applyFoldState(
   }
 }
 
+/** 0.1.5 右侧 turn 导航框的内联变量（frameStyle 设置；语义命名非哈希，全文档唯一）。 */
+const TURN_NAV_FRAME_VAR = '--turn-rail-inset'
+
+/** 隐藏 turn 导航条上的 memory 轮刻度（2026-09-10 用户拍板：反思/梦境独立成轮后
+ *  会在 0.1.5 右侧导航多出刻度，很困扰）。
+ *  定位：宿主导航框是唯一带 --turn-rail-inset 内联变量的 nav（类名是内容哈希
+ *  不可依赖，aria-label 文案随语言变）；刻度按钮的 aria-label 内插 turn 号
+ *  （数字不随语言变），取其中整数比对 memory turn 集合。
+ *  刻度为绝对定位，隐藏后留一小段空隙；hover 预览与跳转随刻度一起消失。
+ *  旧宿主（0.1.2-）没有导航条：查询为空，纯 no-op。 */
+function applyTurnNavHiding(memoryTurns: ReadonlySet<number>): void {
+  if (memoryTurns.size === 0) return
+  for (const nav of document.querySelectorAll<HTMLElement>('nav[style]')) {
+    if (nav.style.getPropertyValue(TURN_NAV_FRAME_VAR) === '') continue // 只处理宿主 turn 导航框
+    for (const btn of nav.querySelectorAll('button[aria-label]')) {
+      const nums = (btn.getAttribute('aria-label') ?? '').match(/\d+/g)
+      if (nums === null) continue
+      const turn = Number(nums[nums.length - 1])
+      const slot = btn.parentElement
+      if (Number.isInteger(turn) && memoryTurns.has(turn) && slot !== null) slot.style.display = 'none'
+    }
+  }
+}
+
 /**
  * 隐形 dock 条目：不渲染可见 UI（横条直接进消息流 DOM），只随快照驱动折叠。
+ *
+ * 双版本 props（2026-09-10）：
+ * - dsh 0.1.2 及以下：`{ session: ConversationSnapshot, input }`——session 即含
+ *   `.chat` 的会话快照；
+ * - dsh 0.1.3+/0.1.5：dock 条目改发 hooks（与第一方 StatsPills 同款契约）——
+ *   `useChat(selector)` 响应式取 chat 快照，`session` 缺席或只剩生命周期字段。
+ * 取快照一律能力探测：有 useChat 走 hooks，否则回退 props.session——旧宿主
+ * 行为逐字节不变。两版都拿不到 chat（异常宿主）时 fail-closed 不折叠。
  */
-export function MemoryFoldDock({ session }: InputZone): null {
+const chatIdentity = (chat: unknown): unknown => chat
+
+export function MemoryFoldDock(props: {
+  /** 旧宿主（0.1.2-）：含 .chat 的会话快照；新宿主上缺席或为纯生命周期快照。 */
+  session?: unknown
+  /** 新宿主（0.1.3+）：响应式 chat 快照 hook（useChat(selector) → ChatSnapshot）。 */
+  useChat?: (selector: (chat: unknown) => unknown) => unknown
+}): null {
+  const useChat = props?.useChat
+  // hooks 顺序按宿主形态固定（同一宿主内 useChat 要么恒在要么恒缺），不违反规则。
+  const chatViaHook = typeof useChat === 'function' ? useChat(chatIdentity) : undefined
+  const legacySession = props?.session as { chat?: unknown } | undefined
+  const snapshot: unknown = chatViaHook !== undefined
+    ? { chat: chatViaHook }
+    : (legacySession !== null && typeof legacySession === 'object' && legacySession.chat !== undefined
+        ? legacySession
+        : undefined)
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
   const [injExpanded, setInjExpanded] = useState<ReadonlySet<string>>(() => new Set())
-  const groups = useMemo(() => computeFoldGroups(session), [session])
-  const injGroups = useMemo(() => computeInjectionGroups(session), [session])
-  const dgNotices = useMemo(() => computeDelegateNotices(session), [session])
+  const groups = useMemo(() => computeFoldGroups(snapshot as never), [snapshot])
+  const injGroups = useMemo(() => computeInjectionGroups(snapshot as never), [snapshot])
+  const dgNotices = useMemo(() => computeDelegateNotices(snapshot as never), [snapshot])
+  const memTurns = useMemo(() => memoryTurnNumbers(snapshot as never), [snapshot])
   const toggle = useCallback((id: string): void => {
     setExpanded((prev) => {
       const next = new Set(prev)
@@ -493,10 +542,10 @@ export function MemoryFoldDock({ session }: InputZone): null {
       else next.delete(id)
       // 同步填充/清空展开卡片（不依赖 effect 时序，也避免 observer 循环）。
       const group = groups.find((candidate) => candidate.id === id)
-      fillBody(id, willExpand, group?.keys ?? [], session)
+      fillBody(id, willExpand, group?.keys ?? [], snapshot as never)
       return next
     })
-  }, [groups, session])
+  }, [groups, snapshot])
   const toggleInj = useCallback((id: string): void => {
     setInjExpanded((prev) => {
       const next = new Set(prev)
@@ -508,22 +557,24 @@ export function MemoryFoldDock({ session }: InputZone): null {
 
   // 快照/展开态变化 → 重放折叠（行隐藏 + 锚点，不改卡片内容）。
   useLayoutEffect(() => {
-    applyFoldState(groups, expanded, toggle, session)
+    applyFoldState(groups, expanded, toggle, snapshot as never)
     applyInjectionFold(injGroups, injExpanded, toggleInj)
     applyDelegateNotices(dgNotices)
-  }, [groups, expanded, toggle, session, injGroups, injExpanded, toggleInj, dgNotices])
+    applyTurnNavHiding(memTurns)
+  }, [groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns])
 
   // 兜底：视图切换/元素重建/流式重渲染导致 DOM 变化时自愈（防抖）。
-  const latest = useRef({ groups, expanded, toggle, session, injGroups, injExpanded, toggleInj, dgNotices })
-  latest.current = { groups, expanded, toggle, session, injGroups, injExpanded, toggleInj, dgNotices }
+  const latest = useRef({ groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns })
+  latest.current = { groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns }
   useEffect(() => {
     let timer = 0
     const observer = new MutationObserver(() => {
       window.clearTimeout(timer)
       timer = window.setTimeout(() => {
-        applyFoldState(latest.current.groups, latest.current.expanded, latest.current.toggle, latest.current.session)
+        applyFoldState(latest.current.groups, latest.current.expanded, latest.current.toggle, latest.current.snapshot as never)
         applyInjectionFold(latest.current.injGroups, latest.current.injExpanded, latest.current.toggleInj)
         applyDelegateNotices(latest.current.dgNotices)
+        applyTurnNavHiding(latest.current.memTurns)
       }, 80)
     })
     observer.observe(document.body, { childList: true, subtree: true })
