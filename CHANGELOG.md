@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.25.1 (2026-09-10)
+
+### 兼容性修复：settings 注册双版本分流（0.1.2 及以下旧版 / 0.1.3+ 新版）
+
+- **问题**：v0.25.0 的设置区注册硬调 `settings.installSection`（dsh-settings 0.1.5 起的方法）。但 dsh 0.1.2 及以下的旧宿主把注册入口做成自由函数 `installSettingsSection`，`SettingsProvider` 上并没有 `installSection` 方法——旧宿主上调用即 TypeError，设置区静默失效（`ctx.inject` 回调内的异常调用点的 try/catch 不一定兜得住）。
+- **修法**：新增 `installSettingsSectionCompat`，按「settings 服务是否暴露 `installSection` 方法」分流（它正好是两版的能力分界）：0.1.3+ 走 `settings.installSection(owner, ns, schema, entry, hooks)`；0.1.2 及以下回退 `settings.register(ns, schema, { base, validate })`，复刻旧自由函数的 register + effect + watch 行为（含 cordis fiber 收尾态 DISPOSED/UNLOADING 时跳过回填）。
+- **关键约束**：不能静态 `import { installSettingsSection }`——0.1.5 起该导出已移除，ESM 缺导出会在模块加载期直接报错，比原问题更糟。故旧分支复用两版都有的底层 `register`。
+
+### 测试
+
+- 主套件 397 passed / 0 failed；client-fold、client-delegate-notice 全通过；构建产物确认含两条分支。
+- 真机：旧宿主（dsh 0.1.1-rc.2，端口 3080）与新宿主（dsh 0.1.5-rc.1，端口 3081）设置页均可见 meow-memory 配置区，旧宿主注册不再抛错。
+
 ## v0.25.0 (2026-09-10)
 
 ### 兼容 dsh 0.1.5：历史会话迁移器内置（Closes #13）
