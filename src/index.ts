@@ -22,7 +22,6 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
-import { installSettingsSection } from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -456,16 +455,27 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   const settingsBase = mergeConfigLayer(CONFIG_DEFAULTS, config)
   let settingsGet: (() => unknown) | undefined
   try {
-    installSettingsSection(ctx, SETTINGS_NS, z.dict(z.any()), settingsBase, {
-      validate: (value: unknown): void => {
-        validateConfigUserLayer(value)
-      },
-      setSource: (get: () => unknown): void => {
-        settingsGet = get
-      },
-      onChange: (): void => {
-        ctx.logger.info('meow-memory: 配置已通过设置页更新（热重载/重启插件后生效）')
-      },
+    // dsh-settings 0.1.5 把 installSettingsSection 自由函数改成了
+    // settings 服务方法 installSection(owner, ns, schema, entry, hooks)，
+    // 参数顺序和 hooks 契约不变。这里改用新方法注册设置区。
+    // 注册失败（比如 settings 服务未装配）不影响插件本体：
+    // 下面 catch 会降级为只走 patch 层配置，设置页标签不可用。
+    ctx.inject(['settings'], (settingsCtx: {
+      settings: {
+        installSection: (owner: Context, ns: string, schema: unknown, entry: unknown, hooks: Record<string, unknown>) => void
+      }
+    }) => {
+      settingsCtx.settings.installSection(ctx, SETTINGS_NS, z.dict(z.any()), settingsBase, {
+        validate: (value: unknown): void => {
+          validateConfigUserLayer(value)
+        },
+        setSource: (get: () => unknown): void => {
+          settingsGet = get
+        },
+        onChange: (): void => {
+          ctx.logger.info('meow-memory: 配置已通过设置页更新（热重载/重启插件后生效）')
+        },
+      })
     })
   } catch (e) {
     // 设置服务未装配（别的 profile）不挡插件本体：config 退回 patch 层。
