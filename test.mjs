@@ -1386,7 +1386,7 @@ check('no steer after memory_ tool', steered3.length === 0)
 // ═══════════════════════ delegate（fork 子代理执行体） ═══════════════════════
 
 // parseModelSpec 单元：'provider/model' / 'model' / 空
-const { parseModelSpec, validateConfigUserLayer, mergeConfigLayer } = await import('./lib/index.js')
+const { parseModelSpec, validateConfigUserLayer, mergeConfigLayer, CONFIG_DEFAULTS, factoryDefaultOf } = await import('./lib/index.js')
 check('parseModelSpec splits provider/model', JSON.stringify(parseModelSpec('prov/main')) === JSON.stringify({ provider: 'prov', model: 'main' }))
 check('parseModelSpec model-only keeps provider inherited', JSON.stringify(parseModelSpec('solo')) === JSON.stringify({ model: 'solo' }))
 check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && parseModelSpec(undefined) === undefined && parseModelSpec('  ') === undefined)
@@ -1399,6 +1399,9 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   check('settings merge: dream sub-fields shallow-merged (patch keys kept)', merged.dream.enabled === true && merged.dream.idleMinutes === 60 && merged.dream.timeZone === 'UTC')
   check('settings merge: untouched groups pass through', JSON.stringify(merged.delegate) === JSON.stringify(patch.delegate))
   check('settings merge: undefined user layer returns patch', mergeConfigLayer(patch, undefined) === patch)
+  // YAML 空段（`meow-memory:` 后无内容）= null：typeof null === 'object' 会漏过类型判断，
+  // Object.entries(null) 抛 TypeError 崩 applyInner——必须直通 patch 层。
+  check('settings merge: null user layer (empty YAML section) returns patch', mergeConfigLayer(patch, null) === patch)
   check('settings validate: valid layer passes', (validateConfigUserLayer({ enabled: false, promptLang: 'en', dream: { idleMinutes: 60, suppressWindows: [{ start: '09:00', end: '12:00' }] }, delegate: { model: 'prov/m' } }), true))
   const bad = (v) => {
     try { validateConfigUserLayer(v); return false } catch { return true }
@@ -1407,6 +1410,15 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   check('settings validate: bad suppressWindows rejected', bad({ dream: { suppressWindows: [{ start: '9点', end: '12点' }] } }) && bad({ dream: { suppressWindows: '09:00-12:00' } }))
   // v0.24：delegate.reflect/dream 已移除——历史 settings.yaml user 层残留键宽容（忽略不报错）
   check('settings validate: legacy delegate.reflect/dream keys tolerated', !bad({ delegate: { reflect: false, dream: true, model: '' } }))
+
+  // 出厂默认的单一来源（defaults.ts）：host 的 config 兜底与 client 设置页「恢复默认」共用。
+  // 2026-09-10 猫猫拍板：恢复默认 = 回到插件出厂默认，不再是 patch 装配基线。
+  check('factory default: delegate.model 出厂默认=空串（=主模型）', factoryDefaultOf({ key: 'model', sub: 'delegate' }) === '')
+  check('factory default: top-level scalars', factoryDefaultOf({ key: 'hitTopK' }) === 2 && factoryDefaultOf({ key: 'enabled' }) === true && factoryDefaultOf({ key: 'projectDir' }) === '.dsh-meow')
+  check('factory default: dream sub-keys', factoryDefaultOf({ key: 'idleMinutes', sub: 'dream' }) === 180 && factoryDefaultOf({ key: 'rulesReviewDays', sub: 'dream' }) === CONFIG_DEFAULTS.dream.rulesReviewDays)
+  check('factory default: array value equals CONFIG_DEFAULTS', JSON.stringify(factoryDefaultOf({ key: 'suppressWindows', sub: 'dream' })) === JSON.stringify(CONFIG_DEFAULTS.dream.suppressWindows))
+  check('factory default: promptLang 缺席=未设置语义', factoryDefaultOf({ key: 'promptLang' }) === undefined)
+  check('factory default: 未知 sub/key → undefined', factoryDefaultOf({ key: 'nope', sub: 'dream' }) === undefined && factoryDefaultOf({ key: 'enabled', sub: 'nope' }) === undefined)
 }
 
 // 反思永远 steer（v0.24 拍板：独立执行移除，配置了 model 也不 fork）

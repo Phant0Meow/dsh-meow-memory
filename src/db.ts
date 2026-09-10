@@ -352,7 +352,7 @@ export class MemoryDb {
     if (patch.keywords !== undefined) push('keywords', JSON.stringify(patch.keywords))
     if (patch.status !== undefined) push('status', patch.status)
     if (patch.corrected !== undefined && level === 'lesson') push('corrected', patch.corrected)
-    if (patch.project !== undefined && (level === 'project' || level === 'fact' || level === 'lesson')) {
+    if (patch.project !== undefined && (level === 'project' || level === 'fact' || level === 'lesson' || level === 'rules')) {
       push('project', patch.project)
     }
     if (patch.subcategory !== undefined && level === 'project') push('subcategory', patch.subcategory)

@@ -13,6 +13,7 @@
  */
 
 import * as React from 'react'
+import { factoryDefaultOf } from './defaults.js'
 
 const SETTINGS_NS = 'meow-memory'
 const CSS_ID = 'meow-memory-settings-css'
@@ -251,29 +252,56 @@ function MemorySettingsSection(props: { scope: any }): any {
     return false
   }
 
+  /**
+   * 「恢复默认」= 回到插件出厂默认（defaults.ts 的 CONFIG_DEFAULTS）。
+   *
+   * 不能只做"删掉 user 层字段、显示回落 base"：base = 出厂默认 + patch 基线
+   * （cordis.patch.yml），patch 里手编的非默认值会被当成"默认"还给用户——
+   * 2026-09-10 猫猫实证踩到：patch 写死的 zai-coding-cn/glm-5.3-flash 成了
+   * 「反思/梦境换模型」的恢复默认结果，而他期望这里为空（=主模型）。
+   * 所以有出厂默认的字段直接写入出厂默认值；出厂默认缺席的字段
+   * （promptLang，语义=未设置）才沿用删键回落 base。
+   */
   const reset = async (spec: FieldSpec): Promise<void> => {
     setError(null)
+    const def = factoryDefaultOf(spec)
     try {
-      if (spec.sub === undefined) {
-        await scope.unset(spec.key)
+      if (def === undefined) {
+        if (spec.sub === undefined) {
+          await scope.unset(spec.key)
+        } else {
+          // scope.unset 同样只认单层键：unset 父键会连坐整个子对象。
+          // 「恢复未设置」= set 回去掉该字段的 user 层父对象；父对象空了才 unset 父键。
+          const user = scope.getSnapshot().user as Record<string, unknown> | undefined
+          const parent = { ...((user?.[spec.sub] as Record<string, unknown>) ?? {}) }
+          delete parent[spec.key]
+          if (Object.keys(parent).length === 0) await scope.unset(spec.sub)
+          else await scope.set(spec.sub, parent)
+        }
       } else {
-        // scope.unset 同样只认单层键：unset 父键会连坐整个子对象。
-        // 「单项恢复默认」= set 回去掉该字段的 user 层父对象；父对象空了才 unset 父键。
+        // 深拷贝一份：suppressWindows 是数组，别把默认常量本身写进设置镜像。
+        const value = JSON.parse(JSON.stringify(def))
+        if (spec.sub === undefined) {
+          await scope.set(spec.key, value)
+        } else {
+          const user = scope.getSnapshot().user as Record<string, unknown> | undefined
+          const parent = { ...((user?.[spec.sub] as Record<string, unknown>) ?? {}) }
+          parent[spec.key] = value
+          await scope.set(spec.sub, parent)
+        }
+      }
+      const landed = (): boolean => {
         const user = scope.getSnapshot().user as Record<string, unknown> | undefined
-        const parent = { ...((user?.[spec.sub] as Record<string, unknown>) ?? {}) }
-        delete parent[spec.key]
-        if (Object.keys(parent).length === 0) await scope.unset(spec.sub)
-        else await scope.set(spec.sub, parent)
+        if (def === undefined) {
+          const cur = spec.sub === undefined
+            ? user?.[spec.key]
+            : (user?.[spec.sub] as Record<string, unknown> | undefined)?.[spec.key]
+          return cur === undefined
+        }
+        return jsonEqual(fieldValue(user, spec), def)
       }
-      const gone = (): boolean => {
-        const v = scope.getSnapshot().user as Record<string, unknown> | undefined
-        const cur = spec.sub === undefined
-          ? v?.[spec.key]
-          : (v?.[spec.sub] as Record<string, unknown> | undefined)?.[spec.key]
-        return cur === undefined
-      }
-      if (!gone()) await new Promise((resolve) => window.setTimeout(resolve, 300))
-      if (gone()) {
+      if (!landed()) await new Promise((resolve) => window.setTimeout(resolve, 300))
+      if (landed()) {
         flashSaved()
       } else {
         setError('恢复默认未生效，请重试。')
@@ -292,7 +320,11 @@ function MemorySettingsSection(props: { scope: any }): any {
 
   const renderField = (spec: FieldSpec): any => {
     const raw = fieldValue(snap.value, spec)
-    const overridden = inUserLayer(snap.user, spec)
+    // 「已覆盖」判定：有出厂默认的字段看"当前生效值 ≠ 出厂默认"（patch 基线的非默认值
+    // 同样算覆盖，与 reset 写入出厂默认的语义对齐）；无出厂默认的字段（promptLang，
+    // 语义=未设置）沿用"user 层有该键即已覆盖"。
+    const def = factoryDefaultOf(spec)
+    const overridden = def === undefined ? inUserLayer(snap.user, spec) : !jsonEqual(raw, def)
     const isSuppress = spec.sub === 'dream' && spec.key === 'suppressWindows'
     const editingSuppress = isSuppress && suppressText !== null
     const mirrorText = typeof raw === 'string' ? raw : (spec.type === 'num' && typeof raw === 'number' ? String(raw) : '')
@@ -392,7 +424,7 @@ function MemorySettingsSection(props: { scope: any }): any {
         { className: 'meowmm_set_ctrl', style: { display: 'flex', gap: '8px', alignItems: 'center' } },
         control,
         el('span', { className: `meowmm_set_badge ${overridden ? 'meowmm_set_badge_override' : 'meowmm_set_badge_prefill'}` }, overridden ? '已覆盖' : '默认'),
-        overridden && snap.writable ? el('button', { className: 'meowmm_set_reset', onClick: () => { clearDraft(spec); void reset(spec) } }, '恢复默认') : null,
+        overridden && snap.writable ? el('button', { className: 'meowmm_set_reset', onClick: () => { clearDraft(spec); setSuppressText(null); void reset(spec) } }, '恢复默认') : null,
       ),
     )
   }
@@ -404,7 +436,7 @@ function MemorySettingsSection(props: { scope: any }): any {
     el(
       'p',
       { className: 'meowmm_set_subtitle' },
-      '跨会话记忆插件的全部设置。改动保存在 DSH 设置里（字段级，可单项恢复默认）；生效需要热重载/重启 meow-memory 插件。',
+      '跨会话记忆插件的全部设置。改动保存在 DSH 设置里（字段级，「恢复默认」= 回到插件出厂默认，不受 patch 装配基线影响）；生效需要热重载/重启 meow-memory 插件。',
     ),
     !snap.writable ? el('span', { className: 'meowmm_set_muted' }, '当前连接为只读（设置写入仅限本机回环连接）。') : null,
     savedAt > 0 ? el('span', { className: 'meowmm_set_saved' }, '已保存 ✓ 热重载/重启 meow-memory 插件后生效') : null,

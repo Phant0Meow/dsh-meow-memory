@@ -166,9 +166,15 @@ npm install meow-memory
 2. Add `meow-memory` to the profile `package.json`'s `dsh.profile.bundles` (same as above).
 3. Restart `dsh web`. New sessions pick up the plugin automatically.
 
+## 🔌 Compatibility
+
+Supports **dsh 0.1.5** (including the latest `0.1.5-rc.1`) and stays backward compatible with older releases — upgrading dsh needs no change to this plugin or its configuration.
+
+The plugin never hardcodes a version: it probes host capabilities at runtime, so new and old releases each take their correct branch. Both generations are verified — on `0.1.5-rc.1` first-turn injection, memory tool calls, and client rendering all work; on `0.1.1-rc.2` behavior is unchanged from previous releases.
+
 ## ⚙️ Configuration
 
-All fields are optional (profile patch or `cordis.patch.yml`). **You don't have to hand-edit files**: the DSH settings page has a dedicated "喵记忆" tab for this plugin (peer of General/Models/Plugins) where every option below is editable in place, saved per-field with one-click restore-to-default; reload/restart the meow-memory plugin after saving for changes to take effect.
+All fields are optional (profile patch or `cordis.patch.yml`). **You don't have to hand-edit files**: the DSH settings page has a dedicated "喵记忆" tab for this plugin (peer of General/Models/Plugins) where every option below is editable in place, saved per-field with one-click restore-to-default (restoring means the plugin's built-in factory default, not the patch baseline); reload/restart the meow-memory plugin after saving for changes to take effect.
 
 ```yaml
 - id: meow-memory

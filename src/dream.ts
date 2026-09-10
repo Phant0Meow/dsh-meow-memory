@@ -37,6 +37,7 @@ import { getDb, projectList, type Level, type MemoryRow } from './db.js'
 import { fillTemplate, keyedValue, resolveSlotText } from './prompt-loader.js'
 import { readSeen, readWritten } from './inject.js'
 import { workspaceOf } from './tools.js'
+import { DEFAULT_RULES_REVIEW_DAYS } from './defaults.js'
 
 const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'meow-memory' }
 
@@ -495,9 +496,9 @@ export interface DreamConfig {
   rulesReviewDays: number
 }
 
-/** rulesReviewDays 的单一默认来源：zod schema / resolveConfig 兜底 / 各运行时函数默认参数
- *  统一引用此处——改默认值只动这一行。 */
-export const DEFAULT_RULES_REVIEW_DAYS = 2
+/** rulesReviewDays 的单一默认来源（已抽到 defaults.ts，与 client 设置页「恢复默认」共用）：
+ *  zod schema / resolveConfig 兜底 / 各运行时函数默认参数统一引用此处。 */
+export { DEFAULT_RULES_REVIEW_DAYS }
 
 /** 取指定时区的当前小时（Intl 支持；无效时区回退系统时区）。 */
 export function hourInTimeZone(timeZone: string, date = new Date()): number {

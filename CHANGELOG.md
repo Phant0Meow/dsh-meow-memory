@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased (2026-09-10)
+
+### 设置页「恢复默认」= 回到插件出厂默认（不再是 patch 装配基线）
+
+- **猫猫实证踩到的坑**：3080 设置页「反思/梦境换模型」点「恢复默认」后填进去的是 `zai-coding-cn/glm-5.3-flash`——那是 `cordis.patch.yml` 里手编的装配基线值。旧实现只做"删掉 user 层字段、显示回落 base"，而 base = 出厂默认 + patch 基线，于是 patch 值被当成"默认"还给用户。猫猫原话：「设置页有恢复默认这个按钮，它的默认就不是空……我希望它默认空」。
+- **修复**：出厂默认值抽到 `src/defaults.ts`（`CONFIG_DEFAULTS` + `factoryDefaultOf`，host 与 client 共用同一份数据，避免两处默认值漂移）；「恢复默认」直接写入出厂默认值（深拷贝，数组字段安全），出厂默认缺席的字段（`promptLang`，语义=未设置）才沿用删键回落。「已覆盖」徽章同步改成"当前生效值 ≠ 出厂默认"——patch 基线的非默认值同样显示为已覆盖，与按钮语义对齐。`DEFAULT_RULES_REVIEW_DAYS` 一并迁进 defaults.ts（dream.ts re-export 保持原导入路径）。
+- **顺带修复崩溃**：`mergeConfigLayer` 漏判 `user === null`——settings.yaml 写成空段（`meow-memory:` 后无内容）会解析成 `null`，`typeof null === 'object'` 漏过类型判断后 `Object.entries(null)` 抛 TypeError，直接崩掉 applyInner（插件整块不启动）。加 `user === null` 直通 patch 层 + 回归用例。
+- 测试：主套件 393 项通过（新增 6 项出厂默认断言）；另有 1 项既存红灯（dream 第三轮 prompt 文案断言 vs 工作区里 in-flight 的 `dream-project-summary.md` 改动）非本次引入。
+
+### 兼容性：实测 dsh 0.1.5-rc.1，向下兼容不变
+
+- 在独立实例（dsh `0.1.5-rc.1`，独立 home + 3082 端口）实测：首轮长期记忆快照注入、`memory_remember`/`memory_project` 等工具注册与真实调用、client 模块下发全部正常，**本版无需为 0.1.5 改动任何代码**。
+- 旧版（`0.1.1-rc.2`，3080/3081 现网）行为未变。README 增补「兼容性」章节。
+
 ## v0.24.1 (2026-09-06)
 
 ### 会话列表 dream 图标改追加式：修复侧边栏「工作区」以下整块空白

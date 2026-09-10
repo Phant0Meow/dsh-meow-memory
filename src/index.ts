@@ -29,6 +29,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { closeAllDbs, getDb, memoryDbPath } from './db.js'
 import { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
+import { CONFIG_DEFAULTS } from './defaults.js'
 
 import {
   abortDream,
@@ -196,26 +197,9 @@ export const Config = z.object({
 
 export const SETTINGS_NS = 'meow-memory'
 
-/** 设置页 base（预填层）=全部默认值；promptLang 刻意缺席=未设置语义（默认 zh+首用引导）。 */
-export const CONFIG_DEFAULTS = {
-  enabled: true,
-  projectDir: '.dsh-meow',
-  hitTopK: 2,
-  titleMax: 40,
-  reflect: true,
-  reflectTurns: 7,
-  autoMigrate: true,
-  dream: {
-    enabled: true,
-    idleMinutes: 180,
-    suppressWindows: [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '18:00' }],
-    suppressLeadMinutes: 15,
-    checkMinutes: 15,
-    timeZone: 'Asia/Shanghai',
-    rulesReviewDays: DEFAULT_RULES_REVIEW_DAYS,
-  },
-  delegate: { model: '' },
-}
+/** 出厂默认值定义已抽到 defaults.ts（host/client 共用，理由见该文件头注释）；
+ *  设置页 base（预填层）=出厂默认 + patch 基线，promptLang 刻意缺席=未设置语义。 */
+export { CONFIG_DEFAULTS, factoryDefaultOf } from './defaults.js'
 
 /** 单个时间点（suppressWindows 的 start/end）。 */
 const TIME_OF_DAY_RE = /^\d{1,2}:\d{2}$/
@@ -283,7 +267,10 @@ export function validateConfigUserLayer(value: unknown): void {
  * dream/delegate 子对象做浅合并：用户只改一个子字段不丢 patch 里的其余键。
  */
 export function mergeConfigLayer(patch: unknown, user: Record<string, unknown> | undefined): unknown {
-  if (user === undefined || typeof user !== 'object') return patch
+  // user === null：YAML 里写成空段（`meow-memory:` 后面没内容）会解析成 null，而
+  // typeof null === 'object' 会漏过下面这行，随后 Object.entries(null) 抛 TypeError
+  // 直接崩掉 applyInner（插件整块不启动）。防御式直通 patch 层。
+  if (user === undefined || user === null || typeof user !== 'object') return patch
   const base = (typeof patch === 'object' && patch !== null ? { ...(patch as Record<string, unknown>) } : {}) as Record<string, unknown>
   for (const [key, value] of Object.entries(user)) {
     if (key === 'dream' || key === 'delegate') {
