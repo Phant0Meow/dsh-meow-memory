@@ -29,6 +29,7 @@ import { dirname, join } from 'node:path'
 import { closeAllDbs, getDb, memoryDbPath } from './db.js'
 import { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
 import { CONFIG_DEFAULTS } from './defaults.js'
+import { ensureV0SessionsMigrated } from './migrate-v0.js'
 
 import {
   abortDream,
@@ -492,6 +493,13 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   applyCount++
   perf(`apply #${applyCount} pid=${process.pid}`)
   loadWindowIndex(resolved.projectDir) // 恢复窗口索引（热重载/重启后旧窗口不失联）
+
+  // v0 会话一次性迁移（issue #13）：标记未迁移时体检全部会话并把 source.memory 搬进
+  // sections.__meta__，完成后置位 .dsh-meow/migrate-v0-state.json，此后启动直接跳过。
+  // fire-and-forget：绝不阻塞 dsh 启动；单文件失败只记日志（用户拍板 2026-09-10）。
+  void ensureV0SessionsMigrated(resolved.projectDir, (m) => ctx.logger.info(m)).catch((e: unknown) => {
+    ctx.logger.warn(`meow-memory: migrate-v0 failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`)
+  })
   perf(`window-index restored ${windowIndex.size} windows`)
 
   // 工具注册 + disposer 收集：热重载/重启时旧 fiber 的工具必须注销，

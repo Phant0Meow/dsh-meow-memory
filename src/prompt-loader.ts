@@ -79,7 +79,11 @@ export const SLOT_PARAMS: Partial<Record<SlotName, readonly string[]>> = {
  *  文件在③仍缺失直接 throw（部署完整性由 build.mjs 拷贝保证）。
  *  末尾空白剥离：md 文件惯例以换行结尾，而原代码常量末尾无换行——剥离后与外置前逐字节等价。 */
 function readSlotFile(slot: SlotName, lang: string): string {
-  const read = (p: string): string => readFileSync(p, 'utf8').replace(/\s+$/, '')
+  const read = (p: string): string =>
+    readFileSync(p, 'utf8')
+      .replace(/\s+$/, '')
+      // markdown 转义反转义：md 源里写 memory\_project 防渲染器吃下划线，模型该看到的是裸工具名
+      .replace(/\\_/g, '_')
   const override = join(OVERRIDE_DIR, lang, `${slot}.md`)
   if (existsSync(override)) return read(override)
   if (lang !== DEFAULT_LANG) {

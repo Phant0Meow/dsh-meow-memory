@@ -428,6 +428,31 @@ abortDream(agentClaim, '.dsh-meow')
 check('abortDream finalizes immediately', dbClaim.getDreamLease('win-claim') === null && dbClaim.getWindow('win-claim')?.last_dream_time !== null)
 dbClaim.close()
 
+// steer 抛错兜底（2026-09-10，dsh 0.1.5 实测事故回归）：0.1.5 起 agent 的 inbox
+// 从内存对象改成 session projection，投影未激活时 steer 直接抛
+// "cannot read inbox state: its projection registration is not active"；
+// dream 调用点在 setInterval 里，未捕获异常会把整个 dsh 进程带走。
+// 修复=safeSteer 兜底 + 释放租约 + 返回 false（下个周期自然重试）。
+const wsSteerFail = mkdtempSync(join(tmpdir(), 'mm-steer-fail-'))
+const dbSteerFail = new MemoryDb(memoryDbPath(wsSteerFail))
+dbSteerFail.touchWindow('win-steer-fail', wsSteerFail, Date.now())
+dbSteerFail.insert({ level: 'fact', content: 'steer 兜底用例', source_session: 'win-steer-fail' })
+const agentThrows = {
+  session: { header: { id: 'win-steer-fail', cwd: wsSteerFail } },
+  steer: () => {
+    throw new Error('agent "win-steer-fail" cannot read inbox state: its projection registration is not active')
+  },
+}
+check('startWindowDream: steer throw → returns false, does not crash', startWindowDream({}, agentThrows, wsSteerFail, '.dsh-meow') === false)
+check('startWindowDream: steer throw → lease released for retry', dbSteerFail.getDreamLease('win-steer-fail') === null)
+const steeredSteerOk = []
+const agentSteerOk = { session: { header: { id: 'win-steer-fail', cwd: wsSteerFail } }, steer: (m) => steeredSteerOk.push(m) }
+check(
+  'startWindowDream: normal steer still starts after a failed attempt',
+  startWindowDream({}, agentSteerOk, wsSteerFail, '.dsh-meow') === true && steeredSteerOk.length === 1,
+)
+dbSteerFail.close()
+
 // 跨实例推进（原「孤儿收尾」）：状态在 DB 租约，任何实例的 turn-stopping 都能推进/收尾
 const wsOrphan = mkdtempSync(join(tmpdir(), 'mm-orphan-'))
 const dbOrphan = new MemoryDb(memoryDbPath(wsOrphan))
@@ -662,7 +687,7 @@ check('seven tools registered', tools.length === 7 && ['memory_remember', 'memor
   const rSubTool = await dreamToolT.execute({}, subExec)
   check('memory_dream tool rejects subagent session', rSubTool.ok === false && rSubTool.note.includes('子代理'), JSON.stringify(rSubTool))
   check('memory_dream tool reject leaves no window/lease', dbT.getWindow('win-subagent-tool') === undefined && dbT.getDreamLease('win-subagent-tool') === null)
-  const mainExec = { agent: { session: { header: { cwd: wsT, id: 'win-main-tool' } } } }
+  const mainExec = { agent: { session: { header: { cwd: wsT, id: 'win-main-tool' } }, steer: () => {} } }
   const rMainTool = await dreamToolT.execute({}, mainExec)
   check('memory_dream tool allows main window (dream starts, topic round)', rMainTool.ok === true && dbT.getDreamLease('win-main-tool') !== null, JSON.stringify(rMainTool))
   dbT.finishDream('win-main-tool', Date.now()) // 清理：收尾不留悬挂租约

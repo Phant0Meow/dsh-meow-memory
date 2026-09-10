@@ -267,6 +267,30 @@ export type DreamStateCallback = (sessionId: string, state: 'dreaming' | 'dreame
  * 抢占成功后即使本进程崩溃/被重载，下个检查周期也会按过期租约补收尾而不是重复 start。
  * 执行体：steer 主会话（组消息落主 log，turn-stopping 驱动推进）。
  */
+/**
+ * steer 兜底（2026-09-10）。dsh 0.1.5 起 agent 的 inbox 从内存对象（0.1.1 的
+ * Inbox 在 agent 构造函数里构造，永不抛）改成 session projection：读不到
+ * state 时 ReactLoopInbox.current() **直接抛错**（"cannot read inbox state:
+ * its projection registration is not active"）。对进程内挂着、但投影未激活的
+ * 会话（实测=headless/未被 GUI 进入的窗口）steer 就会抛；而 dream 的调用点跑在
+ * setInterval 定时器里，未捕获异常即**整个 dsh 进程退出**——插件绝不能把宿主带崩。
+ * 语义：steer 失败 = 这一组没送达，返回 false 交给调用方按"未启动"降级。
+ * 该兜底对旧版本零影响（旧版永不抛，行为逐字节不变），因此不需要按版本号分支。
+ */
+function safeSteer(agent: unknown, msg: unknown, workspace: string, dir: string, tag: string): boolean {
+  const steer = (agent as { steer?: (m: unknown) => void } | undefined)?.steer
+  if (typeof steer !== 'function') return false
+  try {
+    steer.call(agent, msg)
+    return true
+  } catch (error: unknown) {
+    const text = error instanceof Error ? error.message : String(error)
+    dreamLog(workspace, dir, `${tag} steer-failed err=${text}`)
+    console.warn(`[meow-memory] ${tag}: agent.steer failed, dream skipped (${text})`)
+    return false
+  }
+}
+
 export function startWindowDream(ctx: Context, agent: { session?: { header?: { id?: string } } }, workspace: string, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS): boolean {
   const sessionId = agent.session?.header?.id
   if (!sessionId) return false
@@ -285,7 +309,11 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
   if (!db.claimDream(sessionId, newDreamOwner(), T, DREAM_LEASE_MS)) return false // 别处活跃租约未过期
   onDreamState?.(sessionId, 'dreaming')
   const msg = buildDreamMessage(db, sessionId, T, rounds, 0)
-  ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
+  if (!safeSteer(agent, msg, workspace, dir, `dream start sid=${shortSessionId(sessionId)}`)) {
+    // 没送达：释放租约让下个周期自然重试，不把窗口卡在"进行中"。
+    db.releaseDream(sessionId)
+    return false
+  }
   dreamLog(workspace, dir, `dream start pid=${process.pid} session=${shortSessionId(sessionId)} rounds=${rounds.length} T=${T}`)
   return true
 }
@@ -318,8 +346,8 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
     // CAS 推进：多实例同收 turn-stopping 时只有一个成功，其余跳过
     if (db.advanceDreamLease(sessionId, lease.group_idx, DREAM_LEASE_MS)) {
       const msg = buildDreamMessage(db, sessionId, lease.T, rounds, nextIdx)
-      ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
-      dreamLog(ws, dir, `dream group ${nextIdx + 1}/${rounds.length} steered`)
+      const tag = `dream group ${nextIdx + 1}/${rounds.length}`
+      if (safeSteer(agent, msg, ws, dir, tag)) dreamLog(ws, dir, `${tag} steered`)
     }
     return
   }
@@ -736,22 +764,29 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
  *  执行时尝试取 agent（liveAgents 或 ctx.agents.get），进程重启后取不到 → 跳过（旧窗口精神）。 */
 export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow', windowIndex: Map<string, string>, onDreamState?: DreamStateCallback): () => void {
   const timer = setInterval(() => {
-    if (!cfg.enabled) return
-    // 峰时抑制（用户拍板 2026-08-19）：北京时间 09:00–12:00 / 14:00–18:00
-    // （API 峰谷电价峰时）及各自开始前 15 分钟不触发；峰时结束后本周期直接
-    // return，等下一个检查周期自然触发。进行中的 dream 不打断。
-    if (isDreamSuppressed(cfg)) return
-    // 全局检查门（防多实例/多定时器叠加）：60 秒内只有一个实例真正执行检查。
-    // 根因：热重载/多 fiber 并存时 dispose 未必清理旧 setInterval → 检查频率
-    // 远高于 checkMinutes → 同一窗口被反复 start。用共享库的原子抢占做节流，
-    // 与 claimDream（start 幂等）+ recoverInterruptedDream（中断自愈）闭环。
-    let gatePassed = false
-    for (const [, ws] of windowIndex) {
-      if (getDb(ws, dir).claimCheckGate(60_000)) gatePassed = true
-      break
+    // 定时器里的未捕获异常会终止整个 dsh 进程（插件不得杀宿主，2026-09-10 实测
+    // 过一次：0.1.5 的 steer 抛错把进程带崩）。整体兜一层：单次检查失败只记日志，
+    // 下个周期照常重试。各窗口/各步骤自身仍各自降级，这里只作最后一道保险。
+    try {
+      if (!cfg.enabled) return
+      // 峰时抑制（用户拍板 2026-08-19）：北京时间 09:00–12:00 / 14:00–18:00
+      // （API 峰谷电价峰时）及各自开始前 15 分钟不触发；峰时结束后本周期直接
+      // return，等下一个检查周期自然触发。进行中的 dream 不打断。
+      if (isDreamSuppressed(cfg)) return
+      // 全局检查门（防多实例/多定时器叠加）：60 秒内只有一个实例真正执行检查。
+      // 根因：热重载/多 fiber 并存时 dispose 未必清理旧 setInterval → 检查频率
+      // 远高于 checkMinutes → 同一窗口被反复 start。用共享库的原子抢占做节流，
+      // 与 claimDream（start 幂等）+ recoverInterruptedDream（中断自愈）闭环。
+      let gatePassed = false
+      for (const [, ws] of windowIndex) {
+        if (getDb(ws, dir).claimCheckGate(60_000)) gatePassed = true
+        break
+      }
+      if (!gatePassed) return
+      dreamSweepOnce(ctx, cfg, dir, windowIndex, onDreamState)
+    } catch (error: unknown) {
+      console.warn(`[meow-memory] dream sweep failed: ${error instanceof Error ? error.message : String(error)}`)
     }
-    if (!gatePassed) return
-    dreamSweepOnce(ctx, cfg, dir, windowIndex, onDreamState)
   }, cfg.checkMinutes * 60_000)
   return () => clearInterval(timer)
 }

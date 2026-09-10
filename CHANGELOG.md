@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.25.0 (2026-09-10)
+
+### 兼容 dsh 0.1.5：历史会话迁移器内置（Closes #13）
+
+- **历史会话打不开的根因与修复**：dsh 0.1.3-alpha.2 起的 v0→v1 会话格式迁移器对插件 source 做白名单校验（仅 kind/plugin/form/sections/summary），本插件 ≤0.24.x 写入的 `source.memory` 顶层元数据不在名单内——凡含首轮注入/关键词命中/重注入快照的历史会话在 0.1.3+ 上打开即被整体拒收（issue #13）。本版把元数据改写入 `sections` 保留节 `__meta__`（首个 section，与白名单完全合规），信息零丢失；welcome 类一次性通知的元数据本无消费者，直接移除（PR #14，作者 cuddly-guacamole）。
+- **一次性迁移内置**：插件启动时检测标记文件 `.dsh-meow/migrate-v0-state.json`（默认缺失=未迁移）：未迁移则全量扫描 `DSH_HOME/sessions`（含 archived-sessions）逐会话迁移，全部成功才置位 `migrated: true`，此后启动直接跳过；有单文件失败则不置位，下次启动自动重试。迁移全程：逐行手术式改写（不整行重序列化）、字节值与解析结构 canonical 相等才动手、每行改后 re-parse 断言无残留、原文件先镜像到 `DSH_HOME/pre-migrate-backup/`（幂等不覆盖）、tmp+rename 原子替换、零删除 API。fire-and-forget 不阻塞启动。
+- **zstd 物理层同构**（喵猫实测踩坑后重写）：dsh 会话档案是多帧 zstd 容器（帧1=header 行、帧2+=事件批次；首帧明文必须恰一行——`assertZstdHeaderFrame`）。迁移器按帧扫描边界逐帧解压、按 dsh `encodeMaterialization` 同构重编码（header 独立成帧 + checksum），通过 841 文件物理体检与官方 v0→v1→v2 语义链抽样验证。注意：`node:zlib` 的 `zstdDecompressSync` 对多帧容器只解第一帧，勿用其做整容器解压。
+
+### 兼容 dsh 0.1.5：设置页 API 跟随上游（PR #16，作者 ICE-CBing）
+
+- dsh-settings 0.1.5 移除了 `installSettingsSection` 自由函数，改用 settings 服务方法 `installSection(owner, ns, schema, entry, hooks)`（参数序与 hooks 契约不变）。设置区注册改为官方注入姿势，服务未装配时降级 patch 层配置不挡插件本体。
+
+### 稳定性：dream 定时器不再可能带崩 dsh 进程
+
+- `scheduleDream` 的 setInterval 回调整体 try/catch（真机实证：dsh 0.1.5 下投影窗批量唤醒使 SQLite 短暂锁死，`claimCheckGate` 同步抛 "database is locked"，未捕获异常直接终止整个 dsh 进程——插件绝不能杀宿主）。单次检查失败只记日志，下个周期自然重试。
+- steer 兜底（`safeSteer`）：0.1.5 起 agent inbox 改为 session projection，投影未激活时 `agent.steer` 抛错；dream 调用点吞掉并返回 false（该组未送达降级），旧行为逐字节不变。
+
+### 修复：prompt 文件 markdown 转义泄漏
+
+- prompt 槽位文件（如 `dream-project-summary.md`）按 md 惯例写的 `memory\_project` 会原样进入模型消息（模型看到带反斜杠的工具名）。`readSlotFile` 读取时统一反转义 `\_` → `_`。同步修复了 v0.24.2 起存量的 dream 第三轮文案断言红灯（397 项主套件全绿）。
+
+### 测试
+
+- 主套件 397 + client-fold 24 + delegate-notice 22，全部通过；语言包 en 与 zh 键集对齐校验通过。
+
 ## v0.24.2 (2026-09-10)
 
 ### 设置页「恢复默认」= 回到插件出厂默认（不再是 patch 装配基线）
