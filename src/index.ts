@@ -438,6 +438,74 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
   }
 }
 
+/** dsh-settings 服务最小形态（新旧两版公共面并集）。 */
+interface SettingsScopeLike {
+  get: () => unknown
+  watch: (cb: () => void) => unknown
+}
+interface SettingsServiceLike {
+  /** dsh 0.1.3+ 服务方法；0.1.2 及以下不存在。 */
+  installSection?: (owner: Context, ns: string, schema: unknown, entry: unknown, hooks: Record<string, unknown>) => void
+  /** 两版都有：底层命名空间注册（旧 installSettingsSection 内部即调它）。 */
+  register?: (ns: string, schema: unknown, options: { base: unknown; validate?: (value: unknown) => void }) => SettingsScopeLike
+}
+
+/**
+ * 双版本设置区注册：dsh 0.1.2 及以下旧版把 installSettingsSection 作为
+ * dsh-settings 的自由函数提供（0.1.5 起已移除，故本插件不能静态 import 它——
+ * ESM 缺导出会在模块加载期直接报错）。按「settings 服务是否暴露 installSection
+ * 方法」分流，它正好是两版的能力分界：0.1.3+ 有 installSection（走新 API）；
+ * 0.1.2 及以下没有（回退，复刻旧 installSettingsSection 的 register 行为）。
+ */
+function installSettingsSectionCompat(
+  settingsCtx: unknown,
+  ownerCtx: Context,
+  ns: string,
+  schema: unknown,
+  entry: unknown,
+  hooks: {
+    validate?: (value: unknown) => void
+    setSource: (get: () => unknown) => void
+    onChange: () => void
+  },
+): void {
+  const sctx = settingsCtx as {
+    settings: SettingsServiceLike
+    effect: (fn: () => () => void) => unknown
+  }
+  const settings = sctx.settings
+
+  // 新版（dsh 0.1.3+）：官方服务方法 installSection。
+  if (typeof settings.installSection === 'function') {
+    settings.installSection(ownerCtx, ns, schema, entry, hooks as unknown as Record<string, unknown>)
+    return
+  }
+
+  // 旧版（dsh 0.1.2 及以下）：复刻 installSettingsSection 的 register + effect + watch。
+  const register = settings.register
+  if (typeof register !== 'function') {
+    throw new Error('settings service exposes neither installSection nor register')
+  }
+  const scope = register.call(settings, ns, schema, {
+    base: entry,
+    ...(hooks.validate === undefined ? {} : { validate: hooks.validate }),
+  })
+  hooks.setSource(() => scope.get())
+  sctx.effect(() => () => {
+    // fiber 收尾中（值镜像 cordis FiberState：4=DISPOSED / 5=UNLOADING）不再回填。
+    const state = (ownerCtx as unknown as { fiber?: { state?: number } }).fiber?.state
+    if (state === 4 || state === 5) return
+    hooks.setSource(() => entry)
+    hooks.onChange()
+  })
+  hooks.onChange()
+  scope.watch(() => {
+    const state = (ownerCtx as unknown as { fiber?: { state?: number } }).fiber?.state
+    if (state === 4 || state === 5) return
+    hooks.onChange()
+  })
+}
+
 async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // ── 设置页命名空间（喵记忆标签页的数据底座）──
   // installSettingsSection 必须先于 resolveConfig：setSource 在 install 时同步回填
@@ -449,17 +517,17 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   const settingsBase = mergeConfigLayer(CONFIG_DEFAULTS, config)
   let settingsGet: (() => unknown) | undefined
   try {
-    // dsh-settings 0.1.5 把 installSettingsSection 自由函数改成了
-    // settings 服务方法 installSection(owner, ns, schema, entry, hooks)，
-    // 参数顺序和 hooks 契约不变。这里改用新方法注册设置区。
+    // 双版本设置区注册（0.1.2 及以下旧版 / 0.1.3+ 新版）分流见 installSettingsSectionCompat：
+    // 新版走 settings.installSection；旧版回退 settings.register 复刻旧自由函数行为。
+    // 注册必须先于 resolveConfig：setSource 在 install 时同步回填 getter，
+    // 首启/热重载的首次 resolve 就能合并 settings.yaml 的 user 层。
     // 注册失败（比如 settings 服务未装配）不影响插件本体：
     // 下面 catch 会降级为只走 patch 层配置，设置页标签不可用。
     ctx.inject(['settings'], (settingsCtx: {
-      settings: {
-        installSection: (owner: Context, ns: string, schema: unknown, entry: unknown, hooks: Record<string, unknown>) => void
-      }
+      settings: SettingsServiceLike
+      effect: (fn: () => () => void) => unknown
     }) => {
-      settingsCtx.settings.installSection(ctx, SETTINGS_NS, z.dict(z.any()), settingsBase, {
+      installSettingsSectionCompat(settingsCtx, ctx, SETTINGS_NS, z.dict(z.any()), settingsBase, {
         validate: (value: unknown): void => {
           validateConfigUserLayer(value)
         },
