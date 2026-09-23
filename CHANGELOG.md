@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.28.0 (unreleased - release candidate)
+## v0.28.0 (2026-09-23)
 
 ### 内置巴西葡语 prompt 语言包（src/prompts/pt-br/）
 
@@ -27,6 +27,21 @@
 ### 测试
 
 - 新增 `tests/client-i18n.mjs`（61 项：三语键集/占位符一致、静态查表、语言订阅、DSH 服务接线含 fallback 链与幂等/降级、各模块三语输出、重放注册表）与 `tests/settings-page.mjs`（42 项：标签随语言重注册、页面渲染文案、峰时解析错误文案本地化）；`client-fold` / `client-dream-skip` / `client-delegate-notice` 补 en / pt-br 断言，issue #20 的提示断言保留并补齐三语。
+## v0.27.1 (2026-09-23)
+
+### dsh 0.1.7 兼容：settingsScope 客户端服务已删，移出强制 inject（三处）
+
+- **问题**：0.1.7 删除了客户端 `settingsScope` 服务，本插件客户端模块的 inject 清单带着它 → 整个插件 pending（"waiting for service: settingsScope"），折叠/图标/委托气泡全部不上场。
+- **修法**：settingsScope 移出强制 inject 数组；设置页挂载改 `ctx.get('settingsScope')` 软取并加缺省守卫（0.1.7 上设置页不注册，其余功能不受影响）。注意 cordis 对未声明服务的属性访问会抛 rejectGuard，可选链防不住，必须 ctx.get。0.1.6 上服务仍在，行为不变。
+
+### 新增：0.1.7 指令菜单 dream 行换官方脸
+
+- 0.1.7 指令菜单里官方指令都是「图标 + 中文名 + 右对齐一句话描述」，dream 作为宿主目录行只有名字加长描述，无图标。新增 `client-menu-dream.ts`：客户端 DOM 装饰给 dream 行补 FA 空心月牙（样式类抄官方图标行）并把描述换成一句话；只锚定 0.1.7 菜单的 DOM 结构特征（`[data-trigger-menu]` + `dsh-slash-option-command-` 行 id），0.1.6 菜单天然不命中、服务端 description 原样保留。
+
+### 修复：`<style>` 标签自报家门
+
+- 0.1.6 加载器会认领无主 `<style>` 并在其他插件热替换时连坐删除，本插件的样式标签补 `data-plugin="meow-memory"` 自报家门。
+
 
 ## v0.27.0 (2026-09-20)
 
