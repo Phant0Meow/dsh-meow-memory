@@ -455,6 +455,15 @@ function MemorySettingsSection(props: { scope: any }): any {
 // ── 挂载 ────────────────────────────────────────────────────────────────────
 
 export function applySettingsPage(ctx: any): void {
+  // 0.1.7 移除了客户端 settingsScope 服务：缺省时跳过设置页注册（caller 的
+  // try/catch 兜底仍在；0.1.6 上服务存在，此分支不触发，行为不变）。
+  // 注意必须走 ctx.get 软取——cordis 对未声明服务的属性访问会直接抛
+  // rejectGuard（"cannot get property ... without inject"），可选链防不住。
+  const settingsScope = typeof ctx?.get === 'function' ? ctx.get('settingsScope') : undefined
+  if (settingsScope === undefined) {
+    console.info('[meow-memory] settingsScope 服务缺失（0.1.7+），设置页未注册')
+    return
+  }
   if (typeof document !== 'undefined' && document.querySelector(`style[data-plugin-css="${CSS_ID}"]`) === null) {
     const tag = document.createElement('style')
     tag.dataset.plugin = 'meow-memory-settings'
@@ -463,7 +472,7 @@ export function applySettingsPage(ctx: any): void {
     document.head.appendChild(tag)
   }
 
-  const scope = ctx.settingsScope.bind({ namespace: SETTINGS_NS })
+  const scope = settingsScope.bind({ namespace: SETTINGS_NS })
 
   // 顶级分区（与「通用」「模型」「插件」平级）：list slot 契约 = id + order + label。
   // label 直接返回中文（第三方 locale 字典在官方外壳没有席位——cachebilling 实测结论）。

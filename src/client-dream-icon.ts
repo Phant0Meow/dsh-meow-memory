@@ -281,6 +281,8 @@ export function startDreamIconManager(): () => void {
   }
   const style = document.createElement('style')
   style.dataset.meowDreamIconCss = 'true'
+  // 0.1.6 加载器认领无主 <style> 并在其他插件热替换时连坐删除——必须自报家门。
+  style.dataset.plugin = 'meow-memory'
   style.textContent = ICON_CSS
   document.head.appendChild(style)
 

@@ -31,6 +31,7 @@ import {
 import { applyDelegateNotices, computeDelegateNotices, startDelegateStateSync, type DelegateNotice } from './client-delegate-notice.ts'
 import { startDreamIconManager } from './client-dream-icon.ts'
 import { startDreamSkipManager } from './client-dream-skip.ts'
+import { startMenuDreamFace } from './client-menu-dream.ts'
 import { applySettingsPage } from './settings-page.ts'
 
 /** 折叠行标记（CSS 规则隐藏）。 */
@@ -648,7 +649,11 @@ function makeDelegateVanishDock(
  * 并注册 composer.dock 隐形条目驱动折叠、header 隐身哨兵（挂 header.actions 叠加槽）。
  * @param ctx - client 根上下文（slots / sessions 服务）。
  */
-export const inject = ['slots', 'settingsScope', 'sessions']
+// settingsScope 不进强制 inject：dsh 0.1.7 移除了该客户端服务，写进清单会让
+// 整个插件 pending（"waiting for service: settingsScope"）。官方纪律=只 inject
+// 必需服务，可选服务走 ctx 软取——settings-page.ts 顶部已有缺省守卫，0.1.6 上
+// 服务仍在（ctx.settingsScope 照常可用），行为不变。
+export const inject = ['slots', 'sessions']
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function apply(ctx: any): () => void {
@@ -659,6 +664,8 @@ export function apply(ctx: any): () => void {
   disposers.push(startDelegateStateSync())
   // 会话「…」菜单「跳过梦境整理记忆」toggle（v0.16.0）：同上独立启动，静默降级。
   disposers.push(startDreamSkipManager())
+  // 指令菜单 dream 行换官方脸（0.1.7 菜单 DOM 装饰；0.1.6 菜单结构不同天然不命中）。
+  disposers.push(startMenuDreamFace())
   // 设置页「喵记忆」标签页（settings.section 顶级分区）：settingsScope 服务缺失
   // 或注册失败只警告，不影响折叠/图标。
   try {
@@ -675,6 +682,8 @@ export function apply(ctx: any): () => void {
   }
   const style = document.createElement('style')
   style.dataset.meowMemoryCss = 'true'
+  // 0.1.6 加载器认领无主 <style> 并在其他插件热替换时连坐删除——必须自报家门。
+  style.dataset.plugin = 'meow-memory'
   style.textContent = FOLD_CSS
   document.head.appendChild(style)
   const slots = ctx?.slots
