@@ -10,6 +10,14 @@
 - **识别端同步**：客户端折叠、delegate 打点、host 端反思计数与 `wasDreamTurn` 统一改用 `isMeowSource` 判定，**同时接受当前形态与退役形态**——退役形态用于尚未迁移的历史日志；而迁移后的历史会话本身就是当前形态，原判定 `kind === 'plugin' && plugin === 'meow-memory'` 在迁移丢弃 `plugin` 字段后必然失配，本次一并修好。
 - **测试**：5 处产物形态断言随实现更新；`tests/client-fold.mjs` 新增「两种形态同判、别的插件与无关 kind 不误判」用例。
 
+### 恢复：设置页「喵记忆」在 0.1.7 重新可见（configForms 腿，双版本兼容）
+
+- **背景**：0.1.7 移除了客户端 `settingsScope` 服务（旧设置页的读写通道），v0.27.1 的守卫因此在 0.1.7 上直接跳过注册——设置页消失，改配置只能手编 settings.yaml。**挂页的路本身没被堵死**：0.1.7 的 `settings.section` slot 原样健在（官方「通用」「账号」「Agent 预设」页同款注册形状），被删的只是读写服务。
+- **修法**：挂载改双版本两条腿——0.1.6 走 `settingsScope.bind({namespace})`（原链路一字不动）；0.1.7 走设置域基础服务 `configForms.get(entryId)`，其共享表单的 `getSnapshot/subscribe/set/unset` 与组件消费的 scope 形状同构（status/value/base/user/writable/mode、单层键、被拒写入静默 recover），**组件本体零改动**。Host 侧 `describe()` 自动把所有带 schema 的活跃插件列为命名空间（`ns`=entry id），本插件 Config 照常声明，数据源两版同源。
+- **时序**：`configForms` 不进 inject 清单（0.1.6 没有该服务，写进清单会整插件 pending），客户端组合顺序也不保证提供方先起——短轮询（400ms，约 30s 上限）等它就绪再挂页；等不到只留一行日志，不影响插件其余功能。
+- **注意**：共享表单由 configForms 提供方持有并随其卸载，插件侧不 dispose（dispose 后 forms 表仍缓存该实例，热重载会拿到死表单）。
+- **测试**：`tests/settings-page.mjs` 新增第 4 节「双版本挂载」——0.1.6 软取腿、0.1.7 表单当 scope、双缺安全降级（轮询自行放弃）、configForms 迟到轮询等到即挂页、dispose 清理，42→55 项。
+
 ## v0.28.1 (2026-09-23)
 
 ### 修复：已删除的工作区目录不再被启动流程复活（#27）

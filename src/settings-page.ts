@@ -1,10 +1,17 @@
 /**
- * meow-memory — 设置页「喵记忆」标签页。
+ * meow-memory — 设置页「喵记忆」标签页（0.1.6 / 0.1.7 双版本）。
  *
- * 形态：settings.section 顶级分区（与「通用」「模型」「插件」平级），契约照
- * meow-cachebilling 验证过的实现：client 挂 list slot（id+order+label）+
- * settingsScope.bind({namespace}) 读写 user 层；host 半身 installSettingsSection
- * 注册同名命名空间（index.ts applyInner 最前面），base=CONFIG_DEFAULTS 预填。
+ * 形态：settings.section 顶级分区（与「通用」「模型」「插件」平级），两版都有
+ * 该 slot（0.1.7 官方自己的「通用」「账号」「Agent 预设」页同款注册形状）。
+ * 读写层两条腿：
+ * - 0.1.6：客户端 settingsScope 服务仍在，bind({namespace}) 读写 user 层
+ *   （契约照 meow-cachebilling 验证过的实现；host 半身 installSettingsSection
+ *   注册同名命名空间，index.ts applyInner 最前面，base=CONFIG_DEFAULTS 预填）。
+ * - 0.1.7：settingsScope 被官方移除，改用设置域基础服务 configForms——
+ *   get(entryId) 按命名空间（= entry id = 'meow-memory'）取共享表单，其
+ *   getSnapshot/subscribe/set/unset 与组件消费的 scope 形状同构，组件零改动。
+ *   Host 侧 describe() 自动把所有带 schema 的活跃插件列为命名空间
+ *   （value/base/user 三层），本插件 Config 照常声明，数据源两版同源。
  *
  * 生效语义（诚实版）：meow-memory 的 config 在 apply 时解析，保存写入 settings.yaml
  * 的 user 层后需热重载/重启插件生效——页面顶栏明示，不做静默假生效。
@@ -471,66 +478,130 @@ export function MemorySettingsSection(props: { scope: any }): any {
 
 // ── 挂载 ────────────────────────────────────────────────────────────────────
 
-export function applySettingsPage(ctx: any): () => void {
-  // 0.1.7 移除了客户端 settingsScope 服务：缺省时跳过设置页注册（caller 的
-  // try/catch 兜底仍在；0.1.6 上服务存在，此分支不触发，行为不变）。
-  // 注意必须走 ctx.get 软取——cordis 对未声明服务的属性访问会直接抛
-  // rejectGuard（"cannot get property ... without inject"），可选链防不住。
-  let settingsScope: any
-  if (typeof ctx?.get === 'function') settingsScope = ctx.get('settingsScope')
-  else {
-    // 无 ctx.get 的环境（含测试 mock）：退回直接属性读取，rejectGuard 风险用 try/catch 兜住。
-    try { settingsScope = ctx?.settingsScope } catch { settingsScope = undefined }
-  }
-  if (settingsScope === undefined) {
-    console.info('[meow-memory] settingsScope 服务缺失（0.1.7+），设置页未注册')
-    return () => {}
-  }
-  if (typeof document !== 'undefined' && document.querySelector(`style[data-plugin-css="${CSS_ID}"]`) === null) {
-    const tag = document.createElement('style')
-    tag.dataset.plugin = 'meow-memory-settings'
-    tag.dataset.pluginCss = CSS_ID
-    tag.textContent = CSS
-    document.head.appendChild(tag)
-  }
+/** 可选服务软取：cordis 对未声明服务的属性访问直接抛 rejectGuard（可选链防不住），
+ *  ctx.get 不抛（缺服务返回 undefined）；无 ctx.get 的环境（含测试 mock）退回
+ *  属性读取并用 try/catch 兜住。 */
+function softService(ctx: any, name: string): any {
+  if (typeof ctx?.get === 'function') return ctx.get(name)
+  try { return ctx?.[name] } catch { return undefined }
+}
 
-  const scope = settingsScope.bind({ namespace: SETTINGS_NS })
+/** 注入设置页 CSS（幂等：同名 data-plugin-css 只挂一份）。 */
+function injectSettingsCss(): void {
+  if (typeof document === 'undefined') return
+  if (document.querySelector(`style[data-plugin-css="${CSS_ID}"]`) !== null) return
+  const tag = document.createElement('style')
+  tag.dataset.plugin = 'meow-memory-settings'
+  tag.dataset.pluginCss = CSS_ID
+  tag.textContent = CSS
+  document.head.appendChild(tag)
+}
+
+/** 轮询参数（测试可注入短周期；生产默认 400ms × 75 ≈ 30s 后放弃并留日志）。 */
+export interface SettingsPageMountOptions {
+  pollMs?: number
+  maxPollAttempts?: number
+}
+
+/**
+ * 挂设置页（双版本两条腿，settings.section 注册形状两版共用）。
+ *
+ * - 0.1.6 腿：settingsScope 服务存在 → bind({namespace}) 得 scope（原链路不变）。
+ * - 0.1.7 腿：settingsScope 缺席 → configForms.get(entryId) 取共享表单直接当
+ *   scope（接口同构：getSnapshot 的 status/value/base/user/writable/mode、
+ *   subscribe、单层键 set/unset；被拒写入静默 recover 重载镜像——成功与否照旧
+ *   回读 user 层判定）。共享表单由 configForms 提供方持有并随其卸载，这里**不
+ *   dispose**：dispose 后 forms 表仍缓存该实例，热重载再 get 会拿到死表单。
+ *
+ * 时序说明：configForms 不进 inject 清单（0.1.6 没有该服务，写进清单会让整个
+ * 插件 pending），而客户端组合顺序不保证提供方先起——短轮询等它就绪再挂页；
+ * 等不到（异常宿主）只留一行日志，不影响插件其余功能。
+ */
+export function applySettingsPage(ctx: any, opts?: SettingsPageMountOptions): () => void {
+  const pollMs = opts?.pollMs ?? 400
+  const maxPollAttempts = opts?.maxPollAttempts ?? 75
 
   // 顶级分区（与「通用」「模型」「插件」平级）：list slot 契约 = id + order + label。
   // label 是「注册者本地化」的文案：外壳不订阅 locale 状态，注册者要在语言切换时
   // 用新文案重注册（官方契约原话），所以这里保存注册 disposer，语言一变就重注册。
-  let disposeEntry: (() => void) | null = null
-  const registerSection = (): void => {
-    try {
-      disposeEntry?.()
-    } catch {
-      /* 旧条目已在卸载：继续注册新条目 */
+  const mountWithScope = (scope: any): () => void => {
+    injectSettingsCss()
+    let disposeEntry: (() => void) | null = null
+    const registerSection = (): void => {
+      try {
+        disposeEntry?.()
+      } catch {
+        /* 旧条目已在卸载：继续注册新条目 */
+      }
+      disposeEntry = ctx.slots.register(
+        {
+          name: 'settings.section',
+          id: SETTINGS_NS,
+          order: 35,
+          label: () => t('settings.title'),
+          inject: (): unknown => ({ scope }),
+        },
+        MemorySettingsSection,
+      )
     }
-    disposeEntry = ctx.slots.register(
-      {
-        name: 'settings.section',
-        id: SETTINGS_NS,
-        order: 35,
-        label: () => t('settings.title'),
-        inject: (): unknown => ({ scope }),
-      },
-      MemorySettingsSection,
-    )
+    const disposeInjection = ctx.slots.inject('settings.section', registerSection)
+    const unsubscribeLocale = onUiLocaleChange(registerSection)
+    return () => {
+      unsubscribeLocale()
+      try {
+        disposeInjection()
+      } catch {
+        /* 清理失败不阻塞 */
+      }
+      try {
+        disposeEntry?.()
+      } catch {
+        /* 清理失败不阻塞 */
+      }
+    }
   }
-  const disposeInjection = ctx.slots.inject('settings.section', registerSection)
-  const unsubscribeLocale = onUiLocaleChange(registerSection)
 
-  return () => {
-    unsubscribeLocale()
-    try {
-      disposeInjection()
-    } catch {
-      /* 清理失败不阻塞 */
+  // ── 0.1.6 腿：settingsScope 在，原样走旧链路 ──────────────────────────────
+  const settingsScope = softService(ctx, 'settingsScope')
+  if (settingsScope !== undefined) return mountWithScope(settingsScope.bind({ namespace: SETTINGS_NS }))
+
+  // ── 0.1.7 腿：settingsScope 被移除，等 configForms 提供方就绪 ─────────────
+  let mountDisposer: (() => void) | null = null
+  let pollTimer: ReturnType<typeof setInterval> | undefined
+  let attempts = 0
+  const stopPoll = (): void => {
+    if (pollTimer !== undefined) {
+      clearInterval(pollTimer)
+      pollTimer = undefined
     }
-    try {
-      disposeEntry?.()
-    } catch {
-      /* 清理失败不阻塞 */
+  }
+  const attach = (): void => {
+    if (mountDisposer !== null) return
+    const configForms = softService(ctx, 'configForms')
+    if (configForms === undefined || typeof configForms.get !== 'function') return
+    mountDisposer = mountWithScope(configForms.get(SETTINGS_NS))
+    stopPoll()
+  }
+  attach()
+  if (mountDisposer === null) {
+    pollTimer = setInterval(() => {
+      attach()
+      attempts += 1
+      if (mountDisposer === null && attempts >= maxPollAttempts) {
+        stopPoll()
+        console.info('[meow-memory] configForms 服务未就绪（0.1.7 设置页未注册；插件其余功能不受影响）')
+      }
+    }, pollMs)
+  }
+  return () => {
+    stopPoll()
+    if (mountDisposer !== null) {
+      try {
+        mountDisposer()
+      } catch {
+        /* 清理失败不阻塞 */
+      }
+      mountDisposer = null
     }
   }
 }

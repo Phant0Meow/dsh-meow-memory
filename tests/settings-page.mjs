@@ -191,5 +191,104 @@ check('pt-br 格式错误', settings.parseSuppressWindows('abc').error === 'O in
 check('解析成功路径不变', JSON.stringify(settings.parseSuppressWindows('09:00-12:00, 14:00-18:00').value) === JSON.stringify([{ start: '09:00', end: '12:00' }, { start: '14:00', end: '18:00' }]))
 check('序列化不变', settings.serializeSuppressWindows([{ start: '09:00', end: '12:00' }]) === '09:00-12:00')
 
+// ── 4. 双版本挂载：0.1.6 settingsScope 腿 / 0.1.7 configForms 腿 ────────────
+// 0.1.7 移除客户端 settingsScope，改用设置域 configForms：get(entryId) 的共享
+// 表单与组件吃的 scope 形状同构（getSnapshot/subscribe/单层键 set/unset）。
+// 本节锁死：软取分腿、configForms 就绪前轮询等待、双缺安全降级、dispose 清理。
+console.log('=== 4. 双版本挂载（settingsScope / configForms）===')
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** slots 服务桩：记录每次 register 的 {options, component}，inject 同步回调（真实外壳语义）。 */
+function makeSlots() {
+  const registrations = []
+  return {
+    registrations,
+    slots: {
+      register: (options, component) => {
+        registrations.push({ options, component })
+        return () => {}
+      },
+      inject: (_slot, cb) => {
+        cb()
+        return () => {}
+      },
+    },
+  }
+}
+
+/** ctx.get 形态的宿主桩（真实宿主两版都有 ctx.get；返回 undefined=服务缺席）。 */
+function ctxWithGet(services, slots) {
+  return { get: (name) => services[name], slots }
+}
+
+/** configForms.get 产出的共享表单桩：0.1.7 ConfigForm 的形状（含 mode/revision）。 */
+function makeFormStub() {
+  return {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ status: 'ready', value: { enabled: true }, base: {}, user: {}, writable: true, revision: 3, mode: 'host' }),
+    set: async () => true,
+    unset: async () => true,
+  }
+}
+
+// 4.1 0.1.6 腿（ctx.get 软取路线）：bind 的命名空间结果原样当 scope。
+{
+  const bound = { subscribe: () => () => {}, getSnapshot: () => ({ status: 'ready', value: {}, base: {}, user: {}, writable: true, mode: 'user' }), set: async () => {}, unset: async () => {} }
+  const bindArgs = []
+  const { registrations, slots } = makeSlots()
+  const ctx = ctxWithGet({ settingsScope: { bind: (args) => { bindArgs.push(args); return bound } } }, slots)
+  const disposeLeg = settings.applySettingsPage(ctx)
+  check('0.1.6 腿（ctx.get）注册了设置页', registrations.length >= 1 && registrations[0].options.name === 'settings.section')
+  check('0.1.6 腿绑定 meow-memory 命名空间', bindArgs.length >= 1 && bindArgs[0].namespace === 'meow-memory', JSON.stringify(bindArgs))
+  check('0.1.6 腿 scope=bind 结果', registrations[registrations.length - 1].options.inject().scope === bound)
+  disposeLeg()
+}
+
+// 4.2 0.1.7 腿（configForms 就绪）：get(entryId) 表单直接当 scope，组件可渲染。
+{
+  const form = makeFormStub()
+  const getCalls = []
+  const { registrations, slots } = makeSlots()
+  const ctx = ctxWithGet({ configForms: { get: (id) => { getCalls.push(id); return form } } }, slots)
+  const disposeLeg = settings.applySettingsPage(ctx)
+  check('0.1.7 腿注册了设置页', registrations.length >= 1 && registrations[registrations.length - 1].options.name === 'settings.section')
+  check('0.1.7 腿以命名空间取表单', getCalls.includes('meow-memory'), JSON.stringify(getCalls))
+  check('0.1.7 腿 scope=configForms 表单', registrations[registrations.length - 1].options.inject().scope === form)
+  const page = texts(settings.MemorySettingsSection({ scope: form }))
+  check('0.1.7 形状快照可渲染（标题在场）', page.includes('Meow memory') || page.includes('喵记忆'))
+  disposeLeg()
+  const afterDispose = registrations.length
+  settings.setUiLocaleForTest('zh')
+  check('0.1.7 腿 dispose 后不再重注册', registrations.length === afterDispose, String(registrations.length))
+}
+
+// 4.3 双缺（异常宿主）：不注册、轮询自行放弃、dispose 安全。
+{
+  const { registrations, slots } = makeSlots()
+  const ctx = ctxWithGet({}, slots)
+  const disposeLeg = settings.applySettingsPage(ctx, { pollMs: 5, maxPollAttempts: 2 })
+  check('双缺不注册设置页', registrations.length === 0, String(registrations.length))
+  await sleep(40)
+  check('双缺轮询放弃后仍不注册', registrations.length === 0, String(registrations.length))
+  disposeLeg()
+}
+
+// 4.4 0.1.7 腿（configForms 迟到）：提供方晚于插件 apply 就绪，轮询等到即挂页。
+{
+  const form = makeFormStub()
+  let calls = 0
+  const { registrations, slots } = makeSlots()
+  const ctx = ctxWithGet({ get configForms() { calls += 1; return calls > 3 ? { get: () => form } : undefined } }, slots)
+  const disposeLeg = settings.applySettingsPage(ctx, { pollMs: 5, maxPollAttempts: 200 })
+  check('configForms 缺席期间不注册', registrations.length === 0, String(registrations.length))
+  await sleep(60)
+  check('configForms 就绪后轮询挂页', registrations.length >= 1 && registrations[registrations.length - 1].options.inject().scope === form, String(registrations.length))
+  disposeLeg()
+  const afterDispose = registrations.length
+  await sleep(20)
+  check('0.1.7 腿迟到挂页 dispose 后稳定', registrations.length === afterDispose, String(registrations.length))
+}
+
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed === 0 ? 0 : 1)

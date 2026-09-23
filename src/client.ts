@@ -665,10 +665,11 @@ function makeDelegateVanishDock(
  * 并注册 composer.dock 隐形条目驱动折叠、header 隐身哨兵（挂 header.actions 叠加槽）。
  * @param ctx - client 根上下文（slots / sessions 服务）。
  */
-// settingsScope 不进强制 inject：dsh 0.1.7 移除了该客户端服务，写进清单会让
-// 整个插件 pending（"waiting for service: settingsScope"）。官方纪律=只 inject
-// 必需服务，可选服务走 ctx 软取——settings-page.ts 顶部已有缺省守卫，0.1.6 上
-// 服务仍在（ctx.settingsScope 照常可用），行为不变。
+// settingsScope / configForms 都不进强制 inject：两者都是可选服务（0.1.6 只有
+// settingsScope，0.1.7 只有 configForms），写进清单会让缺它的那一版整个插件
+// pending（"waiting for service: …"）。官方纪律=只 inject 必需服务，可选服务走
+// ctx 软取——applySettingsPage 双腿软取（0.1.6 走 settingsScope.bind，0.1.7 短
+// 轮询等 configForms 提供方就绪后 get(entryId) 当 scope），缺服务只降级不阻断。
 export const inject = ['slots', 'sessions']
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -690,8 +691,8 @@ export function apply(ctx: any): () => void {
   disposers.push(startDreamSkipManager())
   // 指令菜单 dream 行换官方脸（0.1.7 菜单 DOM 装饰；0.1.6 菜单结构不同天然不命中）。
   disposers.push(startMenuDreamFace())
-  // 设置页「喵记忆」标签页（settings.section 顶级分区）：settingsScope 服务缺失
-  // 或注册失败只警告，不影响折叠/图标。
+  // 设置页「喵记忆」标签页（settings.section 顶级分区，0.1.6/0.1.7 双版本）：
+  // 服务缺失、轮询超时或注册失败只警告，不影响折叠/图标。
   try {
     disposers.push(applySettingsPage(ctx))
   } catch (e) {
