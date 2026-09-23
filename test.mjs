@@ -19,6 +19,7 @@ import {
   memoryDbPath,
   getDb,
   closeAllDbs,
+  loadWindowIndex,
   migrateLegacy,
   buildInjection,
   buildHitInjection,
@@ -1724,6 +1725,24 @@ rmSync(wsD, { recursive: true, force: true })
 rmSync(wsR, { recursive: true, force: true })
 rmSync(wsIcon, { recursive: true, force: true })
 rmSync(wsNoDb, { recursive: true, force: true })
+
+// ── issue #27：已删除的工作区目录不被 loadWindowIndex 复活 ──
+{
+  const tmp = mkdtempSync(join(tmpdir(), 'meow-i27-'))
+  const wsLive = join(tmp, 'ws-live')
+  const wsDead = join(tmp, 'ws-dead')
+  mkdirSync(join(wsLive, '.dsh-meow'), { recursive: true })
+  // 存活工作区先建库（模拟真实使用过的状态）
+  getDb(wsLive, '.dsh-meow').close()
+  const indexFile = join(tmp, 'window-index.json')
+  writeFileSync(indexFile, JSON.stringify({ 's-live': wsLive, 's-dead': wsDead }))
+  loadWindowIndex('.dsh-meow', indexFile)
+  check('issue#27 存活工作区的索引恢复不受影响', existsSync(join(wsLive, '.dsh-meow', 'memory.db')))
+  check('issue#27 已删除的工作区目录不被复活', !existsSync(wsDead))
+  check('issue#27 存活工作区目录不被误删', existsSync(wsLive))
+  closeAllDbs()
+  rmSync(tmp, { recursive: true, force: true })
+}
 
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

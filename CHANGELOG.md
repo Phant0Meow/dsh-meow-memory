@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.28.1 (2026-09-23)
+
+### 修复：已删除的工作区目录不再被启动流程复活（#27）
+
+- **问题**：apply 恢复窗口索引时会把 `window-index.json` 里记录的**每一个**工作区交给 `getDb()` 打开，`MemoryDb` 构造函数的 `mkdirSync(recursive)` 连带把用户已删除的工作区根目录补建回来，并生成一份全新空 `memory.db`。`loadWindowIndex` 缺 `existsSync` 守卫——同项目 `collectDreamStates` / skip-dreams 路由两处都有同款守卫，属漏判。
+- **修法**：`loadWindowIndex` 对每个 workspace 加双守卫（工作区目录存在 + 库文件存在）才打开库；`window-index.json` 里的 sid→workspace 映射恢复不受影响，只是不再为已消失的工作区新建任何东西。另将 `loadWindowIndex` 导出并参数化 `indexFile`（供测试）。
+- **测试**：新增 3 条断言（存活工作区恢复不受影响 / 已删除目录不复活 / 存活目录不误删）。
+
+### 诊断：启动日志输出配置解析路径（issue #26 取证）
+
+- 新增一行启动日志 `config resolved (sourceReady=…, enabled=…, dream.enabled=…, promptLang=…, projectDir=…)`：用于定位「设置页配置不生效」类报告——`sourceReady=false` 即 settings 服务晚于有界等待（250ms）就绪的冷启动竞态（大 profile 上插件树加载慢时可能出现）。已在 issue #26 请报告人提供该行与确切 DSH 版本，根因确认后再定修复策略（盲改等待上限属症状补丁）。
+
+
 ## v0.28.0 (2026-09-23)
 
 ### 内置巴西葡语 prompt 语言包（src/prompts/pt-br/）

@@ -574,6 +574,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   }
   const merged = mergeConfigLayer(config, settingsGet?.() as Record<string, unknown> | undefined)
   const resolved = resolveConfig(merged)
+  // 诊断（issue #26）：把「设置源是否赶上」与关键解析值落到启动日志——配置不生效类
+  // 报告先看这一行：sourceReady=否 即冷启动竞态（settings 服务晚于等待上限就绪）。
+  ctx.logger.info(`meow-memory: config resolved (sourceReady=${settingsGet !== undefined}, enabled=${resolved.enabled}, dream.enabled=${resolved.dream?.enabled ?? 'default'}, promptLang=${resolved.promptLang ?? 'zh'}, projectDir=${resolved.projectDir ?? '.dsh-meow'})`)
   if (!resolved.enabled) {
     ctx.logger.info('meow-memory: disabled by config')
     return
@@ -1260,10 +1263,10 @@ const WINDOW_INDEX_FILE = join(homedir(), '.dsh-meow', 'window-index.json')
 /** apply 时恢复窗口索引：①文件（上次落盘）→ workspace 集合；②每个已知 workspace
  *  的 windows 表（DB 持久化，含 reload 前全部窗口）补全——旧窗口（reload 后无新
  *  事件、文件里没有）也能恢复，不会从 dream 检查中失联。 */
-function loadWindowIndex(dir = '.dsh-meow'): void {
+export function loadWindowIndex(dir = '.dsh-meow', indexFile = WINDOW_INDEX_FILE): void {
   const workspaces = new Set<string>()
   try {
-    const merged = JSON.parse(readFileSync(WINDOW_INDEX_FILE, 'utf8')) as Record<string, unknown>
+    const merged = JSON.parse(readFileSync(indexFile, 'utf8')) as Record<string, unknown>
     for (const [sid, ws] of Object.entries(merged)) {
       if (typeof ws === 'string' && ws.length > 0) {
         windowIndex.set(sid, ws)
@@ -1274,6 +1277,10 @@ function loadWindowIndex(dir = '.dsh-meow'): void {
     /* 无文件/损坏 */
   }
   for (const ws of workspaces) {
+    // 已删除的工作区不复活（issue #27）：目录没了、或从未建过库的，一律跳过——
+    // 绝不为「恢复索引」新建目录或空库（collectDreamStates / skip-dreams 同款守卫）。
+    // json 里的 sid→workspace 映射不受影响（上面已恢复），只是不去打开它的库。
+    if (!existsSync(ws) || !existsSync(memoryDbPath(ws, dir))) continue
     try {
       for (const w of getDb(ws, dir).listWindows()) {
         if (typeof w.workspace === 'string' && w.workspace.length > 0) windowIndex.set(w.session_id, w.workspace)
