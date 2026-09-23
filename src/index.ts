@@ -49,6 +49,7 @@ import {
 import { buildHitInjection, buildInjection, buildReinjection, clearReinjectPending, isReinjectPending, markAccessed, markReinjectPending, markSearched, readProjectQueried, readSeen, readInjected, releaseSeen } from './inject.js'
 import { migrateLegacy } from './migrate.js'
 import { buildReflectMessage, consecutiveToolSteps, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
+import { isMeowSource } from './source.js'
 import { registerMemoryTools } from './tools.js'
 import { resolveSlotText, setPromptLang } from './prompt-loader.js'
 
@@ -77,8 +78,7 @@ function createMemorySnapshotMessage(text: string, meta: MemorySourceMeta): Retu
   return createUserMessage({
     content: [{ type: 'text', text }],
     source: {
-      kind: 'plugin',
-      plugin: 'meow-memory',
+      ...PLUGIN_SOURCE,
       form: 'snapshot',
       sections: [encodeMetaSection(meta), { name: '长期记忆', text }],
     },
@@ -87,14 +87,13 @@ function createMemorySnapshotMessage(text: string, meta: MemorySourceMeta): Retu
 
 /** 构造独立的插件通知消息（如首次语言引导），不改写人类 user 消息。
  *  notice form 按 dsh-llm ContextFormed 契约带 summary（折叠行一行摘要，≤120 字符）；
- *  v0 迁移器对 plugin source 只允许 kind/plugin/form/sections/summary —— 因此不复用
- *  source.memory 顶层字段（迁移器拒绝），welcome 类一次性通知的元数据本就无消费者。 */
+ *  不复用 source.memory 顶层字段（v0.24- 遗留形态，新消息只用 ContextFormed 声明的键），
+ *  welcome 类一次性通知的元数据本就无消费者。 */
 function createMemoryNoticeMessage(text: string): ReturnType<typeof createUserMessage> {
   return createUserMessage({
     content: [{ type: 'text', text }],
     source: {
-      kind: 'plugin',
-      plugin: 'meow-memory',
+      ...PLUGIN_SOURCE,
       form: 'notice',
       summary: boundContextSummary(text.replace(/\s+/g, ' ').trim()),
     },
@@ -376,7 +375,7 @@ function wasDreamTurn(events: readonly unknown[]): boolean {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i] as { type?: string; data?: { source?: { kind?: string; plugin?: string }; content?: Array<{ type?: string; text?: string }> } }
     if (e?.type === 'turn/start') break
-    if (e?.type === 'user/message' && e.data?.source?.kind === 'plugin' && e.data.source.plugin === 'meow-memory') {
+    if (e?.type === 'user/message' && isMeowSource(e.data?.source)) {
       if ((e.data.content ?? []).some((b) => b.type === 'text' && b.text?.includes(DREAM_MARKER))) return true
     }
   }
