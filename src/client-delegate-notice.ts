@@ -32,6 +32,7 @@ import type { ConversationSnapshot } from '@deepseek-ai/dsh-client-runtime/clien
 import { subscribeDreamEvents } from './client-dream-events.ts'
 import { registerUiReplayer } from './client-i18n-replay.ts'
 import { t } from './i18n/index.js'
+import { isMeowSource } from './source.js'
 
 /** 测试接点：界面语言（生产代码读 DSH locale 服务）。 */
 export { setUiLocaleForTest, getUiLocale } from './i18n/index.js'
@@ -41,8 +42,8 @@ export const REFLECT_DELEGATE_MARKER = '【记忆反思标记】'
 export const REFLECT_DONE_DELEGATE_MARKER = '【记忆反思完成标记】'
 export const DREAM_DELEGATE_MARKER = '【记忆整理标记】'
 
-/** 插件 source 识别（与 client-fold.ts PLUGIN_NAME 一致）。 */
-const PLUGIN_NAME = 'meow-memory'
+/** 插件 source 识别（生产端见 host 端 source.ts）。 */
+export { PLUGIN_NAME } from './source.js'
 
 /** 隐藏原始行的 data 属性。 */
 const HIDDEN_ATTR = 'data-meow-delegate-hidden'
@@ -122,7 +123,7 @@ function delegateVariantOf(node: NoticeNodeLike): DelegateVariant | undefined {
   if (node.kind !== 'context') return undefined
   const source = node.data?.source
   if (source === undefined || source === null || typeof source !== 'object') return undefined
-  if (source.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) return undefined
+  if (!isMeowSource(source)) return undefined
   // v0.27.0+: 优先从 sections.__meta__ 读取；回退到旧 source.memory（兼容历史会话）
   const meta = extractMetaFromSections(source.sections) ?? source.memory
   const memKind = meta?.kind

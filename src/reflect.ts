@@ -9,11 +9,10 @@
  * 关键词 8-13/importance/收尾）。topic 归 dream 轮处理，反思不再涉及。
  */
 
-import { createUserMessage, type MessageSource } from '@deepseek-ai/dsh-llm'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { getDb } from './db.js'
 import { keyedValue, resolveSlotText } from './prompt-loader.js'
-
-const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'meow-memory' }
+import { PLUGIN_SOURCE, isMeowSource } from './source.js'
 
 /** 反思消息识别标记（防同 turn 重复反思）。 */
 export const REFLECT_MARKER = '[meow-memory-reflect]'
@@ -51,7 +50,7 @@ export function scanTurn(events: readonly unknown[]): {
         .filter((b) => b.type === 'text' && typeof b.text === 'string')
         .map((b) => b.text ?? '')
         .join(' ')
-      if (src?.kind === 'plugin' && src.plugin === 'meow-memory' && msgText.includes(REFLECT_MARKER)) {
+      if (isMeowSource(src) && msgText.includes(REFLECT_MARKER)) {
         sawReflect = true
       } else {
         for (const b of e.data?.content ?? []) if (b.type === 'text' && b.text) texts.push(b.text)

@@ -394,5 +394,27 @@ console.log('=== 10. formatInjectionClock ===')
   setUiLocaleForTest('zh')
 }
 
+// ---- 11. 生产者 source 形态：当前形态与退役形态必须同判 ----
+// dsh 0.1.7 起新写入用 plugin:meow-memory（v4 拒绝退役的 plugin kind），
+// 历史会话经迁移器改写后也是同一形态；两种形态都必须被识别，否则读旧会话会丢折叠。
+console.log('=== 11. source 形态兼容 ===')
+{
+  const mk = (source) => {
+    const nodes = new Map([
+      ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(1), source)],
+      ['asst-1', assistantNode('asst-1', turnLoc(1), 'settled')],
+      ['tail-1', { key: 'tail-1', kind: 'turn-tail', location: turnLoc(1), data: { turn: 1 } }],
+    ])
+    return snapshot(['ctx-1', 'asst-1', 'tail-1'], nodes, (t) => t === 1 ? ['ctx-1', 'asst-1', 'tail-1'] : [])
+  }
+  const current = computeFoldGroups(mk({ kind: 'plugin:meow-memory' }))
+  const retired = computeFoldGroups(mk({ kind: 'plugin', plugin: 'meow-memory' }))
+  check('当前形态（plugin:meow-memory）识别为反思轮', current.length === 1 && current[0].variant === 'reflect')
+  check('退役形态（plugin + 插件名）识别为反思轮', retired.length === 1 && retired[0].variant === 'reflect')
+  check('两种形态折叠结果一致', JSON.stringify(current) === JSON.stringify(retired))
+  check('别的插件的 source 不误判', computeFoldGroups(mk({ kind: 'plugin', plugin: 'other-plugin' })).length === 0)
+  check('无关 kind 不误判', computeFoldGroups(mk({ kind: 'user' })).length === 0)
+}
+
 console.log(failures === 0 ? '\nALL CLIENT-FOLD TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)
 process.exit(failures === 0 ? 0 : 1)

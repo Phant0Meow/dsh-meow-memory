@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.28.2 (2026-09-23)
+
+### 修复：dsh 0.1.7 的 v4 会话不再接受通用 source kind `plugin`（新会话整轮失败）
+
+- **问题**：session format v4 要求每条消息声明自己的生产者 kind，退役的通用 kind `plugin` 在写入侧（JSONL 落盘用的 `encodeCurrentEvent`）与读取侧（行准入）都被拒绝，报 `format v4 message requires a producer-owned source kind`。本插件的快照（snapshot）/ 通知（notice）/ 反思轮 / dream 轮消息此前都用 `{ kind: 'plugin', plugin: 'meow-memory' }`，于是在 0.1.7 上**新会话一注入就整轮失败**（界面表现为「本轮运行失败」）。停用整个插件可以规避，但记忆功能随之全部失效。
+- **为什么扫日志查不出来**：被拒的行在 encode 阶段就抛错，**根本写不进会话日志**——「扫当前 v4 日志、0 处失败」这种验收方式对本题无效（本地曾据此误判为已恢复）。
+- **修法**：改用 DSH 约定的第三方形态 `plugin:meow-memory`（= 官方 v3→v4 迁移器对历史会话的改写结果：`producerKind()` 对非官方插件产出 `plugin:<包名>` 并丢弃 `plugin` 字段），并在 `dsh-llm` 的 `MessageSourceMap` 上做声明合并登记自己的 kind（与 `time-context` / `agent-instructions` 等官方生产者同款）。
+- **识别端同步**：客户端折叠、delegate 打点、host 端反思计数与 `wasDreamTurn` 统一改用 `isMeowSource` 判定，**同时接受当前形态与退役形态**——退役形态用于尚未迁移的历史日志；而迁移后的历史会话本身就是当前形态，原判定 `kind === 'plugin' && plugin === 'meow-memory'` 在迁移丢弃 `plugin` 字段后必然失配，本次一并修好。
+- **测试**：5 处产物形态断言随实现更新；`tests/client-fold.mjs` 新增「两种形态同判、别的插件与无关 kind 不误判」用例。
+
 ## v0.28.1 (2026-09-23)
 
 ### 修复：已删除的工作区目录不再被启动流程复活（#27）

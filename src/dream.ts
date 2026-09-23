@@ -29,7 +29,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { createUserMessage, type MessageSource } from '@deepseek-ai/dsh-llm'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -38,8 +38,7 @@ import { fillTemplate, keyedValue, resolveSlotText } from './prompt-loader.js'
 import { readSeen, readWritten } from './inject.js'
 import { workspaceOf } from './tools.js'
 import { DEFAULT_RULES_REVIEW_DAYS } from './defaults.js'
-
-const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'meow-memory' }
+import { PLUGIN_SOURCE } from './source.js'
 
 // ── 执行体（steer，主窗口） ─────────────────────────────────────────────────
 //

@@ -1,8 +1,9 @@
 /**
  * meow-memory — 反思轮折叠：纯计算逻辑（与 DOM 无关，可单测）。
  *
- * 识别：会话快照 chat 节点里 kind='context' 且 source 为
- * { kind: 'plugin', plugin: 'meow-memory' } 的节点 = 反思/dream 轮 prompt
+ * 识别：会话快照 chat 节点里 kind='context' 且 source 由本插件生产
+ * （{ kind: 'plugin:meow-memory' }；旧会话为 { kind: 'plugin', plugin: 'meow-memory' }）
+ * 的节点 = 反思/dream 轮 prompt
  * （steer/followup 注入的 user/message 事件，非 append 改写，渲染为 context 行）。
  * 范围（2026-09-10 双形状）：
  * - 独立轮（host 走 followup：prompt 即 turn 首节点）：整个 turn 折叠，
@@ -25,6 +26,7 @@ import type {
   ToolChatData,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { t } from './i18n/index.js'
+import { isMeowSource } from './source.js'
 
 /** 测试接点（与 client-delegate-notice 的 setDreamStatesForTest 同款惯例）：界面
  *  语言。生产代码只读 DSH locale 服务，唯一的写入入口在 i18n core 里。 */
@@ -34,8 +36,8 @@ export { setUiLocaleForTest, getUiLocale } from './i18n/index.js'
 export const REFLECT_MARKER = '[meow-memory-reflect]'
 export const DREAM_MARKER = '[meow-memory-dream]'
 
-/** 插件 source 识别（与 host 端 PLUGIN_SOURCE 保持一致）。 */
-export const PLUGIN_NAME = 'meow-memory'
+/** 插件 source 识别（生产端见 host 端 source.ts）。 */
+export { PLUGIN_NAME } from './source.js'
 
 export type FoldVariant = 'reflect' | 'dream'
 
@@ -99,8 +101,8 @@ function contextText(node: ChatNode): string {
 /** 判定节点是否 meow-memory 注入的反思/dream prompt。 */
 function isMemoryPrompt(node: ChatNode): boolean {
   if (node.kind !== 'context') return false
-  const source = (node.data as ContextLike).source as { kind?: string; plugin?: string } | undefined
-  if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) return false
+  const source = (node.data as ContextLike).source
+  if (!isMeowSource(source)) return false
   const text = contextText(node)
   return text.includes(REFLECT_MARKER) || text.includes(DREAM_MARKER)
 }
@@ -277,7 +279,7 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
     if (node.kind === 'context') {
       const ctx = node.data as ContextLike
       const source = ctx.source as MemorySourceLike | undefined
-      if (source?.kind !== 'plugin' || source.plugin !== PLUGIN_NAME) continue
+      if (!isMeowSource(source)) continue
       // 元数据在 source.sections 的 __meta__ 节（与 dsh 快照一致；host v0.25+ 写入）；
       // 回退旧 source.memory（v0.24- 历史会话）。
       const meta = extractMetaFromSections(source.sections) ?? source.memory

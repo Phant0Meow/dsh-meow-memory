@@ -1205,7 +1205,7 @@ const decisionA = await preStep(
 )
 check('pre-step inserts independent snapshot', decisionA.kind === 'enter' && decisionA.messages.length === 2 &&
   decisionA.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
-  decisionA.messages[0].source.kind === 'plugin' && decisionA.messages[0].source.plugin === 'meow-memory' &&
+  decisionA.messages[0].source.kind === 'plugin:meow-memory' &&
   decisionA.messages[0].source.form === 'snapshot' && decisionA.messages[0].source.sections.length === 2 &&
   decisionA.messages[0].source.sections[0].name === '__meta__' &&
   JSON.parse(decisionA.messages[0].source.sections[0].text).kind === 'initial' &&
@@ -1228,7 +1228,7 @@ check('snapshot is inserted before first user despite leading plugin notice',
   decisionNotif.kind === 'enter' &&
   decisionNotif.messages[0].content.length === 1 && // 通知消息原样保留
   decisionNotif.messages[0] === notifMsg &&
-  decisionNotif.messages[1].source.kind === 'plugin' &&
+  decisionNotif.messages[1].source.kind === 'plugin:meow-memory' &&
   decisionNotif.messages[1].source.form === 'snapshot' &&
   decisionNotif.messages[1].content[0].text.includes('===== 长期记忆 =====') &&
   !decisionNotif.messages[1].content[0].text.includes('可能相关的记忆，仅供参考：') &&
@@ -1285,7 +1285,7 @@ const decisionA3 = await preStep(
   async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }] }),
 )
 check('per-message hit inserts independent snapshot', decisionA3.messages.length === 2 &&
-  decisionA3.messages[0].source.kind === 'plugin' && decisionA3.messages[0].source.form === 'snapshot' &&
+  decisionA3.messages[0].source.kind === 'plugin:meow-memory' && decisionA3.messages[0].source.form === 'snapshot' &&
   decisionA3.messages[0].content[0].text.includes('可能相关的记忆，仅供参考：') &&
   !decisionA3.messages[0].content[0].text.includes('本轮用户prompt：') &&
   decisionA3.messages[0].content[0].text.includes('测试关键词修正') &&
@@ -1311,7 +1311,7 @@ const dReinj = await preStep(
 )
 check('post-compaction reinjection injects snapshot + projects', dReinj.kind === 'enter' &&
   dReinj.messages.length === 2 &&
-  dReinj.messages[0].source.kind === 'plugin' && dReinj.messages[0].source.form === 'snapshot' &&
+  dReinj.messages[0].source.kind === 'plugin:meow-memory' && dReinj.messages[0].source.form === 'snapshot' &&
   dReinj.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
   dReinj.messages[0].content[0].text.includes('【会话已压缩】') &&
   dReinj.messages[0].content[0].text.includes('【项目：femo】') &&
@@ -1373,7 +1373,7 @@ const dGuide1 = await guidePreStep(
   async () => ({ kind: 'enter', messages: [guideMsg] }),
 )
 check('welcome guide injected as independent notice when promptLang unset', dGuide1.messages.length === 2 &&
-  dGuide1.messages[0].source.kind === 'plugin' &&
+  dGuide1.messages[0].source.kind === 'plugin:meow-memory' &&
   dGuide1.messages[0].source.form === 'notice' &&
   typeof dGuide1.messages[0].source.summary === 'string' && dGuide1.messages[0].source.summary.length > 0 &&
   dGuide1.messages[0].source.memory === undefined &&
