@@ -12,3 +12,4 @@ mytrashbin/
 /.npm-cache
 /.pr-body.md
 /.pr-body-*.md
+/storage/

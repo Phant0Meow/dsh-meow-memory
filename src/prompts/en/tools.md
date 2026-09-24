@@ -64,3 +64,9 @@
 ### memory_dream
 
 - memory_dream.description: Schedule a memory consolidation (dream) for this window right now: everything this window created or pulled up is sent to the main agent round by round to be tidied and put away (round 1 = atomic memories, project/fact/lesson/rules/soul/user; round 2 = topic memories; round 3 = project summary, added only when this window actually touched a project). It triggers automatically after 3+ hours of window idle time (suppressed during peak hours, 09:00-12:00 and 14:00-18:00 Beijing time, plus the 15 minutes before each); this tool is the manual trigger.
+
+### memory_home
+
+- memory_home.description: View or switch the meow-memory global data directory (where instance-level data such as logs and the dream window ledger lives; the memory store itself sits inside each project and is unaffected). Call without parameters to get the current directory and the real locations of the three presets; switching automatically moves the old directory contents over (same-disk move / cross-disk copy). After a cross-disk copy the old directory is kept, not deleted - remind the user to delete it manually once verified; if several dsh instances share one directory, remind the user to update them together. Call this when the user wants to move memory data or logs off the system drive or to another location.
+- memory_home.param.target: Target location. Either a preset marker: default = system user home (the default), dsh-storage = meow-memory folder under the DSH home's storages, plugin-root = storage folder next to the plugin itself; or an absolute path. Omit to view the current state without changing anything.
+- memory_home.out.note: View/switch result: the current or new directory, how many files were moved, and what to do with the old directory.

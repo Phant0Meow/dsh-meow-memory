@@ -670,7 +670,11 @@ function makeDelegateVanishDock(
 // pending（"waiting for service: …"）。官方纪律=只 inject 必需服务，可选服务走
 // ctx 软取——applySettingsPage 双腿软取（0.1.6 走 settingsScope.bind，0.1.7 短
 // 轮询等 configForms 提供方就绪后 get(entryId) 当 scope），缺服务只降级不阻断。
-export const inject = ['slots', 'sessions']
+// remote.settings 进清单（2026-09-25）：设置写入失败探针要直调 remote.settings
+// 拿宿主拒因原文——cordis rejectGuard 按「remote.settings」复合键守卫，不声明
+// 则属性访问直接抛（ctx.get('remote') 能过、.settings 仍拦，实证）。两版宿主的
+// api-settings-controller 都提供该服务，无 pending 风险。
+export const inject = ['slots', 'sessions', 'remote.settings']
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function apply(ctx: any): () => void {

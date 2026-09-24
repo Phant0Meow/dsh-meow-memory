@@ -20,6 +20,7 @@ import { zstdCompressSync, zstdDecompressSync, constants } from 'node:zlib'
 import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, renameSync, statSync } from 'node:fs'
 import { join, relative, dirname } from 'node:path'
 import { homedir } from 'node:os'
+import { activeHomeDir } from './home-dir.js'
 
 const PLUGIN = 'meow-memory'
 const META_SECTION_NAME = '__meta__'
@@ -40,20 +41,22 @@ export interface MigrateReport {
   errors?: Array<{ file: string; error: string }>
 }
 
-function statePath(projectDir: string): string {
-  return join(homedir(), projectDir || '.dsh-meow', STATE_FILE)
+// 迁移完成标记落全局目录（activeHomeDir() 动态取——用户切换全局目录后标记跟着走，
+// 随目录整体搬迁天然迁移，二次启动照常跳过）。
+function statePath(): string {
+  return join(activeHomeDir(), STATE_FILE)
 }
 
-export function readMigrateState(projectDir: string): MigrateState {
+export function readMigrateState(): MigrateState {
   try {
-    return JSON.parse(readFileSync(statePath(projectDir), 'utf8')) as MigrateState
+    return JSON.parse(readFileSync(statePath(), 'utf8')) as MigrateState
   } catch {
     return {}
   }
 }
 
-function writeMigrateState(projectDir: string, state: MigrateState): void {
-  const p = statePath(projectDir)
+function writeMigrateState(state: MigrateState): void {
+  const p = statePath()
   mkdirSync(dirname(p), { recursive: true })
   writeFileSync(p, JSON.stringify(state, null, 1), 'utf8')
 }
@@ -332,7 +335,7 @@ function processFile(home: string, file: string, log: (m: string) => void): { mi
 /* ---------------- 入口 ---------------- */
 
 export async function ensureV0SessionsMigrated(projectDir: string, log: (m: string) => void): Promise<MigrateReport> {
-  const state = readMigrateState(projectDir)
+  const state = readMigrateState()
   if (state.migrated === true) return { ran: false, reason: 'already-migrated' }
   const home = process.env.DSH_HOME || join(homedir(), '.dsh')
   if (!existsSync(home)) {
@@ -360,7 +363,7 @@ export async function ensureV0SessionsMigrated(projectDir: string, log: (m: stri
   }
   // 置位门槛：全部干净（无迁移对象 OR 全成功且零错误）才置 true；有错误 -> 不置位，下次启动重试
   if ((report.errors?.length ?? 0) === 0) {
-    writeMigrateState(projectDir, {
+    writeMigrateState({
       migrated: true,
       migratedAt: new Date().toISOString(),
       files: report.filesMigrated,

@@ -290,5 +290,92 @@ function makeFormStub() {
   check('0.1.7 腿迟到挂页 dispose 后稳定', registrations.length === afterDispose, String(registrations.length))
 }
 
+
+// ── 5. 全局目录控件（homeDir）：预设 radio + 实际路径显示 + 自定义输入 ──────────
+// 收集树里的 radio（type/checked），按渲染序=default/dsh-storage/plugin-root/custom。
+function collectRadios(node, out = []) {
+  if (node === null || node === undefined || typeof node !== 'object') return out
+  const props = node.props ?? {}
+  if (props.type === 'radio') out.push(props)
+  for (const c of [].concat(props.children ?? [], node.children ?? [])) collectRadios(c, out)
+  return out
+}
+function collectTextInputs(node, out = []) {
+  if (node === null || node === undefined || typeof node !== 'object') return out
+  const props = node.props ?? {}
+  if (props.type === 'text') out.push(props)
+  for (const c of [].concat(props.children ?? [], node.children ?? [])) collectTextInputs(c, out)
+  return out
+}
+
+function renderWithHomeDir(snapshotValue, base) {
+  const scope = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ status: 'ready', value: snapshotValue, user: snapshotValue, base, writable: true, mode: 'user' }),
+    set: async () => {},
+    unset: async () => {},
+  }
+  return settings.MemorySettingsSection({ scope })
+}
+
+const PRESETS_BASE = {
+  homeDirPresets: {
+    default: String.raw`C:\Users\meow\.dsh-meow`,
+    'dsh-storage': String.raw`C:\dsh\storages\meow-memory`,
+    'plugin-root': String.raw`C:\plugins\meow-memory\storage`,
+  },
+}
+
+console.log('=== 5. 全局目录控件 ===')
+settings.setUiLocaleForTest('zh')
+{
+  // 缺省值：default radio 选中，三个预设显示实际路径
+  const tree = renderWithHomeDir({ enabled: true }, PRESETS_BASE)
+  const page = texts(tree)
+  const radios = collectRadios(tree)
+  check('homeDir: 渲染四个 radio', radios.length === 4, String(radios.length))
+  check('homeDir: 缺省=default 选中', radios[0] !== undefined && radios[0].checked === true && radios.slice(1).every((r) => !r.checked))
+  check('homeDir: 三预设显示实际落点', page.some((s) => s.includes(String.raw`C:\dsh\storages\meow-memory`)) && page.some((s) => s.includes(String.raw`C:\plugins\meow-memory\storage`)))
+  check('homeDir: 自定义选项存在', page.includes('自定义路径'))
+  check('homeDir: hint 带多实例提醒', page.some((s) => s.includes('多个 dsh 实例')))
+  // 布局结构：每个预设的实际路径是独立次行节点（等宽小字类），不是挤在名称行里
+  const pathNodes = (function collectPaths(n, out = []) {
+    if (n === null || n === undefined || typeof n !== 'object') return out
+    const p = n.props ?? {}
+    if (p.className === 'meowmm_set_homedir_path') out.push(p)
+    for (const c of [].concat(p.children ?? [], n.children ?? [])) collectPaths(c, out)
+    return out
+  })(tree)
+  check('homeDir: 三条路径各自独立次行节点', pathNodes.length === 3, String(pathNodes.length))
+
+  // 预设标记值：对应 radio 选中
+  const tree2 = renderWithHomeDir({ enabled: true, homeDir: 'dsh-storage' }, PRESETS_BASE)
+  texts(tree2)
+  const radios2 = collectRadios(tree2)
+  check('homeDir: 预设标记选中对应 radio', radios2[1] !== undefined && radios2[1].checked === true && !radios2[0].checked && !radios2[3].checked)
+
+  // 自定义绝对路径：custom radio 选中 + 输入框回填路径值
+  const tree3 = renderWithHomeDir({ enabled: true, homeDir: String.raw`D:\data\meow` }, PRESETS_BASE)
+  texts(tree3)
+  const radios3 = collectRadios(tree3)
+  const textInputs = collectTextInputs(tree3)
+  check('homeDir: 自定义值选中 custom radio', radios3[3] !== undefined && radios3[3].checked === true && radios3.slice(0, 3).every((r) => !r.checked))
+  check('homeDir: 自定义路径回填输入框', textInputs.some((p) => p.value === String.raw`D:\data\meow`))
+
+  // 只读镜像横幅：mode='memory'（非 loopback 连接）时页面顶部亮牌——写入会被客户端丢弃
+  const treeMem = renderWithHomeDir({ enabled: true }, PRESETS_BASE)
+  const pageMem = texts({ ...treeMem })
+  check('mirror: host 模式无横幅', !pageMem.some((s) => s.includes('只读镜像')))
+  function withMode(baseTree, mode) { return null }
+  const memScope = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ status: 'ready', value: { enabled: true }, user: { enabled: true }, base: {}, writable: true, mode: 'memory' }),
+    set: async () => {},
+    unset: async () => {},
+  }
+  const pageMem2 = texts(settings.MemorySettingsSection({ scope: memScope }))
+  check('mirror: memory 模式亮只读横幅', pageMem2.some((s) => s.includes('只读镜像')))
+}
+
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed === 0 ? 0 : 1)

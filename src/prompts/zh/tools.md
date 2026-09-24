@@ -64,3 +64,9 @@
 ### memory_dream
 
 - memory_dream.description: 立即为本窗口安排一次记忆整理（dream）：把本窗口建立过/提取过的记忆逐轮发给主 agent 整理封存（第 1 轮=原子记忆 project/fact/lesson/rules/soul/user，第 2 轮=topic 记忆，第 3 轮=项目总结——仅当本窗口涉及具体项目时追加）。窗口空闲 3 小时以上自动触发（北京时间峰时 9-12 点/14-18 点及各自前 15 分钟不触发），此工具用于手动触发。
+
+### memory_home
+
+- memory_home.description: 查看/切换 meow-memory 的全局数据目录（日志、梦境窗口账本等实例级数据的存放位置，记忆库本体在每个项目内、不受影响）。不带参数调用=返回当前目录与三个预设的实际位置；切换时会自动把旧目录内容整体搬过去（同盘为移动、跨盘为复制），跨盘复制时旧目录保留不删，需提醒用户确认后手动删除；若用户本机跑着多个 dsh 实例共享同一目录，请提醒它们应同步修改。当用户表示想把记忆数据/日志挪出 C 盘、换到别的盘或目录时调用。
+- memory_home.param.target: 目标位置。三选一传预设标记：default=系统用户主目录（默认）、dsh-storage=DSH 根目录 storages 下的 meow-memory、plugin-root=插件本体根目录下的 storage；或传一个绝对路径。不传=只查看当前状态，不做任何修改。
+- memory_home.out.note: 切换/查看结果：当前或新的目录位置、搬移的文件数、旧目录的处置提示。

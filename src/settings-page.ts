@@ -41,12 +41,21 @@ const CSS = `
 .meowmm_set_input_err{border-color:#f43f5e}
 .meowmm_set_input_time{width:230px;font-family:ui-monospace,monospace}
 .meowmm_set_check{cursor:pointer}
+.meowmm_set_homedir_block{display:flex;flex-direction:column;gap:10px}
+.meowmm_set_homedir{display:flex;flex-direction:column;gap:12px;min-width:300px}
+.meowmm_set_homedir_opt{cursor:pointer;display:flex;flex-direction:column;gap:3px}
+.meowmm_set_homedir_row{align-items:center;display:flex;gap:8px}
+.meowmm_set_homedir_name{color:var(--dsw-alias-label-secondary);font-size:13px}
+.meowmm_set_homedir_opt_on .meowmm_set_homedir_name{color:var(--dsw-alias-label-primary);font-weight:500}
+.meowmm_set_homedir_path{color:var(--dsw-alias-label-caption);font-family:ui-monospace,monospace;font-size:11px;padding-left:27px;word-break:break-all}
+.meowmm_set_homedir_input{margin-left:27px;width:320px;font-family:ui-monospace,monospace}
 .meowmm_set_badge{border-radius:999px;font-size:11px;line-height:16px;padding:0 8px;flex:none}
 .meowmm_set_badge_override{background:color-mix(in srgb,#f59e0b 18%,transparent);color:#f59e0b}
 .meowmm_set_badge_prefill{background:color-mix(in srgb,#60a5fa 18%,transparent);color:#60a5fa}
 .meowmm_set_reset{background:transparent;border:1px solid var(--dsw-alias-border-l3);border-radius:6px;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:12px;padding:2px 8px}
 .meowmm_set_reset:hover{border-color:var(--dsw-alias-border-l2);color:inherit}
 .meowmm_set_err{color:#f43f5e;font-size:12px;line-height:1.5;margin:0}
+.meowmm_set_mirrornote{background:color-mix(in srgb,#f59e0b 12%,transparent);border:1px solid color-mix(in srgb,#f59e0b 35%,transparent);border-radius:8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1.6;padding:8px 12px}
 .meowmm_set_saved{color:#34d399;font-size:12px}
 .meowmm_set_muted{color:var(--dsw-alias-label-caption);font-size:12px}
 `
@@ -62,7 +71,7 @@ interface FieldSpec {
   key: string
   sub?: string
   label: UiKey
-  type: 'bool' | 'num' | 'str'
+  type: 'bool' | 'num' | 'str' | 'homeDir'
   hint?: UiKey
   placeholder?: string
 }
@@ -77,8 +86,6 @@ const FIELDS: GroupSpec[] = [
     title: 'settings.group.base',
     fields: [
       { key: 'enabled', label: 'settings.field.enabled.label', type: 'bool', hint: 'settings.field.enabled.hint' },
-      { key: 'projectDir', label: 'settings.field.projectDir.label', type: 'str', hint: 'settings.field.projectDir.hint', placeholder: '.dsh-meow' },
-      { key: 'autoMigrate', label: 'settings.field.autoMigrate.label', type: 'bool', hint: 'settings.field.autoMigrate.hint' },
     ],
   },
   {
@@ -117,6 +124,14 @@ const FIELDS: GroupSpec[] = [
     title: 'settings.group.language',
     fields: [
       { key: 'promptLang', label: 'settings.field.promptLang.label', type: 'str', hint: 'settings.field.promptLang.hint', placeholder: 'settings.field.promptLang.placeholder' },
+    ],
+  },
+  {
+    title: 'settings.group.storage',
+    fields: [
+      { key: 'projectDir', label: 'settings.field.projectDir.label', type: 'str', hint: 'settings.field.projectDir.hint', placeholder: '.dsh-meow' },
+      { key: 'homeDir', label: 'settings.field.homeDir.label', type: 'homeDir', hint: 'settings.field.homeDir.hint', placeholder: 'D:\\data\\meow-memory' },
+      { key: 'autoMigrate', label: 'settings.field.autoMigrate.label', type: 'bool', hint: 'settings.field.autoMigrate.hint' },
     ],
   },
 ]
@@ -241,21 +256,36 @@ export function MemorySettingsSection(props: { scope: any }): any {
    *  @returns 是否写入成功（调用方据此清/留本地草稿）。 */
   const apply = async (spec: FieldSpec, newValue: unknown): Promise<boolean> => {
     setError(null)
+    // 只读镜像（dsh 0.1.7 非 loopback 连接）：configForms persistence=memory，
+    // set 会在客户端本地丢弃、根本不达宿主——提前亮牌并精准报错，不再走
+    // 「保存未生效」的误导文案（用户实证 2026-09-25）。
+    if (snap.mode === 'memory') {
+      setError(t('settings.mirrorReadonly'))
+      return false
+    }
+    let setOk: boolean | undefined
     try {
       if (spec.sub === undefined) {
-        await scope.set(spec.key, newValue)
+        setOk = await scope.set(spec.key, newValue)
       } else {
         // 读取用 getSnapshot()（镜像 acceptView 同步生效）而非渲染闭包里的 snap——
         // 连续改同一子对象的两个字段时，闭包快照可能滞后导致第二次 patch 丢掉第一次的写入。
         const user = scope.getSnapshot().user as Record<string, unknown> | undefined
         const parent = { ...((user?.[spec.sub] as Record<string, unknown>) ?? {}) }
         parent[spec.key] = newValue
-        await scope.set(spec.sub, parent)
+        setOk = await scope.set(spec.sub, parent)
       }
     } catch (e) {
       setError(t('settings.saveFailed', { error: e instanceof Error ? e.message : String(e) }))
       return false
     }
+    // 诊断留痕（0.1.7 宿主对被拒写入静默、无服务端日志可查）：mode/返回值/回读值
+    // 一次看全——configForms.set 的 boolean=false 即宿主拒收（含 revision 围栏）。
+    console.info('[meow-memory] settings write', spec.key, {
+      mode: snap.mode,
+      setReturned: setOk,
+      userNow: (scope.getSnapshot().user as Record<string, unknown> | undefined)?.[spec.sub === undefined ? spec.key : `${String(spec.sub)}.${String(spec.key)}`],
+    })
     const landed = (): boolean => {
       const v = scope.getSnapshot().user as Record<string, unknown> | undefined
       const cur = spec.sub === undefined
@@ -277,6 +307,9 @@ export function MemorySettingsSection(props: { scope: any }): any {
     // 与错误文案「已恢复显示服务器当前值」保持一致。
     clearDraft(spec)
     setError(t('settings.saveNotApplied'))
+    // 探针：直发同 ops 拿服务端拒因 envelope 打到 console（configForms 自身只回
+    // false、把错误详情吞掉——0.1.7 宿主拒写又零服务端日志，此处是唯一取证口）。
+    if (spec.sub === undefined) void probeMutationRejection(spec.key, newValue)
     return false
   }
 
@@ -358,7 +391,73 @@ export function MemorySettingsSection(props: { scope: any }): any {
     const mirrorText = typeof raw === 'string' ? raw : (spec.type === 'num' && typeof raw === 'number' ? String(raw) : '')
     const draft = drafts[draftKey(spec)]
     let control: any = null
-    if (spec.type === 'bool') {
+    if (spec.type === 'homeDir') {
+      // 全局目录：三预设 radio（旁显实际落点，来自 base 的 homeDirPresets 只读 meta）
+      // + 自定义绝对路径。预设落库语义标记（挪 dsh/插件目录不失效），自定义落库路径。
+      // 保存后插件自动迁移旧目录内容并热切换（见 home-dir.ts；跨盘复制时旧目录保留，
+      // 由日志提示手动删——绝不在代码里删目录）。
+      const presets = (snap.base as Record<string, unknown> | undefined)?.homeDirPresets as Record<string, string> | undefined
+      // 选中态只认「已保存的值」（raw/user 层）——草稿只管输入框文本，绝不钉住
+      // radio（2026-09-25 闪回修复：残留草稿曾把选中态钉死在旧位置）。
+      const saved = typeof raw === 'string' && raw !== '' ? raw : 'default'
+      const isCustomSaved = saved !== 'default' && saved !== 'dsh-storage' && saved !== 'plugin-root'
+      const draftText = typeof draft === 'string' ? draft : undefined
+      const radio = (value: string, labelKey: UiKey, realPath?: string) =>
+        el('label', { key: value, className: 'meowmm_set_homedir_opt' + (!isCustomSaved && saved === value ? ' meowmm_set_homedir_opt_on' : '') },
+          el('span', { className: 'meowmm_set_homedir_row' },
+            el('input', {
+              type: 'radio',
+              name: draftKey(spec),
+              checked: !isCustomSaved && saved === value,
+              disabled: !snap.writable,
+              onChange: () => {
+                void apply(spec, value)
+              },
+            }),
+            el('span', { className: 'meowmm_set_homedir_name' }, t(labelKey)),
+          ),
+          realPath !== undefined
+            ? el('span', { className: 'meowmm_set_homedir_path' }, realPath)
+            : null,
+        )
+      control = el('div', { className: 'meowmm_set_homedir' },
+        radio('default', 'settings.field.homeDir.preset.default', presets?.default),
+        radio('dsh-storage', 'settings.field.homeDir.preset.dshStorage', presets?.['dsh-storage']),
+        radio('plugin-root', 'settings.field.homeDir.preset.pluginRoot', presets?.['plugin-root']),
+        // 自定义行：radio 只反映「已保存的自定义路径」；输入框常驻，blur 保存
+        //（空值不切换）。draft 只影响输入框文本，不碰选中态。
+        el('div', { key: 'custom', className: 'meowmm_set_homedir_opt' + (isCustomSaved ? ' meowmm_set_homedir_opt_on' : '') },
+          el('span', { className: 'meowmm_set_homedir_row' },
+            el('input', {
+              type: 'radio',
+              name: draftKey(spec),
+              checked: isCustomSaved,
+              disabled: !snap.writable,
+              onChange: () => { /* 自定义经下方输入框 blur 保存；radio 只反映已保存状态 */ },
+            }),
+            el('span', { className: 'meowmm_set_homedir_name' }, t('settings.field.homeDir.preset.custom')),
+          ),
+          el('input', {
+            key: 'custom-path',
+            className: 'meowmm_set_input meowmm_set_homedir_input',
+            type: 'text',
+            value: draftText !== undefined ? draftText : (isCustomSaved ? saved : ''),
+            placeholder: placeholderOf(spec),
+            disabled: !snap.writable,
+            onClick: (e: any) => e.stopPropagation(),
+            onChange: (e: any) => setDrafts((prev) => ({ ...prev, [draftKey(spec)]: e.target.value })),
+            onBlur: (e: any) => {
+              const next = e.target.value.trim()
+              if (next === saved || next === '') {
+                clearDraft(spec)
+                return
+              }
+              void apply(spec, next)
+            },
+          }),
+        ),
+      )
+    } else if (spec.type === 'bool') {
       // checkbox：本地草稿立即反映点击，落库成功后清草稿（mirror 已含新值，无视觉跳变）；
       // 失败由 apply 清草稿回落 + 错误提示（视觉=点了没反应，红字解释）。
       const checked = typeof draft === 'boolean' ? draft : raw === true
@@ -369,10 +468,9 @@ export function MemorySettingsSection(props: { scope: any }): any {
         disabled: !snap.writable,
         onChange: (e: any) => {
           const next = e.target.checked
-          setDrafts((prev) => ({ ...prev, [draftKey(spec)]: next }))
-          void apply(spec, next).then((ok) => {
-            if (ok) clearDraft(spec)
-          })
+          // 保存成功后保留 draft（值与新 mirror 一致，渲染稳定）：立即清除会在
+          // 宿主镜像确认前回落旧值，造成「保存成功却闪回旧值」的视觉抖动。
+          void apply(spec, next)
         },
       })
     } else if (spec.type === 'num') {
@@ -391,9 +489,8 @@ export function MemorySettingsSection(props: { scope: any }): any {
             clearDraft(spec)
             return
           }
-          void apply(spec, num).then((ok) => {
-            if (ok) clearDraft(spec)
-          })
+          // 保存成功后保留 draft：镜像追上前值一致，显示无跳变（同上）
+          void apply(spec, num)
         },
       })
     } else if (isSuppress) {
@@ -429,11 +526,31 @@ export function MemorySettingsSection(props: { scope: any }): any {
             clearDraft(spec)
             return
           }
-          void apply(spec, next).then((ok) => {
-            if (ok) clearDraft(spec)
-          })
+          // 保存成功后保留 draft：镜像追上前值一致，显示无跳变（同上）
+          void apply(spec, next)
         },
       })
+    }
+    if (spec.type === 'homeDir') {
+      // 整行铺满布局（用户拍板 2026-09-25）：标题+说明独占一行自然排布，radio 组
+      // 另起一行——左右两列会把长说明挤成窄条竖排。
+      return el(
+        'div',
+        { key: spec.key, className: 'meowmm_set_homedir_block' },
+        el(
+          'div',
+          { className: 'meowmm_set_rowtext' },
+          el(
+            'span',
+            { className: 'meowmm_set_label', style: { display: 'flex', gap: '8px', alignItems: 'center' } },
+            t(spec.label),
+            el('span', { className: `meowmm_set_badge ${overridden ? 'meowmm_set_badge_override' : 'meowmm_set_badge_prefill'}` }, t(overridden ? 'settings.badge.override' : 'settings.badge.default')),
+            overridden && snap.writable ? el('button', { className: 'meowmm_set_reset', onClick: () => { clearDraft(spec); setSuppressText(null); void reset(spec) } }, t('settings.reset')) : null,
+          ),
+          spec.hint !== undefined ? el('span', { className: 'meowmm_set_hint' }, t(spec.hint)) : null,
+        ),
+        control,
+      )
     }
     return el(
       'div',
@@ -462,6 +579,10 @@ export function MemorySettingsSection(props: { scope: any }): any {
     { className: 'meowmm_set_page' },
     el('h2', { className: 'meowmm_set_title' }, t('settings.title')),
     el('p', { className: 'meowmm_set_subtitle' }, t('settings.summary')),
+    // 只读镜像横幅（用户实证 2026-09-25）：dsh 0.1.7 非 loopback 连接下 configForms
+    // persistence='memory'——所有写入在客户端本地丢弃、根本不达宿主（describe 却仍
+    // 报 writable=true）。以 snap.mode 为准提前亮牌，不再让用户点了才收到误导报错。
+    snap.mode === 'memory' ? el('div', { className: 'meowmm_set_mirrornote' }, t('settings.mirrorReadonly')) : null,
     !snap.writable ? el('span', { className: 'meowmm_set_muted' }, t('settings.readonly')) : null,
     savedAt > 0 ? el('span', { className: 'meowmm_set_saved' }, t('settings.saved')) : null,
     error !== null ? el('div', { className: 'meowmm_set_err' }, error) : null,
@@ -486,15 +607,88 @@ function softService(ctx: any, name: string): any {
   try { return ctx?.[name] } catch { return undefined }
 }
 
+/** 挂载时的客户端 ctx（供写入失败探针直调 remote.settings；见 probeMutationRejection）。 */
+let probeCtx: any = null
+
+/**
+ * 写入被拒后的探针（0.1.7 configForms 腿把服务端错误 envelope 整个吞掉只回 false，
+ * 拒因原文外界永远看不到——2026-09-25 排查实证）。用 describe 取最新 revision 后
+ * 以同 ops 直发一次 mutate，把服务端 envelope 原样打到 console：
+ * - ok=true  → 之前拒因=revision 围栏（换新 revision 即过）
+ * - ok=false → envelope.error 即真拒因（volatile/entry/…）
+ * 只在 host 模式写入失败时发一次，零副作用（成功的那次本身就是用户想要的写入）。
+ */
+export async function probeMutationRejection(field: string, value: unknown): Promise<void> {
+  try {
+    // cordis rejectGuard：未声明服务的属性访问（ctx.remote）直接抛 "without inject"，
+    // 必须经 ctx.get 软取（softService，get 不抛）——femo 插件同款坑（2026-09-25 复验）。
+    const remote = softService(probeCtx, 'remote')?.settings
+    if (typeof remote?.describe !== 'function' || typeof remote?.mutate !== 'function') {
+      console.info('[meow-memory] probe: remote.settings unavailable', {
+        hasCtx: probeCtx !== null,
+        hasGet: typeof probeCtx?.get === 'function',
+      })
+      return
+    }
+    const describe = await remote.describe()
+    // typert 信封形状：{ok, value:{namespaces,...}}（configForms 同款读法 response.value）——
+    // 直读 .namespaces 恒 undefined=假阴性（2026-09-25 首版探针的坑）。
+    const view = (describe as any)?.ok === true ? (describe as any).value : describe
+    const ns = view?.namespaces?.find((row: any) => row?.ns === 'meow-memory')
+    console.info('[meow-memory] probe describe:', JSON.stringify({
+      ok: (describe as any)?.ok,
+      nsListed: ns !== undefined,
+      all: view?.namespaces?.map((row: any) => row?.ns),
+      revision: ns?.revision,
+      writable: view?.writable,
+    }))
+    if (ns === undefined) return
+    const response = await remote.mutate('meow-memory', [{ op: 'set', path: [field], value }], ns.revision)
+    console.info('[meow-memory] probe mutate envelope:', JSON.stringify(response))
+    const err = (response as any)?.error as any
+    if (err) {
+      // typert 信封的 message/cause 常是非枚举属性，JSON.stringify 不显——必须显式读
+      console.info('[meow-memory] probe mutate error fields:', JSON.stringify({
+        code: err.code,
+        message: err.message ?? null,
+        details: err.details ?? null,
+        causeMessage: err.cause instanceof Error ? err.cause.message : err.cause?.message ?? err.cause ?? null,
+      }))
+    }
+    if ((response as any)?.ok !== true) {
+      // 二分实验：mutate（逐字段 op+路径白名单）失败 → 换 update（整体 patch 合并，
+      // 跳过路径校验）。若 update ok=true → 拒因锁死在 mutate 专属段，且写入已补上；
+      // 若 update 仍拒 → 拒因在公共准入段（entry/schema/edit），拿 update envelope 对比。
+      const upd = await remote.update('meow-memory', { [field]: value }, ns.revision)
+      console.info('[meow-memory] probe update envelope:', JSON.stringify(upd))
+      const uerr = (upd as any)?.error as any
+      if (uerr) {
+        console.info('[meow-memory] probe update error fields:', JSON.stringify({
+          code: uerr.code,
+          message: uerr.message ?? null,
+          causeMessage: uerr.cause instanceof Error ? uerr.cause.message : uerr.cause?.message ?? null,
+        }))
+      }
+    }
+  } catch (e) {
+    console.info('[meow-memory] probe threw:', e instanceof Error ? e.message : String(e))
+  }
+}
+
 /** 注入设置页 CSS（幂等：同名 data-plugin-css 只挂一份）。 */
 function injectSettingsCss(): void {
   if (typeof document === 'undefined') return
-  if (document.querySelector(`style[data-plugin-css="${CSS_ID}"]`) !== null) return
-  const tag = document.createElement('style')
-  tag.dataset.plugin = 'meow-memory-settings'
-  tag.dataset.pluginCss = CSS_ID
+  // upsert 而非按 id 跳过：client bundle 热更新后旧标签若常驻（页面没整刷），
+  // 按 id 幂等会让新样式永远进不了样式表、新控件裸奔（2026-09-25 实证踩坑）。
+  // 每次挂载都重写 textContent，样式恒与当前 bundle 同步。
+  let tag = document.querySelector(`style[data-plugin-css="${CSS_ID}"]`) as HTMLStyleElement | null
+  if (tag === null) {
+    tag = document.createElement('style')
+    tag.dataset.plugin = 'meow-memory-settings'
+    tag.dataset.pluginCss = CSS_ID
+    document.head.appendChild(tag)
+  }
   tag.textContent = CSS
-  document.head.appendChild(tag)
 }
 
 /** 轮询参数（测试可注入短周期；生产默认 400ms × 75 ≈ 30s 后放弃并留日志）。 */
@@ -518,6 +712,7 @@ export interface SettingsPageMountOptions {
  * 等不到（异常宿主）只留一行日志，不影响插件其余功能。
  */
 export function applySettingsPage(ctx: any, opts?: SettingsPageMountOptions): () => void {
+  probeCtx = ctx // 写入失败探针用（见 probeMutationRejection）
   const pollMs = opts?.pollMs ?? 400
   const maxPollAttempts = opts?.maxPollAttempts ?? 75
 

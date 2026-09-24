@@ -9,9 +9,11 @@
  */
 
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { isAbsolute, resolve } from 'node:path'
 import { findSimilar, search, tokenize, type RankedHit } from './bm25.js'
 import { getDb, getDreamWorkspace, globalProjectMarker, isGlobalProject, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
 import { fillTemplate, keyedValue } from './prompt-loader.js'
+import { activeHomeDir, homeDirPresets, resolveHomeDir, switchHomeDir } from './home-dir.js'
 
 /** tools.md 键值取用（prompt 文案外置 v0.19.0）：缺键时 keyedValue throw。 */
 const T = (key: string): string => keyedValue('tools', key)
@@ -769,6 +771,62 @@ function projectTool(dir: string): ToolDefinition {
   }
 }
 
+/** 全局数据目录查看/切换（用户拍板 2026-09-25）：对用户=说一句话即可换目录，
+ *  零代码零重启——不依赖 dsh 0.1.7 设置页写入链（其真机写入被拒、拒因静默）。
+ *  切换=插件内部 switchHomeDir（同盘移动/跨盘复制+旧目录绝不自动删+失败留原地）。 */
+function homeTool(): ToolDefinition {
+  return {
+    name: 'memory_home',
+    description: T('memory_home.description'),
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        target: { type: 'string', description: T('memory_home.param.target') },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['note'],
+        properties: { note: { type: 'string', description: T('memory_home.out.note') } },
+      },
+      render: (_args, value) => {
+        const v = value as { note?: string }
+        return [{ type: 'text' as const, text: String(v.note ?? '') }]
+      },
+    },
+    async execute(args: unknown) {
+      const parsed = args as { target?: unknown }
+      const presets = homeDirPresets()
+      const raw = typeof parsed.target === 'string' ? parsed.target.trim() : ''
+      if (raw === '') {
+        return { note: [
+          `当前全局数据目录：${activeHomeDir()}`,
+          `预设 default（系统用户主目录）：${presets.default}`,
+          `预设 dsh-storage（DSH 根目录 Storage）：${presets['dsh-storage']}`,
+          `预设 plugin-root（插件本体根目录）：${presets['plugin-root']}`,
+          `不修改则不传 target；要切换请传预设标记或绝对路径。`,
+        ].join('\n') }
+      }
+      const LEGAL = ['default', 'dsh-storage', 'plugin-root']
+      const target = resolveHomeDir(raw)
+      // 非法输入防误切：resolveHomeDir 会把非法值回落默认——这里识别出来直接报错
+      const downgraded = target === resolveHomeDir(undefined) && !LEGAL.includes(raw)
+      if (downgraded) {
+        return { note: `无法识别的 target："${raw}"（可用预设标记或绝对路径）。当前目录未变：${activeHomeDir()}` }
+      }
+      const sw = switchHomeDir(target)
+      if (sw.mode === 'same') return { note: `全局数据目录本就是 ${sw.to}，未变更。` }
+      if (sw.mode === 'failed') return { note: `切换失败：${sw.error}。仍使用 ${sw.from}，数据未受影响，可稍后重试。` }
+      if (sw.mode === 'reused-nonempty') return { note: `已切换为 ${sw.to}（目标目录已有内容，直接启用、未覆盖）。旧目录 ${sw.from} 原样保留。` }
+      if (sw.mode === 'rename') return { note: `已切换为 ${sw.to}：自 ${sw.from} 移动 ${sw.files} 项完成（同盘移动）。如本机有多个 dsh 实例共享旧目录，请同步修改它们的设置。` }
+      return { note: `已切换为 ${sw.to}：自 ${sw.from} 复制 ${sw.files} 项（跨盘复制为快照）。旧目录 ${sw.from} 保留未删，确认无误后可手动删除；若多个 dsh 实例共享旧目录，请同步修改其他实例的设置。` }
+    },
+  }
+}
+
 export function registerMemoryTools(register: (t: ToolDefinition) => void, dir = '.dsh-meow'): void {
   register(rememberTool(dir))
   register(searchTool(dir))
@@ -776,4 +834,5 @@ export function registerMemoryTools(register: (t: ToolDefinition) => void, dir =
   register(readTool(dir))
   register(updateTool(dir))
   register(projectTool(dir))
+  register(homeTool())
 }

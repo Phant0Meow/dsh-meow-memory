@@ -5,5 +5,3 @@
 - insert:
     - id: meow-memory
       name: 'meow-memory'
-      config:
-        enabled: true

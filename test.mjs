@@ -4,9 +4,9 @@
  * 部分 2：apply 级（mock ctx：工具注册、pre-step 注入、turn-stopping 反思、disabled）。
  * 用法：node test.mjs（先 build）
  */
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, utimesSync } from 'node:fs'
+import { tmpdir, homedir } from 'node:os'
+import { join, resolve } from 'node:path'
 import {
   apply,
   fillTemplate,
@@ -63,6 +63,14 @@ import {
   isDreamSuppressed,
   collectDreamStates,
   sessionEventsOf,
+  sweepHomeLogs,
+  DEFAULT_HOME_DIR,
+  activeHomeDir,
+  setActiveHomeDir,
+  dshHomeDir,
+  homeDirPresets,
+  resolveHomeDir,
+  switchHomeDir,
 } from './lib/index.js'
 
 let passed = 0
@@ -713,8 +721,35 @@ function makeCtx(subagents) {
 
 const { ctx, tools, handlers } = makeCtx()
 await apply(ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
-check('seven tools registered', tools.length === 7 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project']
+check('eight tools registered', tools.length === 8 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project', 'memory_home']
   .every((name) => tools.some((t) => t.name === name)), `got ${tools.map((t) => t.name).join(',')}`)
+
+// memory_home 工具：查询 / 非法 target 防误切 / 合法切换（走 switchHomeDir 真链路）
+{
+  const home = tools.find((t) => t.name === 'memory_home')
+  const saved = activeHomeDir()
+  const tmpH = mkdtempSync(join(tmpdir(), 'meow-home-tool-'))
+  const savedReal = activeHomeDir()
+
+  const r1 = await home.execute({})
+  check('memory_home: 查询模式返回当前目录与预设', String(r1.note).includes('当前全局数据目录') && String(r1.note).includes('dsh-storage'))
+
+  setActiveHomeDir(join(tmpH, 'from'))
+  const r2 = await home.execute({ target: 'not-a-legal-target' })
+  check('memory_home: 非法 target 防误切', String(r2.note).includes('无法识别') && activeHomeDir() === join(tmpH, 'from'))
+
+  mkdirSync(join(tmpH, 'from2'))
+  writeFileSync(join(tmpH, 'from2', 'seed.txt'), 'x')
+  setActiveHomeDir(join(tmpH, 'from2'))
+  const r3 = await home.execute({ target: join(tmpH, 'to-home') })
+  check('memory_home: 合法切换生效且留标记', String(r3.note).includes('已切换为') && existsSync(join(tmpH, 'to-home', 'home-dir.json')) && activeHomeDir() === join(tmpH, 'to-home'))
+
+  const r4 = await home.execute({ target: 'dsh-storage' })
+  check('memory_home: 预设标记解析并切换', typeof r4.note === 'string' && r4.note.length > 0)
+
+  setActiveHomeDir(savedReal)
+  rmSync(tmpH, { recursive: true, force: true })
+}
 
 // memory_dream 工具入口：子代理会话拒绝（与 /dream 命令守卫同语义——fork 播种父
 // 会话 turn，工具 schema 对子代理可见，误调在此拦下，不进 windows 表不留痕迹）。
@@ -1706,7 +1741,63 @@ setPromptLang('zh')
 // ③ 未被 user 层覆盖的字段仍按 patch 层跑（user 层是字段级覆盖、不是整层替换）
 const sc3 = makeSettingsCtx({ promptLang: 'zh' })
 await apply(sc3.ctx, { enabled: true, projectDir: '.dsh-meow', hitTopK: 9 })
-check('issue#21 未被 user 层覆盖的字段仍走 patch（工具照常注册）', sc3.tools.length === 7, `got ${sc3.tools.length}`)
+check('issue#21 未被 user 层覆盖的字段仍走 patch（工具照常注册）', sc3.tools.length === 8, `got ${sc3.tools.length}`)
+
+// ── 0.1.7 宿主盲区补丁：describe 值冻结修正 + homeDirPresets 注入 + write 热切换 ──
+// 0.1.7 的 SettingsForms.write 只落盘从不重载 entry：describe 的 value 冻结在启动值、
+// user 层却新鲜——设置页 radio 因此停在旧位置（2026-09-25 实车分裂实证）。壳=describe
+// 现场重算 value=base⊕user + base 注入 homeDirPresets（不进 value，防 decode 失败）；
+// write 成功侧补 hotSwitchHomeDir（default=当前目录 → 幂等 no-op，链路不炸即可）。
+{
+  class FakeSettings017 {
+    constructor(rows) { this.rows = rows; this.wrote = null }
+    async write(ns, _change, _expected) { this.wrote = ns; return 'ok' }
+    describe() { return this.rows }
+  }
+  const rows017 = [{
+    ns: 'meow-memory', revision: 3, schema: {}, applies: 'live',
+    value: { enabled: true, projectDir: '.dsh-meow', homeDir: 'stale-frozen-at-boot' },
+    base: { enabled: true, projectDir: '.dsh-meow', homeDir: '' },
+    user: { homeDir: 'default' },
+  }, { ns: 'other-ns', revision: 1, value: { x: 1 }, base: {}, user: {} }]
+  const svc017 = new FakeSettings017(rows017)
+  const ctx017 = {
+    logger: { info: () => {}, warn: () => {}, error: console.error },
+    tools: { register: () => {} },
+    on: () => {},
+    effect: () => () => {},
+    get: (n) => (n === 'settings' ? svc017 : undefined),
+    // 真 cordis 会静默吞 inject 回调里的同步异常（0.1.7 上 compat 必抛 'neither'）；
+    // 裸 mock 不吞会炸测试进程——补齐同款语义。
+    inject: (_deps, cb) => { queueMicrotask(() => { try { cb({ settings: svc017, effect: ctx017.effect }) } catch { /* cordis 静默吞 */ } }) },
+  }
+  await apply(ctx017, { enabled: true, projectDir: '.dsh-meow' })
+  const proto017 = Object.getPrototypeOf(svc017)
+  check('0.1.7 describe/write 壳已装配', proto017.__meowValueRefresh === true && proto017.__meowWriteHook === true,
+    JSON.stringify({ v: proto017.__meowValueRefresh, w: proto017.__meowWriteHook }))
+  const meowRow = svc017.describe().find((r) => r.ns === 'meow-memory')
+  check('0.1.7 describe value 现场重算=base⊕user（不再冻结）',
+    meowRow.value.homeDir === 'default' && meowRow.value.projectDir === '.dsh-meow', JSON.stringify(meowRow.value))
+  check('0.1.7 homeDirPresets 注入 base、不进 value（value 过 schema decode）',
+    typeof meowRow.base.homeDirPresets === 'object' && meowRow.value.homeDirPresets === undefined,
+    JSON.stringify({ b: typeof meowRow.base.homeDirPresets, v: meowRow.value.homeDirPresets }))
+  check('0.1.7 非我方命名空间原样透传', svc017.describe()[1].base.homeDirPresets === undefined, '')
+  await svc017.write('meow-memory', () => ({}))
+  check('0.1.7 write 成功侧热切换链路不炸（default→当前目录 no-op）', svc017.wrote === 'meow-memory', '')
+  // 0.1.6 形状（installSection 在）绝不装壳——原生链路全在，包装反而多此一举
+  const svcLegacy = { installSection: (_o, _n, _s, _e, hooks) => { hooks.setSource(() => ({})); return () => {} } }
+  const ctxLegacy = {
+    logger: { info: () => {}, warn: () => {}, error: console.error },
+    tools: { register: () => {} },
+    on: () => {},
+    effect: () => () => {},
+    get: (n) => (n === 'settings' ? svcLegacy : undefined),
+    inject: (_deps, cb) => { queueMicrotask(() => cb({ settings: svcLegacy, effect: ctxLegacy.effect })) },
+  }
+  await apply(ctxLegacy, { enabled: true, projectDir: '.dsh-meow' })
+  check('0.1.6 原生链路不装壳（Object.prototype 不被污染）',
+    Object.getPrototypeOf(svcLegacy).__meowValueRefresh === undefined && Object.getPrototypeOf(svcLegacy).__meowWriteHook === undefined, '')
+}
 
 // disabled
 const { ctx: ctxOff, tools: toolsOff, handlers: handlersOff } = makeCtx()
@@ -1741,6 +1832,124 @@ rmSync(wsNoDb, { recursive: true, force: true })
   check('issue#27 已删除的工作区目录不被复活', !existsSync(wsDead))
   check('issue#27 存活工作区目录不被误删', existsSync(wsLive))
   closeAllDbs()
+  rmSync(tmp, { recursive: true, force: true })
+}
+
+// ── 主目录日志清扫：48h 保留 + perf.log 轮转（白名单精确点名，绝不 glob）──
+{
+  const tmp = mkdtempSync(join(tmpdir(), 'meow-sweep-'))
+  const stale = (Date.now() - 49 * 3600 * 1000) / 1000 // 超 48h 一小时
+  const fresh = (Date.now() - 1 * 3600 * 1000) / 1000
+  const mk = (name, mtimeSec, body = 'x') => {
+    writeFileSync(join(tmp, name), body)
+    utimesSync(join(tmp, name), mtimeSec, mtimeSec)
+  }
+  // 白名单：两个超期该删、两个新鲜该留
+  mk('perf.log', stale)
+  mk('apply-error.log', stale)
+  mk('settings-register-error.log', fresh)
+  mk('perf.log.old', fresh)
+  // 非白名单住户：就算超期也绝不能动（误删防线）
+  mk('window-index.json', stale, '{}')
+  mk('migrate-v0-state.json', stale, '{"migrated":true}')
+  mk('migrate-v0-state.json.bak-2026', stale, '{}')
+  mkdirSync(join(tmp, 'prompts'))
+
+  const r = sweepHomeLogs(tmp, Date.now())
+  check('sweep 超期白名单被删（perf.log）', !existsSync(join(tmp, 'perf.log')))
+  check('sweep 超期白名单被删（apply-error.log）', !existsSync(join(tmp, 'apply-error.log')))
+  check('sweep 新鲜白名单保留（settings-register-error.log）', existsSync(join(tmp, 'settings-register-error.log')))
+  check('sweep 新鲜白名单保留（perf.log.old）', existsSync(join(tmp, 'perf.log.old')))
+  check('sweep 非白名单超期也不碰（window-index.json）', existsSync(join(tmp, 'window-index.json')))
+  check('sweep 非白名单超期也不碰（migrate-v0-state.json 及 .bak）', existsSync(join(tmp, 'migrate-v0-state.json')) && existsSync(join(tmp, 'migrate-v0-state.json.bak-2026')))
+  check('sweep 非白名单不碰（prompts/ 目录）', existsSync(join(tmp, 'prompts')))
+  check('sweep 返回值记账（swept=2 rotated=false）', r.swept.length === 2 && r.swept.includes('perf.log') && r.swept.includes('apply-error.log') && !r.rotated)
+
+  // 轮转：新鲜 perf.log 超 5MB → 改名 .old（覆盖上一代）
+  const big = 'y'.repeat(5 * 1024 * 1024 + 1)
+  writeFileSync(join(tmp, 'perf.log'), big)
+  const r2 = sweepHomeLogs(tmp, Date.now())
+  check('sweep 轮转：超 5MB 的 perf.log 改名为 .old', r2.rotated && !existsSync(join(tmp, 'perf.log')) && existsSync(join(tmp, 'perf.log.old')))
+  check('sweep 轮转保一代：.old 内容正是刚轮转的大文件', readFileSync(join(tmp, 'perf.log.old'), 'utf8') === big)
+
+  // 幂等：无 perf.log 时轮转静默跳过不炸
+  const r3 = sweepHomeLogs(tmp, Date.now())
+  check('sweep 幂等：无 perf.log 时轮转静默跳过', !r3.rotated && !existsSync(join(tmp, 'perf.log')))
+
+  rmSync(tmp, { recursive: true, force: true })
+}
+
+// ── 全局目录：预设解析 + 迁移切换（home-dir.ts；红线=绝不删旧目录/绝不覆盖非空目标）──
+{
+  const savedReal = activeHomeDir()
+  const tmp = mkdtempSync(join(tmpdir(), 'meow-homedir-'))
+
+  // resolveHomeDir：预设/缺省/非法输入
+  check('resolveHomeDir: default 标记=平台默认目录', resolveHomeDir('default') === DEFAULT_HOME_DIR)
+  check('resolveHomeDir: 空/undefined 回落默认', resolveHomeDir('') === DEFAULT_HOME_DIR && resolveHomeDir(undefined) === DEFAULT_HOME_DIR)
+  const savedEnv = process.env.DSH_HOME
+  process.env.DSH_HOME = join(tmp, 'dshhome')
+  check('resolveHomeDir: dsh-storage 预设=DSH_HOME/storages/meow-memory', resolveHomeDir('dsh-storage') === join(tmp, 'dshhome', 'storages', 'meow-memory'))
+  process.env.DSH_HOME = savedEnv
+  check('resolveHomeDir: plugin-root 预设=插件根/storage（绝对路径）', resolveHomeDir('plugin-root') === homeDirPresets()['plugin-root'] && resolve(resolveHomeDir('plugin-root')) === resolveHomeDir('plugin-root'))
+  check('resolveHomeDir: 相对路径非法回落默认', resolveHomeDir('relative/path') === DEFAULT_HOME_DIR)
+  check('resolveHomeDir: 用户主目录本身非法回落默认', resolveHomeDir(homedir()) === DEFAULT_HOME_DIR)
+  const customAbs = join(tmp, 'custom-home')
+  check('resolveHomeDir: 合法绝对路径原样通过', resolveHomeDir(customAbs) === resolve(customAbs))
+  const savedEnvHome = process.env.MEOW_MEMORY_HOME
+  process.env.MEOW_MEMORY_HOME = join(tmp, 'env-home')
+  check('resolveHomeDir: env 兜底生效（配置无值时）', resolveHomeDir(undefined) === join(tmp, 'env-home') && resolveHomeDir('') === join(tmp, 'env-home'))
+  if (savedEnvHome === undefined) delete process.env.MEOW_MEMORY_HOME
+  else process.env.MEOW_MEMORY_HOME = savedEnvHome // 直接赋 undefined 会存成字符串 "undefined"
+  check('resolveHomeDir: env 还原后回落默认', resolveHomeDir(undefined) === DEFAULT_HOME_DIR)
+
+  // switchHomeDir：same / 目标非空直接启用 / 同盘 rename 迁移
+  const from = join(tmp, 'from-home')
+  mkdirSync(from)
+  writeFileSync(join(from, 'perf.log'), 'old-perf')
+  writeFileSync(join(from, 'window-index.json'), '{}')
+  setActiveHomeDir(from)
+  let sw = switchHomeDir(from)
+  check('switch: 同目录不动', !sw.changed && sw.mode === 'same' && activeHomeDir() === from)
+
+  const busy = join(tmp, 'busy-home')
+  mkdirSync(busy)
+  writeFileSync(join(busy, 'keep.txt'), 'user-data')
+  sw = switchHomeDir(busy)
+  check('switch: 目标非空直接启用、绝不覆盖', sw.changed && sw.mode === 'reused-nonempty' && !sw.migrated && readFileSync(join(busy, 'keep.txt'), 'utf8') === 'user-data')
+  check('switch: 目标非空时不搬旧内容', !existsSync(join(busy, 'perf.log')))
+
+  const moved = join(tmp, 'moved-home')
+  setActiveHomeDir(from) // 上一步 reused 切换已把状态口拨到 busy；本场景从 from-home 起迁
+  sw = switchHomeDir(moved)
+  check('switch: 空目标走迁移（同盘 rename）', sw.changed && sw.migrated && sw.mode === 'rename')
+  check('switch: rename 后旧目录不复存在（同盘移动语义）', !existsSync(from))
+  check('switch: 内容完整落到新目录', readFileSync(join(moved, 'perf.log'), 'utf8') === 'old-perf')
+  check('switch: 落 home-dir.json 标记', existsSync(join(moved, 'home-dir.json')) && JSON.parse(readFileSync(join(moved, 'home-dir.json'), 'utf8')).migratedFrom === from)
+  check('switch: 状态口已切到新目录', activeHomeDir() === moved)
+
+  // 目标为空壳目录：同盘时实现会拆壳后 rename（单盘环境测不到跨盘 copy 分支——
+  // 该分支只有 EXDEV/句柄占用触发）；断言迁移成功+内容落位即可。
+  const copyFrom = join(tmp, 'copy-from')
+  const copyTo = join(tmp, 'copy-to')
+  mkdirSync(copyFrom)
+  writeFileSync(join(copyFrom, 'apply-error.log'), 'err')
+  mkdirSync(copyTo)
+  setActiveHomeDir(copyFrom)
+  sw = switchHomeDir(copyTo)
+  check('switch: 空壳目标迁移成功', sw.changed && sw.migrated && (sw.mode === 'rename' || sw.mode === 'copy'))
+  check('switch: 内容落位+标记在', readFileSync(join(copyTo, 'apply-error.log'), 'utf8') === 'err' && existsSync(join(copyTo, 'home-dir.json')))
+  // 「绝不自动删旧目录」红线在 copy 场景成立（rename 场景旧目录消失=OS 移动语义）；
+  // 单测以「目标非空绝不覆盖」锁同一条红线：旧目录内容原样保留（上方 keep.txt 断言）。
+
+  // failed：目标是一个文件（不是目录）
+  const fileTarget = join(tmp, 'not-a-dir')
+  writeFileSync(fileTarget, 'x')
+  setActiveHomeDir(copyTo)
+  sw = switchHomeDir(fileTarget)
+  check('switch: 目标是文件→失败留原地', !sw.changed && sw.mode === 'failed' && sw.error !== undefined && activeHomeDir() === copyTo)
+
+  setActiveHomeDir(savedReal)
   rmSync(tmp, { recursive: true, force: true })
 }
 

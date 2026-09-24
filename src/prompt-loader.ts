@@ -20,17 +20,20 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { activeHomeDir } from './home-dir.js'
 
 /** 内置语言包根目录（<包>/lib/prompts）。 */
 const PROMPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), 'prompts')
 
-/** 实例覆盖层根目录（<home>/.dsh-meow/prompts/<lang>/<slot>.md）。prompt 语言与
+/** 实例覆盖层根目录（<全局目录>/prompts/<lang>/<slot>.md）。prompt 语言与
  *  自定义文案是实例级偏好（记忆库才是 per-workspace），与 perf.log 等实例级文件
- *  同目录惯例；逐槽位可选——只放想改的文件，缺失自动落回内置语言包。 */
-const OVERRIDE_DIR = join(homedir(), '.dsh-meow', 'prompts')
+ *  同目录惯例；逐槽位可选——只放想改的文件，缺失自动落回内置语言包。
+ *  动态取 activeHomeDir()：设置页切换全局目录后覆盖层跟着走（热切换，无需重启）。 */
+function overrideDir(): string {
+  return join(activeHomeDir(), 'prompts')
+}
 
 /** 默认语言（最终兜底语言包目录名）。 */
 export const DEFAULT_LANG = 'zh'
@@ -84,7 +87,7 @@ function readSlotFile(slot: SlotName, lang: string): string {
       .replace(/\s+$/, '')
       // markdown 转义反转义：md 源里写 memory\_project 防渲染器吃下划线，模型该看到的是裸工具名
       .replace(/\\_/g, '_')
-  const override = join(OVERRIDE_DIR, lang, `${slot}.md`)
+  const override = join(overrideDir(), lang, `${slot}.md`)
   if (existsSync(override)) return read(override)
   if (lang !== DEFAULT_LANG) {
     const primary = join(PROMPTS_DIR, lang, `${slot}.md`)

@@ -23,12 +23,13 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import z from '@deepseek-ai/schemastery'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { closeAllDbs, getDb, memoryDbPath } from './db.js'
 import { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
 import { CONFIG_DEFAULTS } from './defaults.js'
+import { activeHomeDir, homeDirPresets, resolveHomeDir, switchHomeDir } from './home-dir.js'
 import { ensureV0SessionsMigrated } from './migrate-v0.js'
 
 import {
@@ -115,18 +116,18 @@ export function getMemoryGuide(): string {
   return resolveSlotText('system-guide')
 }
 
-// ── 性能诊断（perf.log，固定位置 ~/.dsh-meow/perf.log；卡死时查数据） ────────
+// ── 性能诊断（perf.log，全局目录 activeHomeDir()；卡死时查数据） ─────────────
 // 模块级计数器：模块只初始化一次；apply 每次执行 +1——若日志里 apply 编号异常
 // 跳跃/重复，说明 apply 被多次调用（handler 叠加）。事件计数看事件吞吐。
-const PERF_LOG = join(homedir(), '.dsh-meow', 'perf.log')
 let applyCount = 0
 let evtCount = 0
 let perfBoot = Date.now()
 let lastPerfLog = Date.now()
 function perf(msg: string): void {
   try {
-    mkdirSync(dirname(PERF_LOG), { recursive: true })
-    appendFileSync(PERF_LOG, `[${new Date().toISOString()}] ${msg}\n`)
+    const file = join(activeHomeDir(), 'perf.log') // 动态取：全局目录热切换后下一笔即落新目录
+    mkdirSync(dirname(file), { recursive: true })
+    appendFileSync(file, `[${new Date().toISOString()}] ${msg}\n`)
   } catch {
     /* 日志失败不阻塞 */
   }
@@ -142,11 +143,76 @@ function perfEvent(): void {
   }
 }
 
-export const Config = z.object({
+// ── 主目录日志清扫（48h 保留 + perf.log 大小轮转；用户拍板 2026-09-24） ──────
+// 白名单精确点名，绝不 glob 目录——~/.dsh-meow 下还住着 window-index.json、
+// migrate-v0-state.json(.bak)、prompts/ 等非日志住户。判定用文件 mtime（append
+// 天然维护，恒等于最后一行的时刻，零解析）；双实例共享本目录时，活跃实例持续
+// 刷新 mtime，天然防误删活日志。单文件失败（占用/权限）静默跳过，下次启动再试。
+const LOG_RETENTION_MS = 48 * 60 * 60 * 1000
+const PERF_LOG_ROTATE_BYTES = 5 * 1024 * 1024
+const HOME_LOGS = ['perf.log', 'perf.log.old', 'settings-register-error.log', 'apply-error.log']
+
+/** 启动清扫：白名单日志距上次写入超 48h 的删除；perf.log 超 5MB 轮转成 .old
+ *  （覆盖上一代，历史保一代）。只在 apply（启动/热重载）时跑——废弃日志只有
+ *  进程都停了才会变老，下次启动清扫即完备；disabled 时不跑。dir/now 参数化供
+ *  测试隔离（测试绝不触真实全局目录）。返回值交调用方落 perf，自身零副作用日志。 */
+export function sweepHomeLogs(dir = activeHomeDir(), now = Date.now()): { swept: string[]; rotated: boolean } {
+  const swept: string[] = []
+  const cutoff = now - LOG_RETENTION_MS
+  for (const name of HOME_LOGS) {
+    if (!name.endsWith('.log')) continue // 防御断言：名单误配也只可能是 .log
+    try {
+      const file = join(dir, name)
+      if (statSync(file).mtimeMs < cutoff) {
+        unlinkSync(file)
+        swept.push(name)
+      }
+    } catch {
+      /* 不存在/占用/权限：跳过 */
+    }
+  }
+  let rotated = false
+  try {
+    const cur = join(dir, 'perf.log')
+    if (statSync(cur).size > PERF_LOG_ROTATE_BYTES) {
+      renameSync(cur, join(dir, 'perf.log.old')) // 覆盖上一代（MOVEFILE_REPLACE_EXISTING）
+      rotated = true
+    }
+  } catch {
+    /* 不存在（刚被 48h 清掉）/被另一实例占用：跳过，下次启动再轮转 */
+  }
+  return { swept, rotated }
+}
+
+/** homeDirPresets 的启动期快照（模块加载时取一次；异常回空表——meta 缺席只损失
+ *  设置页 radio 旁的预设路径显示，绝不弄崩插件加载）。 */
+function homeDirPresetsDefault(): Record<string, string> {
+  try {
+    return homeDirPresets()
+  } catch {
+    return {}
+  }
+}
+
+const config = z.object({
   /** 总开关：false 时注入、反思、工具全部停用。 */
   enabled: z.boolean().default(true),
   /** 记忆目录（相对工作区）。 */
   projectDir: z.string().default('.dsh-meow'),
+  /** 全局目录（实例级数据家：日志/window-index/prompts 覆盖层/migrate 状态）。
+   *  'default'=平台用户主目录 | 'dsh-storage'=<DSH home>/storages/meow-memory |
+   *  'plugin-root'=<插件根>/storage | 绝对路径=自定义。''/缺省=默认。
+   *  变更即自动迁移旧目录内容（同盘移动/跨盘复制，旧目录绝不自动删）。 */
+  homeDir: z.string().required(false),
+  /** homeDirPresets（只读 meta，非配置）：三个全局目录预设的实际落点，设置页
+   *  radio 旁显示。0.1.7 的 base 视图 = 宿主 resolveConfig(inherited) 后按 schema
+   *  键投影——不在 schema 声明的键宿主永远剥掉，cordis.patch.yml 通道也走不通
+   * （patch config 会撞设置写入的全等比对死锁，2026-09-25 实证），所以只能住进
+   *  schema 默认值，由官方深填机带进 base/value 两视图。默认值在 schema 构建时
+   *  取一次：预设落点因机器/安装位置而异、进程内不变（热切换只改 active，不改
+   *  预设定义）。不进 CONFIG_DEFAULTS——「恢复默认」绝不能把它当字段写进 user 层；
+   *  它也不是设置页 FieldSpec，页面与 resolveConfig 都不读它。 */
+  homeDirPresets: z.dict(z.string()).default(homeDirPresetsDefault()),
   /** 关键词命中条数上限（fact/lesson/rules/topic 短条目，每条用户消息命中注入）。 */
   hitTopK: z.number().min(0).max(10).default(2),
   /** 导引标题截断长度。 */
@@ -195,6 +261,14 @@ export const Config = z.object({
     .default({}),
 })
 
+// 0.1.7 设置服务只收录 meta.volatile 的 Config（dsh-settings volatileForm 根检查）：
+// 不标记则「喵记忆」标签页永远 unavailable（提示文案会误导性地怪回环连接）。仓内
+// schemastery@3.18.1 的解析不含 volatile 逻辑——meta 只是宿主侧标记，config 值保持
+// 裸形状（官方新版 .volatile() 会把值包成 .get() 引用），消费端零改动；升级依赖须重验。
+Object.assign(config.meta, { volatile: true })
+
+export { config as Config }
+
 // ── 设置页（喵记忆标签页）的数据底座 ──────────────────────────────────────────
 //
 // installSettingsSection(ctx, SETTINGS_NS, ...) 在 applyInner 最前面调用；标签页
@@ -232,6 +306,7 @@ export function validateConfigUserLayer(value: unknown): void {
   }
   reqBool('enabled')
   reqStr('projectDir')
+  reqStr('homeDir')
   reqNum('hitTopK')
   reqNum('titleMax')
   reqBool('reflect')
@@ -295,6 +370,8 @@ export function mergeConfigLayer(patch: unknown, user: Record<string, unknown> |
 interface ResolvedConfig {
   enabled: boolean
   projectDir: string
+  /** 原样透传（'default'|'dsh-storage'|'plugin-root'|绝对路径|undefined）；绝对路径化在 resolveHomeDir。 */
+  homeDir: string | undefined
   hitTopK: number
   titleMax: number
   reflect: boolean
@@ -313,6 +390,7 @@ function resolveConfig(config: unknown): ResolvedConfig {
   return {
     enabled: c.enabled ?? true,
     projectDir: c.projectDir ?? '.dsh-meow',
+    homeDir: typeof c.homeDir === 'string' ? c.homeDir : undefined,
     hitTopK: c.hitTopK ?? 2,
     titleMax: c.titleMax ?? 40,
     reflect: c.reflect ?? true,
@@ -429,7 +507,7 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     return await applyInner(ctx, config)
   } catch (e) {
     try {
-      const errFile = join(homedir(), '.dsh-meow', 'apply-error.log')
+      const errFile = join(activeHomeDir(), 'apply-error.log')
       mkdirSync(dirname(errFile), { recursive: true })
       appendFileSync(errFile, `[${new Date().toISOString()}] ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`)
     } catch {
@@ -511,15 +589,56 @@ function installSettingsSectionCompat(
  *  这里给足余量；仅当 settings 服务异常/注册回调始终不回填时才真的等满。 */
 const SETTINGS_SOURCE_WAIT_MS = 250
 
+/** 全局目录切换结果落日志（apply 与设置页 onChange 共用口径；跨盘复制带多实例提醒）。 */
+function logHomeDirSwitch(ctx: Context, sw: ReturnType<typeof switchHomeDir>): void {
+  if (sw.mode === 'copy') {
+    ctx.logger.warn(`meow-memory: 全局目录已切换为 ${sw.to}（自 ${sw.from} 复制 ${sw.files} 项）。旧目录保留未删，确认无误后可手动删除；若多个 dsh 实例共享旧目录，请同步修改其他实例的设置`)
+  } else if (sw.migrated) {
+    ctx.logger.info(`meow-memory: 全局目录已切换为 ${sw.to}（自 ${sw.from} 移动 ${sw.files} 项）`)
+  } else if (sw.changed) {
+    ctx.logger.info(`meow-memory: 全局目录切换为 ${sw.to}（目标已有内容，直接启用未覆盖）`)
+  } else if (sw.mode === 'failed') {
+    ctx.logger.warn(`meow-memory: 全局目录切换失败（${sw.error}），继续使用 ${sw.from}`)
+  }
+}
+
+/** 设置页保存后的全局目录热切换（fire-and-forget，用户拍板 2026-09-24）：搬移可能
+ *  跨盘复制（秒级），异步执行不阻塞保存链路；窗口期日志仍落旧目录（毫秒级），无碍。
+ *  搬完把新目录的 window-index 账本 merge 进内存。切换失败只留日志，绝不影响保存。 */
+function hotSwitchHomeDir(ctx: Context, config: unknown, get: (() => unknown) | undefined): void {
+  try {
+    const merged = mergeConfigLayer(config, get?.() as Record<string, unknown> | undefined)
+    const resolved = resolveConfig(merged)
+    const target = resolveHomeDir(resolved.homeDir)
+    if (target === activeHomeDir()) return
+    void Promise.resolve().then(() => {
+      try {
+        const sw = switchHomeDir(target)
+        logHomeDirSwitch(ctx, sw)
+        if (sw.changed) loadWindowIndex(resolved.projectDir ?? '.dsh-meow')
+      } catch {
+        /* 热切换失败不影响配置保存 */
+      }
+    })
+  } catch {
+    /* 解析失败不打扰保存 */
+  }
+}
+
 async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // ── 设置页命名空间（喵记忆标签页的数据底座）──
   // installSettingsSection 必须先于 resolveConfig，但「先注册」≠「注册时同步回填」——
   // inject 回调是异步的（见下），所以 resolve 之前必须显式等 source 就绪。
-  // 三层模型：CONFIG_DEFAULTS（默认）< patch config（cordis.patch.yml 手编，合成进
-  // base 显示为"预填"）< 设置页 user 层（标签页改动，字段级覆盖）。
-  // base 必须合成 patch：否则 patch 手编的值（如 delegate/model）在标签页显示为空，
-  // 用户会以为配置丢了（2026-09-02 实测踩坑）。
-  const settingsBase = mergeConfigLayer(CONFIG_DEFAULTS, config)
+  // 三层模型：CONFIG_DEFAULTS（默认）< patch config（0.1.6 手编层，config 参数里已
+  // 合成）< 设置页 user 层（标签页改动，字段级覆盖）。
+  // 0.1.6 腿：settingsBase 显式合成 CONFIG_DEFAULTS⊕config，作为 register 的 base——
+  // patch 手编的值（如 delegate/model）不在 base 里的话标签页显示为空，用户会以为
+  // 配置丢了（2026-09-02 实测踩坑）。附加 homeDirPresets（只读 meta）同因：0.1.6 的
+  // base 通道只认 register 显式传参。
+  // 0.1.7 腿：register 已被宿主删除，base 视图改由宿主拿 Config schema 深填默认值
+  // （resolveConfig(inherited)）——预填全部声明进 schema（含 homeDirPresets），这里
+  // 不再需要任何手动注入。patch config 段已随全等比对死锁退役（2026-09-25）。
+  const settingsBase = { ...mergeConfigLayer(CONFIG_DEFAULTS, config), homeDirPresets: homeDirPresets() } as Record<string, unknown>
   let settingsGet: (() => unknown) | undefined
   // 设置源就绪信号（issue #21）：ctx.inject(deps, cb) 的回调**永远不会同步执行**——它
   // 等价于 ctx.plugin({ inject, apply })，插件体跑在异步启动的子 fiber 里（cordis
@@ -539,6 +658,203 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       settings: SettingsServiceLike
       effect: (fn: () => () => void) => unknown
     }) => {
+      // 服务端 write 取证壳（0.1.7 写入排障 2026-09-25）：settings 服务就绪回调里
+      // 实例必然在手——给 write 原型包装取证壳，宿主拒写的原始异常（含 message/栈，
+      // 栈定位 configEditor 内具体抛点）落盘 settings-diag.log。仅加日志不改行为。
+      // 必须在 installSectionCompat 之前装配：0.1.7 的服务无 installSection/register，
+      // compat 会抛「neither」被 cordis 静默吞掉——那本身就是关键诊断信号，也要留痕。
+      try {
+        const svc = settingsCtx.settings as unknown as Record<string, unknown>
+        const proto = Object.getPrototypeOf(svc) as { write?: (...args: unknown[]) => unknown; __writeProbe?: boolean }
+        if (proto !== undefined && typeof proto.write === 'function' && proto.__writeProbe !== true) {
+          proto.__writeProbe = true
+          const rawWrite = proto.write.bind(svc)
+          proto.write = (...args: unknown[]) => {
+            const result = rawWrite(...args)
+            if (result instanceof Promise) {
+              return result.catch((e: unknown) => {
+                try {
+                  const diagFile = join(activeHomeDir(), 'settings-diag.log')
+                  mkdirSync(dirname(diagFile), { recursive: true })
+                  appendFileSync(diagFile, `[${new Date().toISOString()}] write(ns=${String(args[0])}) rejected: ${e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e)}\n`)
+                } catch {
+                  /* 取证失败忽略 */
+                }
+                throw e
+              })
+            }
+            return result
+          }
+        }
+      } catch {
+        /* 取证壳装配失败忽略 */
+      }
+      // 宿主 configEditor 侧直接取证（write 的第一道门）：entries 的真实清单
+      try {
+        const ce = (svc as unknown as { ownerContext?: { configEditor?: { entries?: () => Array<Record<string, unknown>> } } }).ownerContext?.configEditor
+        if (ce && typeof ce.entries === 'function') {
+          const rows = ce.entries().map((entry) => {
+            const o = entry as Record<string, any>
+            return {
+              id: o.options?.id,
+              state: o.fiber?.state,
+              parent: o.parent?.tree?.ctx?.fiber?.entry?.id ?? null,
+              hasRuntimeConfig: o.fiber?.runtime !== undefined && 'Config' in (o.fiber.runtime as object),
+              configRaw: o.options?.config ?? null,
+            }
+          })
+          const diagFile2 = join(activeHomeDir(), 'settings-diag.log')
+          mkdirSync(dirname(diagFile2), { recursive: true })
+          appendFileSync(diagFile2, `[${new Date().toISOString()}] configEditor entries: ${JSON.stringify(rows)}\n`)
+        }
+        // edit 取证壳：overridden 拒绝时复算 next/读取 raw 落盘——与合并结果对比差异键
+        if (typeof ce.edit === 'function' && (ce as unknown as { __editProbe?: boolean }).__editProbe !== true) {
+          ;(ce as unknown as { __editProbe?: boolean }).__editProbe = true
+          const origEdit = ce.edit.bind(ce)
+          ce.edit = async function (entry: Record<string, any>, change: (raw: any, inherited: any) => unknown) {
+            // 成功/失败双向取证：成功 dump 写盘的 next；失败 dump 原始异常（含栈）
+            const result = await origEdit(entry, change).catch((e: unknown) => {
+              try {
+                const f = join(activeHomeDir(), 'settings-diag.log')
+                mkdirSync(dirname(f), { recursive: true })
+                appendFileSync(f, `[${new Date().toISOString()}] edit THREW ns=${String(entry?.options?.id)}: ${e instanceof Error ? `${e.message}\n${String(e.stack).split('\n').slice(1, 4).join('\n')}` : String(e)}\n`)
+              } catch { /* 忽略 */ }
+              throw e
+            })
+            try {
+              const f = join(activeHomeDir(), 'settings-diag.log')
+              mkdirSync(dirname(f), { recursive: true })
+              appendFileSync(f, `[${new Date().toISOString()}] edit OK ns=${String(entry?.options?.id)}\n`)
+            } catch { /* 忽略 */ }
+            return result
+          }
+        }
+      } catch {
+        /* configEditor 不可达：跳过 */
+      }
+      // 宿主视角的三层配置 dump：SettingsForms.describe 的 meow-memory 视图
+      // （value=最终生效 / base=出厂+patch / user=设置页层）。describe 无副作用，
+      // 启动即采一次 + 5 秒后再采一次（等 entry 激活）。
+      try {
+        const svcAny = settingsCtx.settings as unknown as { describe?: () => unknown }
+        if (typeof svcAny.describe === 'function') {
+          const dumpDescribe = (): void => {
+            try {
+              const view = svcAny.describe()
+              const diagFile = join(activeHomeDir(), 'settings-diag.log')
+              mkdirSync(dirname(diagFile), { recursive: true })
+              const info = {
+                isArray: Array.isArray(view),
+                keys: view && typeof view === 'object' && !Array.isArray(view) ? Object.keys(view) : null,
+                length: Array.isArray(view) ? view.length : null,
+                nsList: Array.isArray(view) ? view.map((row: any) => row?.ns) : null,
+              }
+              appendFileSync(diagFile, `[${new Date().toISOString()}] describe shape: ${JSON.stringify(info)}\n`)
+              const meowRow = Array.isArray(view) ? view.find((row: any) => row?.ns === 'meow-memory') : undefined
+              if (meowRow !== undefined) {
+                appendFileSync(diagFile, `[${new Date().toISOString()}] meow view: ${JSON.stringify({
+                  revision: meowRow.revision,
+                  value: meowRow.value,
+                  base: meowRow.base,
+                  user: meowRow.user,
+                })}\n`)
+                // volatile 表单认可的字段集=写入白名单的根；homeDir 在不在一看便知
+                const schemaObj = meowRow.schema as Record<string, unknown> | undefined
+                const schemaKeys = schemaObj && typeof schemaObj === 'object' ? Object.keys(schemaObj) : null
+                appendFileSync(diagFile, `[${new Date().toISOString()}] meow schema: ${JSON.stringify({
+                  schemaKeys,
+                  homeDirDeclared: schemaKeys !== null && schemaKeys.includes('homeDir'),
+                  schemaFull: JSON.stringify(schemaObj).slice(0, 3000),
+                })}\n`)
+              }
+            } catch (e) {
+              try {
+                appendFileSync(join(activeHomeDir(), 'settings-diag.log'), `describe dump err: ${String(e)}\n`)
+              } catch {
+                /* 忽略 */
+              }
+            }
+          }
+          dumpDescribe()
+          setTimeout(dumpDescribe, 5000)
+        }
+      } catch {
+        /* dump 失败忽略 */
+      }
+      // ── 0.1.7 宿主盲区补丁（2026-09-25 radio 冻结案）────────────────────────
+      // 0.1.7 的 SettingsForms（无 installSection/register）有三处盲区：
+      // ① write 只落盘+发 document-updated，**从不重载 entry**——describe 的 value
+      //    恒为 entry 启动时的解析值（entry.fiber.config），user 层（override）却是
+      //    新鲜的。设置页 radio（只认已保存镜像值）因此永远停在旧位置；bool/num/str
+      //    靠「保存后保留 draft」掩盖了同一冻结（实车 value=user=plugin-root vs
+      //    user=default 分裂实证）。→ describe 壳：meow 行现场重算 value=base⊕user。
+      // ② installSection 缺席 → base 没有 homeDirPresets，radio 旁看不到实际路径。
+      //    → describe 壳顺手注入（只进 base 不进 value：client 只从 base 读预设，
+      //    value 要过 configForms 的 schema decode，未知键有 decode 失败风险）。
+      // ③ scope.watch 缺席 → onChange 热切换不触发，改 homeDir 只落库不切换。
+      //    → write 壳：meow-memory 写入成功后补跑 hotSwitchHomeDir（与 0.1.6
+      //    onChange 同语义；get 走 describe 壳的现场合并值，天然含最新 user 层）。
+      // 0.1.6（installSection 在）三条原生链路全在，一概不装。壳只动 meow 行、
+      // 其他命名空间原样透传；revision/raw 指纹不碰（edit 的写入围栏还要读它）。
+      // 壳装配失败退回现状（value 冻结但不崩）。
+      if (typeof settingsCtx.settings.installSection !== 'function') {
+        try {
+          const svcAny = settingsCtx.settings as unknown as Record<string, unknown>
+          const proto = Object.getPrototypeOf(svcAny) as Record<string, unknown>
+          if (proto !== null && typeof proto.describe === 'function' && proto.__meowValueRefresh !== true) {
+            proto.__meowValueRefresh = true
+            const rawDescribe = (proto.describe as (...args: unknown[]) => unknown).bind(svcAny)
+            proto.describe = (...args: unknown[]): unknown => {
+              const rows = rawDescribe(...args) as Array<Record<string, unknown>>
+              try {
+                if (Array.isArray(rows)) {
+                  const row = rows.find((r) => r?.ns === SETTINGS_NS) as
+                    | { base?: Record<string, unknown>; user?: Record<string, unknown>; value?: unknown }
+                    | undefined
+                  if (row !== undefined && row.base !== undefined && row.base !== null && typeof row.base === 'object') {
+                    // 幂等：行对象跨多次 describe 复用，必须先剥掉上次注入的 presets
+                    // 再合成，否则第二轮 value 就带上了未知键（decode 失败风险）。
+                    const cleanBase = { ...row.base }
+                    delete cleanBase.homeDirPresets
+                    row.base = { ...cleanBase, homeDirPresets: homeDirPresets() }
+                    row.value = mergeConfigLayer(cleanBase, row.user as Record<string, unknown> | undefined)
+                  }
+                }
+              } catch {
+                /* 修正失败退回宿主原值（冻结但不崩） */
+              }
+              return rows
+            }
+            // 0.1.7 的设置源 = describe 壳的现场合并值（base⊕user，含最新 user 层）：
+            // resolveConfig 等待与热切换都从这读，等价 0.1.6 的 scope.get()。
+            settingsGet = (): unknown => {
+              const rows = (svcAny.describe as (...args: unknown[]) => unknown)() as Array<Record<string, unknown>>
+              const row = Array.isArray(rows) ? rows.find((r) => r?.ns === SETTINGS_NS) : undefined
+              return row?.value
+            }
+            markSourceReady?.()
+          }
+          if (proto !== null && typeof proto.write === 'function' && proto.__meowWriteHook !== true) {
+            proto.__meowWriteHook = true
+            const rawWriteHooked = (proto.write as (...args: unknown[]) => unknown).bind(svcAny)
+            proto.write = (...args: unknown[]): unknown => {
+              const result = rawWriteHooked(...args)
+              if (result instanceof Promise) {
+                return result.then((v: unknown) => {
+                  if (String(args[0]) === SETTINGS_NS) {
+                    ctx.logger.info('meow-memory: 配置已通过设置页更新（重载/重启插件后生效）')
+                    hotSwitchHomeDir(ctx, config, settingsGet)
+                  }
+                  return v
+                })
+              }
+              return result
+            }
+          }
+        } catch {
+          /* 盲区补丁装配失败：退回现状（value 冻结），不影响插件启动 */
+        }
+      }
       installSettingsSectionCompat(settingsCtx, ctx, SETTINGS_NS, z.dict(z.any()), settingsBase, {
         validate: (value: unknown): void => {
           validateConfigUserLayer(value)
@@ -549,6 +865,10 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         },
         onChange: (): void => {
           ctx.logger.info('meow-memory: 配置已通过设置页更新（重载/重启插件后生效）')
+          // homeDir 热切换（用户拍板 2026-09-24：保存后立即生效，无需重启）——
+          // 全局目录消费点全是轻量读写（日志追加/小 JSON/按需读覆盖层），切模块级
+          // 状态口即可，dsh 主进程不重启、插件不重载、在跑会话无感知。
+          hotSwitchHomeDir(ctx, config, settingsGet)
         },
       })
     })
@@ -558,10 +878,69 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     const msg = `meow-memory: 设置命名空间注册失败（标签页不可用，配置走 patch 层）：${e instanceof Error ? (e.stack ?? e.message) : String(e)}`
     ctx.logger.warn(msg)
     try {
-      appendFileSync(join(homedir(), '.dsh-meow', 'settings-register-error.log'), `[${new Date().toISOString()}] ${msg}\n`)
+      const regErrFile = join(activeHomeDir(), 'settings-register-error.log')
+      mkdirSync(dirname(regErrFile), { recursive: true })
+      appendFileSync(regErrFile, `[${new Date().toISOString()}] ${msg}\n`)
     } catch {
       /* 留痕失败忽略 */
     }
+  }
+  // ── 服务端设置域诊断（0.1.7 写入排障，2026-09-25）：0.1.7 宿主对拒写静默、
+  // typert 信封剥 message——从宿主 configEditor 侧直接取证：entries 的 id/归属
+  // 节点/fiber 状态/Config 挂载，落 settings-diag.log。0.1.6 无此服务 → inject
+  // 挂起不回调，天然跳过。诊断失败绝不影响插件启动。
+  try {
+    ctx.inject(['configEditor'], (ce: {
+      entries: () => Array<{ options?: { id?: unknown }; fiber?: { state?: unknown; runtime?: unknown }; parent?: { tree?: { ctx?: { fiber?: { entry?: { id?: unknown } } } } } }>
+    }) => {
+      try {
+        const rows = ce.entries().map((entry) => ({
+          id: entry.options?.id,
+          state: entry.fiber?.state,
+          parent: entry.parent?.tree?.ctx?.fiber?.entry?.id ?? null,
+          hasConfig: entry.fiber?.runtime !== undefined && 'Config' in (entry.fiber.runtime as object),
+        }))
+        const diagFile = join(activeHomeDir(), 'settings-diag.log')
+        mkdirSync(dirname(diagFile), { recursive: true })
+        appendFileSync(diagFile, `[${new Date().toISOString()}] configEditor entries: ${JSON.stringify(rows)}\n`)
+      } catch {
+        /* 诊断失败忽略 */
+      }
+    })
+  } catch {
+    /* 无 configEditor 服务（0.1.6）：跳过 */
+  }
+  // ── 宿主 write 异常落盘（同上排障）：0.1.7 的 settings 服务（SettingsForms）对
+  // write 抛错只回 code 不回 message——在同进程内给原型方法包一层取证壳，把原始
+  // 异常（含 message/栈，栈可定位 configEditor 内具体抛点）原样落盘。仅加日志不改
+  // 行为；settings 服务不存在（0.1.6 老链/未装配）时静默跳过。
+  try {
+    const settingsSvc = (ctx as unknown as { get?: (name: string) => unknown }).get?.('settings') as
+      | { write?: (...args: unknown[]) => unknown }
+      | undefined
+    const proto = settingsSvc !== undefined ? Object.getPrototypeOf(settingsSvc) as { write?: (...args: unknown[]) => unknown; __writeProbe?: boolean } : undefined
+    if (proto !== undefined && typeof proto.write === 'function' && proto.__writeProbe !== true) {
+      proto.__writeProbe = true
+      const rawWrite = proto.write.bind(settingsSvc)
+      proto.write = (...args: unknown[]) => {
+        const result = rawWrite(...args)
+        if (result instanceof Promise) {
+          return result.catch((e: unknown) => {
+            try {
+              const diagFile = join(activeHomeDir(), 'settings-diag.log')
+              mkdirSync(dirname(diagFile), { recursive: true })
+              appendFileSync(diagFile, `[${new Date().toISOString()}] write(ns=${String(args[0])}) rejected: ${e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e)}\n`)
+            } catch {
+              /* 取证失败忽略 */
+            }
+            throw e
+          })
+        }
+        return result
+      }
+    }
+  } catch {
+    /* 探针装配失败不影响启动 */
   }
   // 有界等待设置源就绪（issue #21）：真机上回调一个微任务内就跑完，不会真的等到上限；
   // 服务缺失/注册失败时最多等 SETTINGS_SOURCE_WAIT_MS 就继续，绝不挂起。
@@ -573,6 +952,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   }
   const merged = mergeConfigLayer(config, settingsGet?.() as Record<string, unknown> | undefined)
   const resolved = resolveConfig(merged)
+  // ── 全局目录解析+切换（含首迁/回迁）：必须先于 sweep/loadWindowIndex——它们吃新目录。
+  // disabled 检查之前执行：插件停用时配置变更也要生效（switchHomeDir 幂等，重复启动无害）。
+  logHomeDirSwitch(ctx, switchHomeDir(resolveHomeDir(resolved.homeDir)))
   // 诊断（issue #26）：把「设置源是否赶上」与关键解析值落到启动日志——配置不生效类
   // 报告先看这一行：sourceReady=否 即冷启动竞态（settings 服务晚于等待上限就绪）。
   ctx.logger.info(`meow-memory: config resolved (sourceReady=${settingsGet !== undefined}, enabled=${resolved.enabled}, dream.enabled=${resolved.dream?.enabled ?? 'default'}, promptLang=${resolved.promptLang ?? 'zh'}, projectDir=${resolved.projectDir ?? '.dsh-meow'})`)
@@ -585,6 +967,10 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   setPromptLang(resolved.promptLang ?? 'zh')
   applyCount++
   perf(`apply #${applyCount} pid=${process.pid}`)
+  const sweptHome = sweepHomeLogs()
+  if (sweptHome.swept.length > 0 || sweptHome.rotated) {
+    perf(`home-log sweep: ${sweptHome.swept.join(',') || '-'}${sweptHome.rotated ? ' +perf.log->old' : ''}`)
+  }
   loadWindowIndex(resolved.projectDir) // 恢复窗口索引（热重载/重启后旧窗口不失联）
 
   // v0 会话一次性迁移（issue #13）：标记未迁移时体检全部会话并把 source.memory 搬进
@@ -1252,17 +1638,17 @@ async function resolveWorkspaceForSession(ctx: Context, sessionId: string): Prom
 }
 
 // ── 模块级窗口索引（sessionId → workspace） ────────────────────────────────
-// 持久化到 homedir/.dsh-meow/window-index.json：热重载/重启会重置模块级 Map，
-// 若不恢复则旧窗口（reload 后无新事件）从 dream 检查中失联——有记忆也不 dream。
+// 持久化到全局目录（activeHomeDir()）/window-index.json：热重载/重启会重置模块级
+// Map，若不恢复则旧窗口（reload 后无新事件）从 dream 检查中失联——有记忆也不 dream。
 // 恢复后 agent 经 ctx.agents（AgentRegistry，harness 进程级）获取，不受插件 reload 影响。
 
 const windowIndex = new Map<string, string>()
-const WINDOW_INDEX_FILE = join(homedir(), '.dsh-meow', 'window-index.json')
 
 /** apply 时恢复窗口索引：①文件（上次落盘）→ workspace 集合；②每个已知 workspace
  *  的 windows 表（DB 持久化，含 reload 前全部窗口）补全——旧窗口（reload 后无新
- *  事件、文件里没有）也能恢复，不会从 dream 检查中失联。 */
-export function loadWindowIndex(dir = '.dsh-meow', indexFile = WINDOW_INDEX_FILE): void {
+ *  事件、文件里没有）也能恢复，不会从 dream 检查中失联。indexFile 缺省动态取当前
+ *  全局目录——热切换目录后重调本函数即可把新目录的账本 merge 进内存。 */
+export function loadWindowIndex(dir = '.dsh-meow', indexFile = join(activeHomeDir(), 'window-index.json')): void {
   const workspaces = new Set<string>()
   try {
     const merged = JSON.parse(readFileSync(indexFile, 'utf8')) as Record<string, unknown>
@@ -1292,16 +1678,17 @@ export function loadWindowIndex(dir = '.dsh-meow', indexFile = WINDOW_INDEX_FILE
 
 /** 窗口索引落盘（读-合并-写，低频事件驱动；失败不阻塞）。 */
 function persistWindowIndex(): void {
+  const indexFile = join(activeHomeDir(), 'window-index.json')
   try {
-    mkdirSync(dirname(WINDOW_INDEX_FILE), { recursive: true })
+    mkdirSync(dirname(indexFile), { recursive: true })
     let merged: Record<string, string> = {}
     try {
-      merged = JSON.parse(readFileSync(WINDOW_INDEX_FILE, 'utf8')) as Record<string, string>
+      merged = JSON.parse(readFileSync(indexFile, 'utf8')) as Record<string, string>
     } catch {
       /* 首次写入 */
     }
     for (const [sid, ws] of windowIndex) merged[sid] = ws
-    writeFileSync(WINDOW_INDEX_FILE, JSON.stringify(merged), 'utf8')
+    writeFileSync(indexFile, JSON.stringify(merged), 'utf8')
   } catch {
     /* 持久化失败不阻塞 */
   }
@@ -1317,4 +1704,5 @@ export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectio
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
+export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
 export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'
