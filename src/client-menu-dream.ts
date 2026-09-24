@@ -34,12 +34,16 @@ const MENU_SELECTOR = '[data-trigger-menu]'
 const ROW_ID_PREFIX = 'dsh-slash-option-command-'
 /** dream 行的短描述（对齐官方一句话的体量）。 */
 const DREAM_SHORT = '手动唤起一次记忆整理'
+/** dream 行的中文标签（对齐官方行「中文名 + 英文名」双段）。 */
+const DREAM_LABEL = '记忆整理'
 /** dream 行的长描述开头（注册全文；用来认出要换的描述 span）。 */
 const DREAM_LONG_PREFIX = '手动唤起一次记忆整理（dream）'
+/** 官方指令的英文名（用于抄别名 span 的哈希样式类）。 */
+const OFFICIAL_ALIASES = ['compact', 'model', 'export', 'permission', 'goal', 'plan', 'feedback']
 /** FA 月亮（regular 空心，与官方行图标线风格一致；路径=FA 5.15.4 svgs/regular/moon.svg），fill currentColor 随行配色。 */
 const MOON_SVG = '<svg viewBox="0 0 512 512" aria-hidden="true" focusable="false"><path fill="currentColor" d="M279.135 512c78.756 0 150.982-35.804 198.844-94.775 28.27-34.831-2.558-85.722-46.249-77.401-82.348 15.683-158.272-47.268-158.272-130.792 0-48.424 26.06-92.292 67.434-115.836 38.745-22.05 28.999-80.788-15.022-88.919A257.936 257.936 0 0 0 279.135 0c-141.36 0-256 114.575-256 256 0 141.36 114.576 256 256 256zm0-464c12.985 0 25.689 1.201 38.016 3.478-54.76 31.163-91.693 90.042-91.693 157.554 0 113.848 103.641 199.2 215.252 177.944C402.574 433.964 344.366 464 279.135 464c-114.875 0-208-93.125-208-208s93.125-208 208-208z"/></svg>'
 
-/** 找 command 源里的 dream 行：名字 span 恰为 dream 的行。 */
+/** 找 command 源里的 dream 行：有 dream 字样的 span（未装饰=名字 span；已装饰=别名 span）。 */
 function findDreamRow(menu: ParentNode): HTMLButtonElement | null {
   const rows = menu.querySelectorAll<HTMLButtonElement>(`button[id^="${ROW_ID_PREFIX}"]`)
   for (const row of rows) {
@@ -58,16 +62,43 @@ function officialIconClass(menu: ParentNode): string | null {
   return span.className
 }
 
-/** 给 dream 行上脸：名字前插月亮 span + 描述换短句。条件已满足则一尘不动。 */
-function decorateRow(row: HTMLButtonElement, iconClass: string | null): void {
+/** 官方行的别名 span 样式类（同理抄现成的：英文名恰好等于别名文字的 span）。 */
+function officialAliasClass(menu: ParentNode): string | null {
+  const spans = menu.querySelectorAll(`button[id^="${ROW_ID_PREFIX}"] > span`)
+  for (const name of OFFICIAL_ALIASES) {
+    for (const span of spans) {
+      if (span.textContent === name && span.className.length > 0) return span.className
+    }
+  }
+  return null
+}
+
+/** 给 dream 行上脸：月亮 span + 中文名 + dream 别名 + 描述换短句。条件已满足则一尘不动。 */
+function decorateRow(row: HTMLButtonElement, iconClass: string | null, aliasClass: string | null): void {
   const spans = row.querySelectorAll(':scope > span')
   let nameSpan: Element | null = null
   let descriptionSpan: Element | null = null
+  const aliasSpan = row.querySelector(':scope > span[data-meow-dream-alias]')
   for (const span of spans) {
-    if (span.textContent === 'dream') nameSpan = span
+    if (span === aliasSpan) {
+      nameSpan = aliasSpan.previousElementSibling
+      continue
+    }
+    if (span.textContent === 'dream' && nameSpan === null) nameSpan = span
     else if ((span.textContent?.length ?? 0) > 4 && span !== nameSpan) descriptionSpan = span
   }
   if (nameSpan === null) return
+  // 中文标签：官方行是「中文名 + 英文名」双段（压缩 compact），dream 原生只有英文名。
+  if (nameSpan.textContent === 'dream') nameSpan.textContent = DREAM_LABEL
+  // 别名 span：官方行的 itemAlias 位（小号英文名）。React 重渲染会冲掉，条件不满足才插。
+  if (aliasSpan === null) {
+    const alias = document.createElement('span')
+    alias.setAttribute('data-meow-dream-alias', '1')
+    if (aliasClass !== null) alias.className = aliasClass
+    else alias.style.cssText = 'opacity:.55;font-size:.9em;'
+    alias.textContent = 'dream'
+    nameSpan.parentElement?.insertBefore(alias, nameSpan.nextSibling)
+  }
   // 月亮：名字前的兄弟不是自有月亮 span 才插（插在名字 span 之前，flex gap 自动给间距）。
   const prev = nameSpan.previousElementSibling
   if (prev === null || !prev.hasAttribute('data-meow-dream-face')) {
@@ -96,7 +127,7 @@ export function startMenuDreamFace(): () => void {
       if (menu === null) return
       const row = findDreamRow(menu)
       if (row === null) return
-      decorateRow(row, officialIconClass(menu))
+      decorateRow(row, officialIconClass(menu), officialAliasClass(menu))
     } catch { /* 菜单装饰失败不影响任何功能 */ }
   }
   const schedule = (): void => {
