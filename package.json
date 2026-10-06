@@ -43,7 +43,7 @@
     "prepare": "node build.mjs",
     "build": "node build.mjs",
     "watch": "node build.mjs --watch",
-    "test": "npm run build && node test.mjs && node tests/config-volatile.mjs && node tests/client-fold.mjs && node tests/client-i18n.mjs && node tests/settings-page.mjs && node tests/client-delegate-notice.mjs && node tests/client-delegate-vanish.mjs && node tests/client-dream-icon.mjs && node tests/client-dream-skip.mjs",
+    "test": "npm run build && node scripts/check-lang.mjs && node test.mjs && node tests/config-volatile.mjs && node tests/client-fold.mjs && node tests/client-i18n.mjs && node tests/settings-page.mjs && node tests/client-delegate-notice.mjs && node tests/client-delegate-vanish.mjs && node tests/client-dream-icon.mjs && node tests/client-dream-skip.mjs",
     "check-lang": "node scripts/check-lang.mjs",
     "link-workspace": "powershell -ExecutionPolicy Bypass -File scripts/link-workspace.ps1"
   },
