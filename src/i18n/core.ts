@@ -92,6 +92,57 @@ const registeredLocales = new Set<string>()
 const registeredDicts = new Set<string>()
 const listeners = new Set<(locale: UiLocale) => void>()
 
+// ── locale 服务晚到重试（issue #32/#33）──────────────────────────────────────
+// 冷启动时序：client apply 可能跑在宿主 locale 服务之前——installI18n 首次探测拿不到
+// 服务，走一次性回退（browserLocale 定格）且原实现永不纠正 → 冷启动后 UI 整会话卡
+// 英文（#32 桌面端实测，#33 重复报告）。
+// 修复区分两种「没服务」（红线不动：locale 绝不进 inject——写进去会让插件在无 locale
+// 的老宿主/受限动态包上整体挂起，v0.28.0 设计决策）：
+//  - ctx 本身没有 get 能力（老宿主/受限动态包）→ 永久回退，不重试；
+//  - ctx.get 存在但 locale 服务未注册（纯时序）→ 有界轮询重入 installI18n（幂等：
+//   registeredLocales/registeredDicts 去重），就绪即注册 + notify（DOM 重放层挂在
+//   onUiLocaleChange 上，文案随之刷新）。默认 1s × 30 次封顶自清——定时器有界自灭，
+//   不挂 dispose；tick 内 try/catch 兜宿主上下文失效（页面卸载/fiber dispose）。
+let localeRetryMs = 1_000
+let localeRetryMax = 30
+let localeRetryTimer: ReturnType<typeof setTimeout> | undefined
+let localeRetryAttempts = 0
+
+/** locale 服务探测：get 能力存在且服务形状齐备才算数（与 installI18n 主探测同口径）。 */
+function probeLocaleService(ctx: LocaleHostContext): LocaleServiceLike | null {
+  const svc = typeof ctx?.get === 'function' ? (ctx.get('locale') as LocaleServiceLike | null | undefined) : null
+  if (svc === null || svc === undefined || typeof svc.getLocale !== 'function' || typeof svc.register !== 'function') return null
+  return svc
+}
+
+function stopLocaleRetry(): void {
+  if (localeRetryTimer !== undefined) clearTimeout(localeRetryTimer)
+  localeRetryTimer = undefined
+  localeRetryAttempts = 0
+}
+
+function armLocaleRetry(ctx: LocaleHostContext, warn: (message: string) => void): void {
+  if (localeRetryTimer !== undefined) return // 已在轮询（重复 install 不叠加定时器）
+  localeRetryAttempts = 0
+  const tick = (): void => {
+    localeRetryTimer = undefined
+    localeRetryAttempts++
+    let svc: LocaleServiceLike | null = null
+    try {
+      svc = probeLocaleService(ctx)
+    } catch {
+      svc = null // 宿主上下文已失效（页面卸载/fiber dispose）：放弃轮询
+    }
+    if (svc !== null) {
+      installI18n(ctx, warn) // 重入走服务路径（幂等）：注册 + subscribe + notify（重放随动）
+      return
+    }
+    if (localeRetryAttempts >= localeRetryMax) return // 封顶放弃：服务始终缺席
+    localeRetryTimer = setTimeout(tick, localeRetryMs)
+  }
+  localeRetryTimer = setTimeout(tick, localeRetryMs)
+}
+
 /** 语言标签归一：pt_BR / pt-BR / PT-br → pt-br；只取主标签的比较用 primary()。 */
 function normalize(tag: string): string {
   return tag.trim().toLowerCase().replace(/_/g, '-')
@@ -165,8 +216,13 @@ export function installI18n(ctx: LocaleHostContext, warn: (message: string) => v
     service = null
     active = browserLocale() ?? DEFAULT_LOCALE
     notify()
+    // issue #32：两种「没服务」分流——ctx 有 get 能力（服务只是晚到，冷启动竞态）
+    // → 有界轮询重入；ctx 连 get 都没有（v0.28.0 决策的永久回退场景）→ 不重试。
+    if (typeof ctx?.get === 'function') armLocaleRetry(ctx, warn)
+    else stopLocaleRetry()
     return []
   }
+  stopLocaleRetry()
   service = svc
   const done: string[] = []
   // ①语言目录：追加语言必须声明 fallback（链最终落在 en，DSH 的硬约束）。
@@ -265,6 +321,15 @@ export function onUiLocaleChange(fn: (locale: UiLocale) => void): () => void {
 export function setUiLocaleForTest(locale: UiLocale): void {
   active = locale
   notify()
+}
+
+/**
+ * 测试专用：调整 locale 晚到重试的节奏与上限（生产 1s × 30；intervalMs 传小值可
+ * 在测试里毫秒级跑完整个轮询生命周期）。
+ */
+export function setLocaleRetryForTest(intervalMs: number, maxAttempts: number): void {
+  localeRetryMs = intervalMs
+  localeRetryMax = maxAttempts
 }
 
 /**
