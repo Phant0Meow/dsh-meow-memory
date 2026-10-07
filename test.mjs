@@ -48,6 +48,7 @@ import {
   abortDream,
   recoverInterruptedDream,
   handleMemoryTurnFailure,
+  dreamSweepTick,
   dreamCommandDefinition,
   findSimilar,
   markInjected,
@@ -59,6 +60,8 @@ import {
   readWritten,
   getCurrentProject,
   setCurrentProject,
+  liveConfigReader,
+  applyLiveConfig,
   hourInTimeZone,
   minutesInTimeZone,
   isDreamSuppressed,
@@ -346,6 +349,61 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   check('resume: dream started with route', dbS2.getDreamLease(widS2) !== null)
   dbS2.close()
   rmSync(wsS2, { recursive: true, force: true })
+}
+
+// ── issue #26：活配置——热字段 getter 化 + 引用相等缓存 + 检查 tick 活读 ──
+{
+  // liveConfigReader：thunk 语义回归（源函数引用恒定、返回值换新对象时 live 值必须
+  // 跟着变——#26 报告人 v1 踩坑：把函数本体当源，引用恒定 → 缓存永不失效）+
+  // 同源引用缓存（identity 稳定）+ 缺源回落出厂默认。
+  const box = { current: undefined }
+  const read = liveConfigReader({ enabled: true }, () => box.current, 0)
+  const r1 = read()
+  check('liveConfig: missing source → factory defaults', r1.hitTopK === 2 && r1.dream.enabled === true)
+  check('liveConfig: same source → cached identity', read() === r1)
+  box.current = { hitTopK: 5 }
+  const r2 = read()
+  check('liveConfig: new source object → re-resolved', r2 !== r1 && r2.hitTopK === 5)
+  check('liveConfig: stable ref again → cached', read() === r2)
+
+  // applyLiveConfig：resolved 热字段 getter 化——快照对象上的读取穿透到最新源；
+  // dream 视图引用稳定、属性活；注册期字段（projectDir）保持冻结。
+  // 接线对齐生产（applyLiveConfig(resolveConfig(merged), reader)）：传入对象必须是
+  // 独立于读取器缓存的快照（structuredClone），误传缓存对象会触发 defineLive 的
+  // 防御回退（见 index.ts 注释）。
+  const resolvedLive = applyLiveConfig(structuredClone(read()), read)
+  check('applyLiveConfig: hot key reads live', resolvedLive.hitTopK === 5)
+  box.current = { hitTopK: 7, dream: { enabled: false } }
+  check('applyLiveConfig: hot key follows source change', resolvedLive.hitTopK === 7)
+  const dreamView1 = resolvedLive.dream
+  check('applyLiveConfig: dream view reads live', resolvedLive.dream.enabled === false)
+  box.current = { dream: { enabled: true, checkMinutes: 9 } }
+  check('applyLiveConfig: dream view live after change', resolvedLive.dream.enabled === true && resolvedLive.dream.checkMinutes === 9)
+  check('applyLiveConfig: dream view reference stable', resolvedLive.dream === dreamView1)
+  box.current = { projectDir: '.other' }
+  check('applyLiveConfig: registration-time fields stay frozen', resolvedLive.projectDir === '.dsh-meow')
+
+  // dreamSweepTick：enabled=false / 抑制时段在任何 DB 操作（含 60s 检查门的 SQLite
+  // 往返）之前短路——用检查门 last_check 是否被写做可观测判定（去 #26 报告人指出的
+  // 观测盲点）；getter 抛错不炸 sweep 链。
+  const wsT = mkdtempSync(join(tmpdir(), 'mm-tick-'))
+  const dbT = getDb(wsT, '.dsh-meow')
+  const gateValue = () => dbT.db.prepare(`SELECT value FROM dream_meta WHERE key = 'last_check'`).get()?.value
+  const cfgOf = (over) => ({ enabled: true, idleMinutes: 180, suppressWindows: [], suppressLeadMinutes: 15, checkMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2, ...over })
+  const winIndexT = new Map([['win-tick', wsT]])
+  dreamSweepTick({}, cfgOf({}), '.dsh-meow', winIndexT)
+  const v1 = gateValue()
+  check('tick: enabled → check gate claimed', typeof v1 === 'number' && v1 > 0)
+  dreamSweepTick({}, cfgOf({ enabled: false }), '.dsh-meow', winIndexT)
+  check('tick: disabled short-circuits before gate', gateValue() === v1)
+  dreamSweepTick({}, cfgOf({ suppressWindows: [{ start: '00:00', end: '23:59' }] }), '.dsh-meow', winIndexT)
+  check('tick: suppressed short-circuits before gate', gateValue() === v1)
+  dreamSweepTick({}, cfgOf({}), '.dsh-meow', winIndexT)
+  check('tick: gate blocks re-entry within 60s', gateValue() === v1)
+  dreamSweepTick({}, () => { throw new Error('cfg getter boom') }, '.dsh-meow', winIndexT)
+  check('tick: throwing getter survives', gateValue() === v1)
+  dbT.close()
+  rmSync(wsT, { recursive: true, force: true })
 }
 
 // 递归 dream 修复（2026-09-05 猫猫拍板）：delegate fork 的子代理会话会进 windows 表，

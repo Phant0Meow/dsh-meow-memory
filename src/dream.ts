@@ -473,7 +473,7 @@ export function abortDream(agent: unknown, dir = '.dsh-meow', onDreamState?: Dre
 
 // ── 工具：memory_dream（手动触发本窗口 dream） ─────────────────────────────
 
-export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS): ToolDefinition {
+export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number | (() => number) = DEFAULT_RULES_REVIEW_DAYS): ToolDefinition {
   return {
     name: 'memory_dream',
     description: keyedValue('tools', 'memory_dream.description'),
@@ -508,7 +508,10 @@ export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamS
         // windows 表不留 dream 痕迹。/dream 命令同款守卫见 dreamCommandDefinition。
         return { ok: false, note: '当前是子代理会话，没有独立的记忆窗口；记忆整理归父窗口负责，无需（也不能）在此触发 dream。' }
       }
-      const ok = startWindowDream(ctx, exec.agent, workspace, dir, onDreamState, rulesReviewDays)
+      // rulesReviewDays 双模式（issue #26 活配置）：数字（兼容旧调用/测试）或 getter
+      //（注册期传入活读取 thunk，每次手动触发现读现用）。
+      const rrd = typeof rulesReviewDays === 'function' ? rulesReviewDays() : rulesReviewDays
+      const ok = startWindowDream(ctx, exec.agent, workspace, dir, onDreamState, rrd)
       if (ok) return { ok, note: '整理任务已在后台启动，会话流中的任务气泡会显示进度与完成状态。' }
       const sessionId = exec.agent.session?.header?.id
       const lease = typeof sessionId === 'string' ? getDb(workspace, dir).getDreamLease(sessionId) : null
@@ -549,7 +552,7 @@ export interface DreamCommandDefinition {
  * command-error 明确提示未启动原因，不会把 /dream 发给模型）。
  * 注册由 index.ts 负责（ctx.get('commands') 可选服务 + 就绪重试 + ctx.effect 清理）。
  */
-export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS): DreamCommandDefinition {
+export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number | (() => number) = DEFAULT_RULES_REVIEW_DAYS): DreamCommandDefinition {
   return {
     name: 'dream',
     description: '手动唤起一次记忆整理（dream）：逐轮回顾本窗口建立/提取过的跨会话记忆并封存。与 memory_dream 工具相同，手动触发不受峰时抑制。',
@@ -567,7 +570,9 @@ export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamS
       if (typeof header?.id !== 'string' || header.id.length === 0) {
         return { kind: 'error', text: '/dream 无法确定当前窗口的会话 id。' }
       }
-      const ok = startWindowDream(ctx, agent, workspace, dir, onDreamState, rulesReviewDays)
+      // rulesReviewDays 双模式（issue #26 活配置）：每次手动触发现读现用。
+      const rrd = typeof rulesReviewDays === 'function' ? rulesReviewDays() : rulesReviewDays
+      const ok = startWindowDream(ctx, agent, workspace, dir, onDreamState, rrd)
       if (ok) return { kind: 'success', text: '🧠 dream 已触发：整理任务已在后台运行，会话流中的任务气泡会显示进度与完成状态。' }
       const lease = getDb(workspace, dir).getDreamLease(header.id)
       return lease !== null
@@ -980,37 +985,77 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
   }
 }
 
-/** 后台定时检查（全局 setInterval + dispose 清理；cordis 无内置定时器）。
+/** dream 检查单 tick（scheduleDream 的定时体；导出供测试直调）。
+ *  cfg 支持对象或 getter（活配置，issue #26）：getter 每 tick 现读，enabled=false
+ *  时在任何 DB 操作（含 60s 检查门的 SQLite 往返）之前短路。
+ *  定时器里的未捕获异常会终止整个 dsh 进程（插件不得杀宿主，2026-09-10 实测
+ *  过一次：0.1.5 的 steer 抛错把进程带崩）。整体兜一层：单次检查失败只记日志，
+ *  下个周期照常重试。各窗口/各步骤自身仍各自降级，这里只作最后一道保险。 */
+export function dreamSweepTick(ctx: Context, cfg: DreamConfig | (() => DreamConfig | undefined), dir: string, windowIndex: Map<string, string>, onDreamState?: DreamStateCallback): void {
+  try {
+    const c = typeof cfg === 'function' ? cfg() : cfg
+    if (c === undefined || !c.enabled) return
+    // 峰时抑制（用户拍板 2026-08-19）：北京时间 09:00–12:00 / 14:00–18:00
+    // （API 峰谷电价峰时）及各自开始前 15 分钟不触发；峰时结束后本周期直接
+    // return，等下一个检查周期自然触发。进行中的 dream 不打断。
+    if (isDreamSuppressed(c)) return
+    // 全局检查门（防多实例/多定时器叠加）：60 秒内只有一个实例真正执行检查。
+    // 根因：热重载/多 fiber 并存时 dispose 未必清理旧 setInterval → 检查频率
+    // 远高于 checkMinutes → 同一窗口被反复 start。用共享库的原子抢占做节流，
+    // 与 claimDream（start 幂等）+ recoverInterruptedDream（中断自愈）闭环。
+    // 工作区按字典序取首个：windowIndex 是插入序 Map，两实例插入序不同时会各自
+    // 抢不同库的门 → 门失效（2026-09-10 复核）；排序后只要有公共工作区，必然
+    // 选中同一块库的同一条门记录。零交集的多实例本来无共享状态，无需共门。
+    const gateWorkspaces = [...new Set(windowIndex.values())].sort()
+    if (gateWorkspaces.length === 0 || !getDb(gateWorkspaces[0], dir).claimCheckGate(60_000)) return
+    dreamSweepOnce(ctx, c, dir, windowIndex, onDreamState)
+  } catch (error: unknown) {
+    console.warn(`[meow-memory] dream sweep failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+/** 后台定时检查（自调度 setTimeout + dispose 清理；cordis 无内置定时器）。
  *  判定纯时间化（用户拍板）：窗口最后发言在 24h 内 且 最后动作不是 dream
  *  （last_dream_time < last_event_time）；不依赖 live agent 存在性。
  *  已归档的会话（workspaceRegistry.archivedSessionIds）视为不存在，不 dream（用户拍板）。
- *  执行时尝试取 agent（liveAgents 或 ctx.agents.get），进程重启后取不到 → 跳过（旧窗口精神）。 */
-export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow', windowIndex: Map<string, string>, onDreamState?: DreamStateCallback): () => void {
-  const timer = setInterval(() => {
-    // 定时器里的未捕获异常会终止整个 dsh 进程（插件不得杀宿主，2026-09-10 实测
-    // 过一次：0.1.5 的 steer 抛错把进程带崩）。整体兜一层：单次检查失败只记日志，
-    // 下个周期照常重试。各窗口/各步骤自身仍各自降级，这里只作最后一道保险。
+ *  执行时尝试取 agent（liveAgents 或 ctx.agents.get），进程重启后取不到 → 跳过（旧窗口精神）。
+ *  自调度（issue #26）：checkMinutes 是活值——每 tick 现读现排下一轮（setInterval 的
+ *  周期在启动时定型，改配置永远不生效）；cfg 支持对象（兼容旧调用/测试）或 getter
+ *  （活配置）。enabled 状态转换打一行日志（静默跳过与没跑在日志里同形，去观测盲点）。 */
+export function scheduleDream(ctx: Context, cfg: DreamConfig | (() => DreamConfig | undefined), dir = '.dsh-meow', windowIndex: Map<string, string>, onDreamState?: DreamStateCallback): () => void {
+  const read = typeof cfg === 'function' ? cfg : (): DreamConfig => cfg
+  const checkMinutesOf = (c: DreamConfig | undefined): number =>
+    typeof c?.checkMinutes === 'number' && Number.isFinite(c.checkMinutes) && c.checkMinutes >= 1 ? c.checkMinutes : 15
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let stopped = false
+  let lastEnabled: boolean | undefined
+  const arm = (minutes: number): void => {
+    if (!stopped) timer = setTimeout(tick, minutes * 60_000)
+  }
+  const tick = (): void => {
+    let c: DreamConfig | undefined
     try {
-      if (!cfg.enabled) return
-      // 峰时抑制（用户拍板 2026-08-19）：北京时间 09:00–12:00 / 14:00–18:00
-      // （API 峰谷电价峰时）及各自开始前 15 分钟不触发；峰时结束后本周期直接
-      // return，等下一个检查周期自然触发。进行中的 dream 不打断。
-      if (isDreamSuppressed(cfg)) return
-      // 全局检查门（防多实例/多定时器叠加）：60 秒内只有一个实例真正执行检查。
-      // 根因：热重载/多 fiber 并存时 dispose 未必清理旧 setInterval → 检查频率
-      // 远高于 checkMinutes → 同一窗口被反复 start。用共享库的原子抢占做节流，
-      // 与 claimDream（start 幂等）+ recoverInterruptedDream（中断自愈）闭环。
-      // 工作区按字典序取首个：windowIndex 是插入序 Map，两实例插入序不同时会各自
-      // 抢不同库的门 → 门失效（2026-09-10 复核）；排序后只要有公共工作区，必然
-      // 选中同一块库的同一条门记录。零交集的多实例本来无共享状态，无需共门。
-      const gateWorkspaces = [...new Set(windowIndex.values())].sort()
-      if (gateWorkspaces.length === 0 || !getDb(gateWorkspaces[0], dir).claimCheckGate(60_000)) return
-      dreamSweepOnce(ctx, cfg, dir, windowIndex, onDreamState)
-    } catch (error: unknown) {
-      console.warn(`[meow-memory] dream sweep failed: ${error instanceof Error ? error.message : String(error)}`)
+      c = read()
+      if (c !== undefined && c.enabled !== lastEnabled) {
+        lastEnabled = c.enabled
+        ctx.logger.info(`meow-memory: dream 调度器${c.enabled ? '启用' : '停用'}（配置热生效，issue #26）`)
+      }
+      dreamSweepTick(ctx, c, dir, windowIndex, onDreamState)
+    } finally {
+      arm(checkMinutesOf(c)) // read 抛错时 c=undefined → 按 15min 兜底重排，循环不断
     }
-  }, cfg.checkMinutes * 60_000)
-  return () => clearInterval(timer)
+  }
+  let initial: DreamConfig | undefined
+  try {
+    initial = read()
+  } catch {
+    /* 首读失败：按默认周期起跑，tick 内再试 */
+  }
+  arm(checkMinutesOf(initial))
+  return (): void => {
+    stopped = true
+    if (timer !== undefined) clearTimeout(timer)
+  }
 }
 
 /** 会话活跃度跟踪（模块级，单进程足够）。 */
