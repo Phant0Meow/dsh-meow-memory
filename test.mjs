@@ -60,6 +60,7 @@ import {
   readWritten,
   getCurrentProject,
   setCurrentProject,
+  backupMemoryDb,
   liveConfigReader,
   applyLiveConfig,
   hourInTimeZone,
@@ -235,6 +236,33 @@ check('touchDreamLease false for unknown window', dbW.touchDreamLease('win-never
 check('check gate passes first', dbW.claimCheckGate(0) === true)
 check('check gate blocks within interval', dbW.claimCheckGate(86_400_000) === false)
 check('check gate passes after interval', dbW.claimCheckGate(0) === true)
+
+// ── 记忆库备份（issue #37 增量②）：VACUUM INTO 快照轮转 + mtime 增量判定 ──
+{
+  const wsBk = mkdtempSync(join(tmpdir(), 'mm-backup-'))
+  const dbBk = new MemoryDb(memoryDbPath(wsBk))
+  check('backup: fresh db without data', backupMemoryDb(wsBk) === true)
+  const fsBak = await import('node:fs')
+  check('backup: .bak exists after first run', fsBak.existsSync(memoryDbPath(wsBk) + '.bak'))
+  // 快照内容可开且含 schema：直接用 node:sqlite 打开 .bak 查 soul 表
+  const { DatabaseSync } = await import('node:sqlite')
+  const probe = new DatabaseSync(memoryDbPath(wsBk) + '.bak')
+  check('backup: snapshot has schema', probe.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='soul'`).get() !== undefined)
+  probe.close()
+  // 无新写入：mtime 不变 → 第二次跳过（mtime 粒度可能同毫秒，人为 sleep 5ms 保险）
+  await new Promise((r) => setTimeout(r, 5))
+  check('backup: unchanged db skipped (mtime)', backupMemoryDb(wsBk) === false)
+  // 新写入后再备份成功，且新数据在快照里
+  dbBk.insert({ level: 'fact', content: '备份前写入的记忆' })
+  await new Promise((r) => setTimeout(r, 5))
+  check('backup: after write runs again', backupMemoryDb(wsBk) === true)
+  const probe2 = new DatabaseSync(memoryDbPath(wsBk) + '.bak')
+  check('backup: snapshot contains new row', probe2.prepare('SELECT COUNT(*) AS n FROM fact').get().n === 1)
+  probe2.close()
+  dbBk.close()
+  closeAllDbs()
+  rmSync(wsBk, { recursive: true, force: true })
+}
 
 // v0.23.1：进程重启后 agent-missing 窗口从 persistence 恢复 agent → dream 自动触发（不需要人碰窗口）
 {

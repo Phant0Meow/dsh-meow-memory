@@ -26,7 +26,7 @@ import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { closeAllDbs, getDb, memoryDbPath } from './db.js'
+import { backupMemoryDb, closeAllDbs, getDb, memoryDbPath } from './db.js'
 import { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
 import { CONFIG_DEFAULTS } from './defaults.js'
 import { activeHomeDir, homeDirPresets, resolveHomeDir, switchHomeDir } from './home-dir.js'
@@ -57,6 +57,8 @@ import { resolveSlotText, setPromptLang } from './prompt-loader.js'
 
 /** 首次欢迎引导的 seen 记账 id（accessed 通道，非真实记忆 id；releaseSeen 不清除）。 */
 const WELCOME_GUIDE_SEEN_ID = '__welcomeGuide__'
+/** 首建提示的 accessed 哨兵（issue #37 增量①；per-session 至多一次）。 */
+const FIRST_CREATE_NOTICE_SEEN_ID = '__firstCreateNotice__'
 import { collectDreamStates, headerOf, DreamStateBroadcast, type PersistedSessionLike } from './dream-signal.js'
 
 export const name = 'meow-memory'
@@ -250,6 +252,13 @@ const config = z.object({
       rulesReviewDays: z.number().min(0).default(DEFAULT_RULES_REVIEW_DAYS),
     })
     .default({}),
+  /** 记忆库自动备份（#37，默认关）：每次 dream 收尾把 memory.db 快照轮转到
+   *  memory.db.bak（VACUUM INTO 一致性备份，mtime 判增量）。注册期消费，改动需重载。 */
+  backup: z
+    .object({
+      enabled: z.boolean().default(false),
+    })
+    .default({}),
   /** 整理任务的模型（可选换模型）。反思/梦境永远在主窗口执行（steer）——配置了
    *  model 时仅在这两类轮的请求上经 agent/request waterfall 覆盖 provider/model，
    *  轮次结束自动换回主模型；不再提供"独立执行"开关（v0.24 移除）。 */
@@ -343,6 +352,11 @@ export function validateConfigUserLayer(value: unknown): void {
     // user 层里残留的这两个键只忽略不报错（手编配置宽容，读取方不再消费）。
     if (ddg.model !== undefined && typeof ddg.model !== 'string') throw new Error('delegate.model 必须是字符串')
   }
+  if (v.backup !== undefined) {
+    if (v.backup === null || typeof v.backup !== 'object' || Array.isArray(v.backup)) throw new Error('backup 必须是对象')
+    const bkv = v.backup as Record<string, unknown>
+    if (bkv.enabled !== undefined && typeof bkv.enabled !== 'boolean') throw new Error('backup.enabled 必须是布尔值')
+  }
 }
 
 /**
@@ -382,12 +396,15 @@ interface ResolvedConfig {
   promptLang: string | undefined
   dream: DreamConfig
   delegate: { modelSpec: AgentOptionsSpec | undefined }
+  /** 记忆库自动备份（#37）：注册期消费（dream 收尾信号侧）。 */
+  backup: { enabled: boolean }
 }
 
 function resolveConfig(config: unknown): ResolvedConfig {
   const c = (config ?? {}) as Partial<ResolvedConfig>
   const d = (c.dream ?? {}) as Partial<DreamConfig>
   const dg = (c.delegate ?? {}) as { reflect?: boolean; model?: string }
+  const bk = (c.backup ?? {}) as { enabled?: boolean }
   return {
     enabled: c.enabled ?? true,
     projectDir: c.projectDir ?? '.dsh-meow',
@@ -412,6 +429,9 @@ function resolveConfig(config: unknown): ResolvedConfig {
       // waterfall 在插件轮请求上覆盖模型（轮次结束自动换回主模型）。
       return { modelSpec: parseModelSpec(dg.model) }
     })(),
+    backup: {
+      enabled: bk.enabled ?? false,
+    },
   }
 }
 
@@ -1094,7 +1114,19 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 会话列表"已 dream"小月牙信号（用户拍板 2026-08-19）：dream 开始推 dreaming、
   // 完成推 dreamed、有新活动推 active。
   const broadcast = new DreamStateBroadcast(ctx.logger)
-  const signalDreamState = (sessionId: string, state: 'dreaming' | 'dreamed' | 'active'): void => broadcast.broadcast(sessionId, state)
+  // dream 收尾钩子（#37 增量②）：开启备份时把 memory.db 快照轮转到 .bak（mtime 判
+  // 增量幂等；VACUUM INTO 失败静默——备份是兜底措施，绝不影响主流程）。
+  const signalDreamState = (sessionId: string, state: 'dreaming' | 'dreamed' | 'active'): void => {
+    broadcast.broadcast(sessionId, state)
+    if (state === 'dreamed' && resolved.backup.enabled) {
+      const wsB = windowIndex.get(sessionId)
+      if (wsB !== undefined) {
+        try {
+          if (backupMemoryDb(wsB, resolved.projectDir)) ctx.logger.info(`meow-memory: memory.db 已备份（dream 收尾触发，${shortSessionId(sessionId)}）`)
+        } catch { /* 备份失败不影响主流程 */ }
+      }
+    }
+  }
   const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays))
   if (typeof disposeDreamTool === 'function') toolDisposers.push(disposeDreamTool)
   ctx.logger.info('meow-memory: memory_remember/search/read/update + memory_dream registered')
@@ -1350,6 +1382,21 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
             return { ...decision, messages: rewritten }
           }
         }
+        // 首建提示（issue #37 增量①）：记忆库还是空的（≈刚创建）时，随首轮注入一条
+        // 独立通知——库在工作区隐藏目录、误删不 recover，memory_home 可迁出、backup
+        // 可兜底。记账 = accessed 痕迹（per-session 至多一次；库有记忆后 isFresh=false
+        // 永久短路）。fail-open：任何失败只跳过提示。
+        try {
+          if (getDb(ws, resolved.projectDir).isFresh() && !readSeen(ws, sid, resolved.projectDir).has(FIRST_CREATE_NOTICE_SEEN_ID)) {
+            const firstUser2 = userMsgs[0]
+            markAccessed(ws, sid, [FIRST_CREATE_NOTICE_SEEN_ID], resolved.projectDir)
+            const notice = resolveSlotText('first-create-notice', { dbPath: join(ws, resolved.projectDir, 'memory.db'), homePath: homedir() })
+            const rewritten = [...decision.messages]
+            rewritten.splice(rewritten.indexOf(firstUser2), 0, createMemoryNoticeMessage(notice))
+            ctx.logger.info('meow-memory: first-create notice injected (fresh memory.db)')
+            return { ...decision, messages: rewritten }
+          }
+        } catch { /* 提示失败不阻塞注入链 */ }
         return decision // 首条消息：不跑命中链路（首轮只注入长期记忆）
       }
       // 恢复的会话（日志已有历史消息）：首轮快照由上个进程注入过，只走命中链路。
@@ -1821,7 +1868,7 @@ function persistWindowIndex(): void {
 export { PLUGIN_SOURCE, REFLECT_MARKER }
 export { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } from './delegate.js'
 export { collectDreamStates, headerOf, type PersistedSessionLike } from './dream-signal.js'
-export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
+export { MemoryDb, memoryDbPath, getDb, closeAllDbs, backupMemoryDb, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markWritten, readWritten, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, MAX_REINJECT_WRITTEN, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'

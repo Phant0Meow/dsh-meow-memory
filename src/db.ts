@@ -14,7 +14,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, renameSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fillTemplate, getPromptLang, keyedValue } from './prompt-loader.js'
@@ -291,6 +291,12 @@ export class MemoryDb {
   isFresh(): boolean {
     const row = this.db.prepare('SELECT COUNT(*) AS n FROM soul').get() as { n: number }
     return row.n === 0
+  }
+
+  /** VACUUM INTO 一致性快照到目标路径（#37 可选备份；目标已存在会抛，调用方先轮转）。
+   *  WAL 下安全：快照含 WAL 内容，读连接一致性由 SQLite 保证。 */
+  vacuumInto(target: string): void {
+    this.db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`)
   }
 
   insert(row: { level: Level; content: string } & Partial<MemoryRow>): MemoryRow {
@@ -733,6 +739,28 @@ export function getDb(workspace: string, dir = '.dsh-meow'): MemoryDb {
 export function closeAllDbs(): void {
   for (const db of dbCache.values()) db.close()
   dbCache.clear()
+}
+
+/** 记忆库备份（issue #37 增量②）：memory.db → memory.db.bak 单文件轮转。
+ *  mtime 判增量（bak 不旧于数据即跳过）——WAL 模式下写入落在 -wal 文件、主库
+ *  mtime 可能不动，所以取 db 与 -wal 的较新者。VACUUM INTO 不能覆盖已存在文件 →
+ *  先写 .tmp 再 rename 原子替换。失败返回 false（备份是兜底措施，绝不影响主流程）。 */
+export function backupMemoryDb(workspace: string, dir = '.dsh-meow'): boolean {
+  try {
+    const dbPath = memoryDbPath(workspace, dir)
+    if (!existsSync(dbPath)) return false
+    const bakPath = `${dbPath}.bak`
+    let dataMtime = statSync(dbPath).mtimeMs
+    const walPath = `${dbPath}-wal`
+    if (existsSync(walPath)) dataMtime = Math.max(dataMtime, statSync(walPath).mtimeMs)
+    if (existsSync(bakPath) && statSync(bakPath).mtimeMs >= dataMtime) return false
+    const tmp = `${bakPath}.tmp`
+    getDb(workspace, dir).vacuumInto(tmp)
+    renameSync(tmp, bakPath)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** dream 子 agent 的 DB 定位通道：子 agent 会话可能无 cwd，dream 运行时临时挂载。 */
