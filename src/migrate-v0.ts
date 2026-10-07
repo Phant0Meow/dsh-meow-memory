@@ -65,7 +65,7 @@ function writeMigrateState(state: MigrateState): void {
 
 interface Frame { start: number; end: number }
 
-function scanFrames(buf: Buffer): Frame[] {
+export function scanFrames(buf: Buffer): Frame[] {
   const frames: Frame[] = []
   let offset = 0
   while (offset < buf.length) {
@@ -108,8 +108,9 @@ function scanFrames(buf: Buffer): Frame[] {
   return frames
 }
 
-/** 逐帧解压整个容器，返回拼接明文（等价 zstd CLI -d -c）。 */
-function decompressAllFrames(buf: Buffer): Buffer {
+/** 逐帧解压整个容器，返回拼接明文（等价 zstd CLI -d -c）。
+ *  导出共享：dream 的 resume 路由恢复（issue #36）读会话日志同用此解压器。 */
+export function decompressAllFrames(buf: Buffer): Buffer {
   const frames = scanFrames(buf)
   const parts: Buffer[] = []
   for (const f of frames) parts.push(zstdDecompressSync(buf.subarray(f.start, f.end)))

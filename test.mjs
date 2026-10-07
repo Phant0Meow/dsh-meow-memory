@@ -47,6 +47,7 @@ import {
   advanceDream,
   abortDream,
   recoverInterruptedDream,
+  handleMemoryTurnFailure,
   dreamCommandDefinition,
   findSimilar,
   markInjected,
@@ -270,6 +271,81 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   check('resume: not-found backed off (no retry within window)', resumeCalls4 === 1)
   dbR4.close()
   rmSync(wsR4, { recursive: true, force: true })
+}
+
+// ── issue #36：dream 失败处理——零进展中断不静默封存、连续上限才止损、turn-failed 即时处理 ──
+{
+  const wsF = mkdtempSync(join(tmpdir(), 'mm-dream-fail-'))
+  const dbF = getDb(wsF, '.dsh-meow')
+  const widF = 'win-fail-1'
+  dbF.touchWindow(widF, wsF, Date.now() - 4 * 3600_000)
+  dbF.insert({ level: 'fact', content: '失败窗口的记忆', project: 'dsh', source_session: widF, created_at: 100 })
+
+  // 失败计数：同 T 累加 / T 变化重计 / 显式清零
+  dbF.recordDreamFailure(widF, 1000)
+  check('recordDreamFailure accumulates per T', dbF.recordDreamFailure(widF, 1000) === 2)
+  check('recordDreamFailure resets on T change', dbF.recordDreamFailure(widF, 2000) === 1)
+  dbF.clearDreamFailure(widF)
+  check('clearDreamFailure resets count', dbF.recordDreamFailure(widF, 2000) === 1)
+  dbF.clearDreamFailure(widF)
+
+  // 零进展中断：释放待重试（旧 bug：一次中断就盖章，整窗记忆静默消失且永不重试）
+  dbF.claimDream(widF, 'o-f1', 1000, LEASE)
+  check('recover zero-progress releases (attempt 1)', recoverInterruptedDream(dbF, widF, wsF, '.dsh-meow') === 0 &&
+    dbF.getDreamLease(widF) === null && dbF.getWindow(widF)?.last_dream_time === null)
+  dbF.claimDream(widF, 'o-f2', 1000, LEASE)
+  check('recover zero-progress releases (attempt 2)', recoverInterruptedDream(dbF, widF, wsF, '.dsh-meow') === 0 &&
+    dbF.getDreamLease(widF) === null && dbF.getWindow(widF)?.last_dream_time === null)
+  // 第 3 次：达上限 → 封存止损（不再无限重试）
+  dbF.claimDream(widF, 'o-f3', 1000, LEASE)
+  const leaseF3 = dbF.getDreamLease(widF)
+  const retF3 = recoverInterruptedDream(dbF, widF, wsF, '.dsh-meow')
+  console.log('DBG leaseT=', leaseF3?.T, 'ret=', retF3, 'meta=', JSON.stringify(dbF.db.prepare("SELECT key, value FROM dream_meta WHERE key LIKE 'dreamfail%' ORDER BY key").all()), 'last_dream=', dbF.getWindow(widF)?.last_dream_time)
+  check('recover zero-progress seals at cap', dbF.getWindow(widF)?.last_dream_time !== null && dbF.getDreamLease(widF) === null)
+  // 封存即收尾：计数清零（下一轮从 1 重计，不继承旧失败）
+  check('failure counter cleared after seal', dbF.recordDreamFailure(widF, 1000) === 1)
+  dbF.clearDreamFailure(widF)
+  dbF.releaseDream(widF)
+
+  // turn/end error 的即时处理：无租约 → none；有租约 → 释放；连续达上限 → 封存
+  const widF2 = 'win-fail-2'
+  dbF.touchWindow(widF2, wsF, Date.now() - 4 * 3600_000)
+  check('turn-failure without lease is none', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'none')
+  dbF.claimDream(widF2, 'o-t1', 1000, LEASE)
+  check('turn-failure releases active lease', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'released' && dbF.getDreamLease(widF2) === null)
+  dbF.claimDream(widF2, 'o-t2', 1000, LEASE)
+  check('turn-failure accumulates (attempt 2 released)', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'released')
+  dbF.claimDream(widF2, 'o-t3', 1000, LEASE)
+  check('turn-failure seals at cap', handleMemoryTurnFailure(dbF, widF2, wsF, '.dsh-meow') === 'sealed' && dbF.getWindow(widF2)?.last_dream_time !== null)
+  dbF.close()
+  rmSync(wsF, { recursive: true, force: true })
+}
+
+// issue #36 根因：resume 组装 agentOptions（agentDefaultModel 回退源）；mock 未提供该
+// 服务且无会话日志时走裸 resume——旧测试路径行为逐字节不变（上面 v0.23.1 块即回归）。
+{
+  const cfgR2 = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2 }
+  const wsS2 = mkdtempSync(join(tmpdir(), 'mm-resume-route-'))
+  const dbS2 = getDb(wsS2, '.dsh-meow')
+  const widS2 = 'win-route-1'
+  dbS2.touchWindow(widS2, wsS2, Date.now() - 4 * 3600_000)
+  dbS2.insert({ level: 'fact', content: '带路由恢复的记忆', project: 'dsh', source_session: widS2, created_at: 100 })
+  const resumedWith = []
+  const agentS2 = { session: { header: { id: widS2 } }, steer: () => {} }
+  const ctxS2 = {
+    get: (name) => name === 'agents'
+      ? { resume: async (opts) => { resumedWith.push(opts); return agentS2 } }
+      : name === 'agentDefaultModel'
+        ? { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) }
+        : undefined,
+  }
+  await resumeAndDream(ctxS2, widS2, wsS2, '.dsh-meow', undefined, cfgR2)
+  check('resume: agentOptions from default selection', resumedWith.length === 1 &&
+    resumedWith[0].resumeSessionId === widS2 &&
+    resumedWith[0].agentOptions?.provider === 'deepseek-official' && resumedWith[0].agentOptions?.model === 'deepseek-flash')
+  check('resume: dream started with route', dbS2.getDreamLease(widS2) !== null)
+  dbS2.close()
+  rmSync(wsS2, { recursive: true, force: true })
 }
 
 // 递归 dream 修复（2026-09-05 猫猫拍板）：delegate fork 的子代理会话会进 windows 表，

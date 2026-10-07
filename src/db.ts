@@ -505,6 +505,8 @@ export class MemoryDb {
     this.db
       .prepare(`UPDATE windows SET dream_owner = NULL, dream_started_at = NULL, dream_progress_at = NULL, dream_group_idx = NULL, dream_T = NULL, last_dream_time = ? WHERE session_id = ?`)
       .run(time, sessionId)
+    // dream 收尾（完成/中止/封存）= 本轮尝试周期结束：失败计数清零（issue #36）。
+    this.clearDreamFailure(sessionId)
   }
 
   /** dream 失败释放：只清租约，**不动 last_dream_time**——窗口保持「待整理」状态，
@@ -516,6 +518,36 @@ export class MemoryDb {
     this.db
       .prepare(`UPDATE windows SET dream_owner = NULL, dream_started_at = NULL, dream_progress_at = NULL, dream_group_idx = NULL, dream_T = NULL WHERE session_id = ?`)
       .run(sessionId)
+  }
+
+  // ── dream 失败计数（issue #36）──────────────────────────────────────────────
+  // 存 dream_meta（KV，跨实例/重启共享）：`dreamfail_c:<sid>` = 连续失败次数、
+  // `dreamfail_t:<sid>` = 计数对应的整理范围 T。T 变了（窗口有新活动 → 新一轮整理
+  // 范围不同）自动从 1 重计；dream 收尾（finishDream）清零。与 releaseDream 的
+  // 「失败不封存、可重试」语义配套：失败只释放，连续达上限（DREAM_MAX_ATTEMPTS，
+  // dream.ts）才封存止损——既不让一次故障静默吞掉整窗记忆，也不让持续性故障
+  // 变成无限重试烧 token。
+
+  /** 记一次 dream 失败，返回当前连续失败次数（同 T 累加，T 变化重计）。 */
+  recordDreamFailure(sessionId: string, T: number): number {
+    const prevT = this.db.prepare(`SELECT value FROM dream_meta WHERE key = ?`).get(`dreamfail_t:${sessionId}`) as { value: number | null } | undefined
+    const prevC = this.db.prepare(`SELECT value FROM dream_meta WHERE key = ?`).get(`dreamfail_c:${sessionId}`) as { value: number | null } | undefined
+    const count = prevT !== undefined && prevT.value === T && prevC !== undefined && typeof prevC.value === 'number' && prevC.value >= 1
+      ? prevC.value + 1
+      : 1
+    this.db
+      .prepare(`INSERT INTO dream_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+      .run(`dreamfail_t:${sessionId}`, T)
+    this.db
+      .prepare(`INSERT INTO dream_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+      .run(`dreamfail_c:${sessionId}`, count)
+    return count
+  }
+
+  /** 清 dream 失败计数（finishDream 收尾时自动调用；一般无需手动调）。 */
+  clearDreamFailure(sessionId: string): void {
+    this.db.prepare(`DELETE FROM dream_meta WHERE key = ?`).run(`dreamfail_t:${sessionId}`)
+    this.db.prepare(`DELETE FROM dream_meta WHERE key = ?`).run(`dreamfail_c:${sessionId}`)
   }
 
   /** 是否有进行中/未收尾的 dream（租约存在，无论是否过期）。 */
