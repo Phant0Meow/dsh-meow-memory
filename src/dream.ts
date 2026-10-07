@@ -31,9 +31,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { getDb, projectList, type Level, type MemoryRow } from './db.js'
+import { decompressAllFrames } from './migrate-v0.js'
 import { fillTemplate, keyedValue, resolveSlotText } from './prompt-loader.js'
 import { readSeen, readWritten } from './inject.js'
 import { workspaceOf } from './tools.js'
@@ -226,6 +228,12 @@ interface DreamLease {
 const DREAM_LEASE_MS = 30 * 60_000
 export { DREAM_LEASE_MS }
 
+/** dream 连续失败上限（issue #36）：失败（turn error / 零进展中断）只释放重试，
+ *  连续达上限才封存止损并 warn——既不让一次故障静默吞掉整窗记忆（旧 bug），
+ *  也不让持续性故障变成无限重试烧 token。计数落 dream_meta（跨实例/重启共享），
+ *  整理范围 T 变化自动重计，dream 收尾（finishDream）清零。 */
+export const DREAM_MAX_ATTEMPTS = 3
+
 const liveAgents = new Map<string, unknown>() // sessionId -> 顶层 agent（live 引用）
 
 export function registerLiveAgent(agent: { session?: { header?: { id?: string; parentSession?: unknown } } }): void {
@@ -256,8 +264,9 @@ export function windowNeedsDream(w: { last_event_time: number; last_dream_time: 
   return true
 }
 
-/** dream 状态信号回调：'dreaming' = dream 开始（租约抢占成功），'dreamed' = 整理完成/收尾。 */
-export type DreamStateCallback = (sessionId: string, state: 'dreaming' | 'dreamed') => void
+/** dream 状态信号回调：'dreaming' = dream 开始（租约抢占成功），'dreamed' = 整理完成/收尾，
+ *  'active' = 失败释放/重试间隙（去月亮；SSE 广播本就支持，issue #36 起恢复路径也会发）。 */
+export type DreamStateCallback = (sessionId: string, state: 'dreaming' | 'dreamed' | 'active') => void
 
 /**
  * 启动一个窗口的 dream（第 0 组）。agent 必须是该窗口的 live 顶层 agent。
@@ -409,7 +418,10 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
     // 租约过期 = 主人已死：补收尾（不再推进），防止窗口永久 need=true 反复 start
     recoverInterruptedDream(db, sessionId, ws, dir)
     dreamLog(ws, dir, `advanceDream expired-recover sid=${shortSessionId(sessionId)}`)
-    onDreamState?.(sessionId, 'dreamed')
+    // 零进展释放（issue #36）≠ 整理完成：去月亮（active）而非加月亮（dreamed）；
+    // 封存路径 last_dream_time 已置上，照旧 dreamed。
+    const wAfter = db.getWindow(sessionId)
+    onDreamState?.(sessionId, wAfter !== undefined && wAfter.last_dream_time !== null ? 'dreamed' : 'active')
     return
   }
 
@@ -566,12 +578,29 @@ export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamS
 }
 
 /** 补收尾被打断的 dream（start 过但没 done：进程重启/热重载/跨进程打断）。
- *  视为已完成：封存该窗口条目 + 清 pending + 记 last_dream_time——不再重复 start。
- *  @returns 封存（stamped）的条目数。 */
+ *  有进展（group_idx>0，前序组成果已落库）：照旧视为已完成——封存该窗口条目 +
+ *  清 pending + 记 last_dream_time——不再重复 start。
+ *  零进展（group_idx=0，一组都没推进——#36 的装配失败轮即此）：封存会让整窗记忆
+ *  静默消失且永不重试。改为记失败计数后释放（下个检查周期自动重试；重试对新写入
+ *  条目幂等——dedup 合并兜底）；连续失败达 DREAM_MAX_ATTEMPTS 才封存止损（warn
+ *  留痕，不再无声）。
+ *  @returns 封存（stamped）的条目数（释放路径返回 0；调用方如需区分「封存」与
+ *  「释放」，看 windows.last_dream_time 是否被置上）。 */
 export function recoverInterruptedDream(db: ReturnType<typeof getDb>, sessionId: string, workspace: string, dir = '.dsh-meow'): number {
   const lease = db.getDreamLease(sessionId)
   const w = db.getWindow(sessionId)
   const T = lease ? lease.T : w && w.last_event_time > 0 ? w.last_event_time : Date.now()
+  const progressed = lease !== null && lease.group_idx > 0
+  if (!progressed) {
+    const fails = db.recordDreamFailure(sessionId, T)
+    if (fails < DREAM_MAX_ATTEMPTS) {
+      db.releaseDream(sessionId)
+      dreamLog(workspace, dir, `dream recovered zero-progress session=${shortSessionId(sessionId)} fails=${fails}/${DREAM_MAX_ATTEMPTS} -> released (retry next sweep)`)
+      return 0
+    }
+    dreamLog(workspace, dir, `dream recovered zero-progress session=${shortSessionId(sessionId)} fails=${fails} -> sealed (cap reached)`)
+    console.warn(`[meow-memory] dream 连续失败 ${fails} 次后中断（窗口 ${shortSessionId(sessionId)}），按封存收尾不再自动重试；该窗口正常对话产生新活动后可重新自动整理，或手动 /dream`)
+  }
   const stamped = db.stampDream(sessionId, T)
   db.finishDream(sessionId, Date.now())
   db.logDream(
@@ -580,6 +609,32 @@ export function recoverInterruptedDream(db: ReturnType<typeof getDb>, sessionId:
   )
   dreamLog(workspace, dir, `dream recovered session=${shortSessionId(sessionId)} stamped=${stamped}`)
   return stamped
+}
+
+/** dream 轮以 turn/end error 收尾的即时处理（issue #36 建议二；session/event 订阅侧调用）。
+ *  宿主只在「某个 step 成功完成后」才发 agent/turn-stopping（dsh-agent-loop turn 循环
+ *  内唯一发射点，发射时本轮 turn/end 还没落日志），首个 step 之前的失败（空 options
+ *  装配抛错、pre-step reject 等）永远走不到 turn-stopping——旧 turn-stopping error
+ *  分支对这类失败是死代码，租约只能等 6h 心跳封顶后被盖章。turn/end 事件在宿主
+ *  catch/finally 里必然落盘，是可靠的失败信号。
+ *  语义：有租约 = 失败计数 +1 后释放（下个检查周期自动重试）；连续达 DREAM_MAX_ATTEMPTS
+ *  封存止损（warn）。无租约（reflect 轮失败等）不动。
+ *  @returns 'released'（已释放待重试）/ 'sealed'（达上限封存）/ 'none'（无租约，非 dream）。 */
+export function handleMemoryTurnFailure(db: ReturnType<typeof getDb>, sessionId: string, workspace: string, dir = '.dsh-meow'): 'released' | 'sealed' | 'none' {
+  stopDreamHeartbeat(sessionId) // 无害：无心跳时空操作；有则立刻退役（release 后 touch 必 changes=0）
+  const lease = db.getDreamLease(sessionId)
+  if (lease === null) return 'none'
+  const fails = db.recordDreamFailure(sessionId, lease.T)
+  if (fails >= DREAM_MAX_ATTEMPTS) {
+    const stamped = db.stampDream(sessionId, lease.T)
+    db.finishDream(sessionId, Date.now())
+    dreamLog(workspace, dir, `dream turn-failed cap sid=${shortSessionId(sessionId)} fails=${fails} -> sealed (stamped=${stamped})`)
+    console.warn(`[meow-memory] dream 轮连续失败 ${fails} 次（窗口 ${shortSessionId(sessionId)}），已封存不再自动重试；详见 dream-debug.log`)
+    return 'sealed'
+  }
+  db.releaseDream(sessionId)
+  dreamLog(workspace, dir, `dream turn-failed sid=${shortSessionId(sessionId)} fails=${fails}/${DREAM_MAX_ATTEMPTS} -> released (retry next sweep)`)
+  return 'released'
 }
 
 // ── 定时器 ──────────────────────────────────────────────────────────────────
@@ -663,6 +718,85 @@ export function isDreamSuppressed(cfg: DreamConfig, date = new Date()): boolean 
   return false
 }
 
+// ── resume 路由恢复（issue #36 根因修复）────────────────────────────────────
+// agents.resume() 不传 agentOptions 时宿主按 {} 处理（dsh-agent-loop resumeWith:
+// options.agentOptions ?? {} → setupAndPublish → prepare）——复活出来的 agent 没有
+// provider/model：人设段的 {{model}} 严格插值直接抛错（dsh-system-prompt renderPrompt
+// 对 undefined 引用即抛，standard/ptc/cordis 预设人设 prefix 都引用 {{model}}），
+// prepareRequest 的空 route 还会二次抛（"has no provider/model"）。GUI 打开的窗口
+// 不受影响——模型是打开时由 GUI 传入的；只有重启后 agent-missing 窗口的自动 resume
+// 走空 options（#36 的「凭空失败轮」即此，宿主逐版本实证 0.1.5-rc.1 起行为一致）。
+// 修法：resume 前把路由组装好——优先恢复该会话日志里最近一次 request/header 的原
+// 路由（dream 轮延续原会话上下文，同模型才命中 prompt cache 前缀），取不到再回退
+// 部署默认选择（与宿主新建会话 dsh-api-session-controller agentOptions() 同源，只
+// 传 provider+model），仍取不到才按旧行为裸 resume（失败由 turn-failed 处理兜底）。
+
+/** 读会话持久化日志里最近一次 request/header 的路由。物理层与
+ *  dsh-session-persistence-jsonl 同构（多帧 zstd 容器，逐帧解压），复用 migrate-v0
+ *  的逐帧解压器；文件缺失/损坏/字段不合一律返回 null，绝不抛（调用方在 sweep 链上）。 */
+function readLastRouteFromSessionLog(sessionId: string): { provider: string; model: string } | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return null // sid 拼路径前的防御（来自 windows 表，正常恒过）
+  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+  for (const rootName of ['sessions', 'archived-sessions']) {
+    const root = join(home, rootName)
+    let projDirs: string[]
+    try {
+      if (!existsSync(root)) continue
+      projDirs = readdirSync(root)
+    } catch {
+      continue
+    }
+    for (const proj of projDirs) {
+      // 两代文件名并存（v4 现行 / v0 旧名），与 migrate-v0 listSessionFiles 同款兼容
+      for (const file of [join(root, proj, sessionId, 'session.v4.jsonl.zstd'), join(root, proj, sessionId, 'session.jsonl.zstd')]) {
+        if (!existsSync(file)) continue
+        try {
+          const lines = decompressAllFrames(readFileSync(file)).toString('utf8').split('\n')
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const line = lines[i]
+            if (!line.includes('"request/header"')) continue
+            let ev: { data?: { header?: { config?: { provider?: unknown; model?: unknown } } } }
+            try {
+              ev = JSON.parse(line) as typeof ev
+            } catch {
+              continue
+            }
+            const cfg = ev?.data?.header?.config
+            if (
+              cfg !== undefined && cfg !== null &&
+              typeof cfg.provider === 'string' && cfg.provider.length > 0 &&
+              typeof cfg.model === 'string' && cfg.model.length > 0
+            ) return { provider: cfg.provider, model: cfg.model }
+          }
+        } catch {
+          /* 单文件损坏/解压失败：试下一个候选 */
+        }
+      }
+    }
+  }
+  return null
+}
+
+/** resume 前解析该会话应使用的路由：原会话路由（会话日志）→ 部署默认选择 → null。 */
+function resolveResumeRoute(ctx: Context, sessionId: string): { provider: string; model: string; source: 'session-log' | 'default-selection' } | null {
+  const fromLog = readLastRouteFromSessionLog(sessionId)
+  if (fromLog !== null) return { ...fromLog, source: 'session-log' }
+  try {
+    const svc = (ctx as { get?: (name: string) => unknown }).get?.('agentDefaultModel') as
+      | { currentSelection?: () => { provider?: unknown; model?: unknown } }
+      | undefined
+    const sel = typeof svc?.currentSelection === 'function' ? svc.currentSelection() : null
+    if (
+      sel !== null && sel !== undefined &&
+      typeof sel.provider === 'string' && sel.provider.length > 0 &&
+      typeof sel.model === 'string' && sel.model.length > 0
+    ) return { provider: sel.provider, model: sel.model, source: 'default-selection' }
+  } catch {
+    /* 默认模型服务不可用/读失败：落到裸 resume（turn-failed 处理兜底） */
+  }
+  return null
+}
+
 /** 进程重启后 liveAgents 清空：对满足 dream 条件的窗口按需恢复 agent。
  *  factory.resume 从 session persistence（jsonl 后端）把已有会话恢复成 live agent，
  *  与 GUI 打开会话同路径；恢复后重验全部条件再 startWindowDream（恢复耗时期间
@@ -727,13 +861,22 @@ export async function resumeAndDream(ctx: Context, sessionId: string, workspace:
     // → 全部 agent-missing 窗口 resume 静默失败（真机踩坑 2026-09-04，日志
     // 'agent-resume-unavailable factory=yes'），重启后自动 dream 从未真正恢复过。
     const agentsSvc = (ctx as { get?: (name: string) => unknown }).get?.('agents') as
-      | { resume?: (options: { resumeSessionId: string }) => Promise<unknown> }
+      | { resume?: (options: { resumeSessionId: string; agentOptions?: { provider: string; model: string } }) => Promise<unknown> }
       | undefined
     if (agentsSvc === undefined || typeof agentsSvc.resume !== 'function') {
       log(`check agent-resume-unavailable sid=${sid} service=${agentsSvc ? 'yes' : 'no'}`)
       return
     }
-    const resumed = await agentsSvc.resume({ resumeSessionId: sessionId })
+    // issue #36：空 options 的 resume 必然产生装配失败轮（{{model}} 严格插值抛错 +
+    // prepareRequest 空 route 抛）——resume 前把路由组装好；取不到才裸 resume
+    //（失败由 handleMemoryTurnFailure 释放重试兜底，不再静默盖章丢记忆）。
+    const route = resolveResumeRoute(ctx, sessionId)
+    if (route === null) log(`check resume no-route sid=${sid} -> resume without agentOptions (turn-failed 兜底)`)
+    else log(`check resume route sid=${sid} provider=${route.provider} model=${route.model} source=${route.source}`)
+    const resumed = await agentsSvc.resume({
+      resumeSessionId: sessionId,
+      ...(route === null ? {} : { agentOptions: { provider: route.provider, model: route.model } }),
+    })
     // dsh 的 agents.resume() 返回 handle { agent, dispose }，不是 agent 本身
     const agent = (resumed as { agent?: unknown })?.agent ?? resumed
     const header = (agent as { session?: { header?: { id?: unknown; origin?: unknown; delegationDepth?: unknown } } })
@@ -799,7 +942,9 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
     if (lease !== null) {
       if (Date.now() - lease.progress_at > DREAM_LEASE_MS) {
         recoverInterruptedDream(db, sessionId, workspace, dir)
-        onDreamState?.(sessionId, 'dreamed')
+        // 零进展释放（issue #36）≠ 整理完成：去月亮（active）；封存路径照旧 dreamed。
+        const wAfter = db.getWindow(sessionId)
+        onDreamState?.(sessionId, wAfter !== undefined && wAfter.last_dream_time !== null ? 'dreamed' : 'active')
       }
       continue
     }

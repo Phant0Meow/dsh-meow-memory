@@ -40,6 +40,7 @@ import {
   dreamCommandDefinition,
   dreamTool,
   disposeDreamHeartbeats,
+  handleMemoryTurnFailure,
   noteActivity,
   registerLiveAgent,
   scheduleDream,
@@ -1049,6 +1050,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // → 窗口永远"需要 dream"，配合中断/多进程场景造成反复 dream。
   const lastWindowWrite = new Map<string, number>()
   const isPluginTurn = new Map<string, boolean>() // sid -> 本 turn 是否为 meow-memory 插件轮
+  const turnHadMessage = new Map<string, boolean>() // sid -> 本 turn 是否出现过任何 user/message（#36 裸轮判定：dream 任务被 claim 后未及落盘就装配崩溃的轮，全程零消息）
   ctx.on('session/event', (session: { id?: string; header?: SessionHeaderLike }, event: { time?: number; type?: string; data?: unknown }) => {
     perfEvent()
     noteActivity()
@@ -1079,9 +1081,11 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     if (typeof sid === 'string') {
       if (t === 'turn/start') {
         isPluginTurn.set(sid, false) // 新轮重置
+        turnHadMessage.set(sid, false) // 新轮重置（#36 裸轮判定基线）
         return
       }
       if (t === 'user/message') {
+        turnHadMessage.set(sid, true) // 任何来源的消息都算（裸轮 = 全程零消息）
         const data = event.data as {
           source?: { kind?: string; plugin?: string; form?: string }
           content?: Array<{ type?: string; text?: string }>
@@ -1109,6 +1113,24 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
             isPluginTurn.set(sid, true) // 反思/dream 指令轮或打点
             return // 不刷新活跃度
           }
+        }
+      }
+      // dream 轮失败即时处理（issue #36 建议二）：宿主的 agent/turn-stopping 只在
+      // 「某个 step 成功完成后」发射（dsh-agent-loop turn 循环内唯一发射点，且发射时
+      // 本轮 turn/end 还没落日志），首个 step 之前的失败（空 options 装配抛错、
+      // pre-step reject 等）永远走不到那里——turn-stopping 的 error 分支对这类失败是
+      // 死代码，租约只能等 6h 心跳封顶后被盖章（静默丢记忆）。turn/end 事件在宿主
+      // catch/finally 里必然落盘，用在这里兜底：
+      // ① 插件轮 error（消息标记已落盘的 dream/reflect 轮）→ handleMemoryTurnFailure；
+      // ② 「裸轮」error（本 turn 全程零 user/message）且有活跃 dream 租约 → 同样处理
+      //    （dream 任务被 claim 后未及落盘就装配崩溃的形状；窗口此刻非活跃使用场景，
+      //    误判代价仅为提前重试一次）。
+      if (t === 'turn/end' && (event.data as { reason?: { kind?: string } } | undefined)?.reason?.kind === 'error') {
+        const pluginTurn = isPluginTurn.get(sid) === true
+        const nakedTurn = turnHadMessage.get(sid) === false // turn/start 已见、其后零消息
+        if ((pluginTurn || nakedTurn) && typeof cwd === 'string' && existsSync(memoryDbPath(cwd, resolved.projectDir))) {
+          const outcome = handleMemoryTurnFailure(getDb(cwd, resolved.projectDir), sid, cwd, resolved.projectDir)
+          if (outcome !== 'none') broadcast.broadcast(sid, 'active') // 摘掉 dreaming 呼吸灯（重试/封存状态由后续 sweep 表达）
         }
       }
       if (isPluginTurn.get(sid)) return // 插件轮内：不 touchWindow
@@ -1713,4 +1735,4 @@ export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.j
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'
