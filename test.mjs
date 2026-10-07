@@ -113,6 +113,22 @@ const topicId = db.list('topic')[0].id
 check('update by prefix', db.update('topic', topicId.slice(0, 8), { status: 'active' }) &&
   db.list('topic', { status: 'active' }).length === 1)
 
+// ── 短 id 前缀歧义拒绝（#23 复盘顺带加固）：唯一前缀命中照常更新（精确化），多行命中拒绝 ──
+{
+  const ambA = db.insert({ level: 'fact', content: '歧义前缀甲' })
+  const ambB = db.insert({ level: 'fact', content: '歧义前缀乙' })
+  // 手工改成共享前缀（绕开 newId 的时间戳前缀天然唯一）
+  db.db.prepare('UPDATE fact SET id = ? WHERE id = ?').run('ambig-111111', ambA.id)
+  db.db.prepare('UPDATE fact SET id = ? WHERE id = ?').run('ambig-222222', ambB.id)
+  check('update: ambiguous short prefix refused', db.update('fact', 'ambig', { content: '被误改' }) === false)
+  check('update: ambiguous refusal changed nothing',
+    db.findById('ambig-111111')?.row.content === '歧义前缀甲' && db.findById('ambig-222222')?.row.content === '歧义前缀乙')
+  check('update: unique short prefix still works (exact upgrade)',
+    db.update('fact', 'ambig-1', { content: '精确命中' }) === true && db.findById('ambig-111111')?.row.content === '精确命中')
+  check('update: unique prefix left sibling untouched', db.findById('ambig-222222')?.row.content === '歧义前缀乙')
+  check('update: prefix with zero matches misses', db.update('fact', 'nomatch', { content: 'x' }) === false)
+}
+
 // ── dream v2 数据层：时间前缀 id / 新列 / status 检索语义 / windows ────────
 check('newId time-prefixed', /^[0-9a-z]{9}-/.test(newId()) && newId().length === 36)
 const early = newId(Date.now() - 1000)

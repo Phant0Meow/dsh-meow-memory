@@ -380,8 +380,21 @@ export class MemoryDb {
     if (patch.project !== undefined && level === 'topic') push('project', patch.project)
     if (sets.length === 0) return false
     push('updated_at', Date.now()) // 记忆时间戳 = 最后更新时间（任何 update 都刷新）
-    const where = id.length < 36 ? 'id LIKE ?' : 'id = ?'
-    const res = this.db.prepare(`UPDATE ${level} SET ${sets.join(', ')} WHERE ${where}`).run(...args, id.length < 36 ? `${id}%` : id)
+    // 短 id = 模型截断输出（findById/update 共享的前缀匹配语义）。前缀 LIKE 可能命中
+    // 多行——歧义更新会静默改掉一批无关注记（#23 复盘顺带加固）：先解析，唯一命中
+    // 升级为全 id 精确更新（语义不变，不再走 LIKE），多行命中拒绝（warn 留痕），
+    // 零命中与旧行为一致返回 false。
+    let targetId = id
+    if (id.length < 36) {
+      const matches = this.db.prepare(`SELECT id FROM ${level} WHERE id LIKE ?`).all(`${id}%`) as Array<{ id: string }>
+      if (matches.length > 1) {
+        console.warn(`[meow-memory] update 拒绝歧义短 id：${level} 前缀 "${id}" 命中 ${matches.length} 行，请用完整 id`)
+        return false
+      }
+      if (matches.length === 0) return false
+      targetId = matches[0].id
+    }
+    const res = this.db.prepare(`UPDATE ${level} SET ${sets.join(', ')} WHERE id = ?`).run(...args, targetId)
     return res.changes > 0
   }
 
