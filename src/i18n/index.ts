@@ -12,6 +12,7 @@ export {
   getUiLocale,
   onUiLocaleChange,
   setUiLocaleForTest,
+  setLocaleRetryForTest,
   t,
   NS,
   SUPPORTED_UI_LOCALES,

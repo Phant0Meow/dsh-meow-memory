@@ -273,5 +273,59 @@ replay2.registerUiReplayer(() => { second++ })
 replay2.setUiLocaleForTest('en')
 check('单个重放失败不阻断其它', second === 1, String(second))
 
+// ── 7. locale 服务晚到重试（issue #32/#33：冷启动卡英文修复） ─────────────────
+console.log('=== 7. locale 服务晚到重试 ===')
+{
+  // 冷启动时序：installI18n 首探失败走回退 → 服务晚到 → 有界轮询重入补注册 + 语言跟随
+  const inst = await bundleSrc('src/i18n/index.ts')
+  inst.setLocaleRetryForTest(5, 30)
+  const registered = []
+  let svcRef
+  const svc = {
+    getLocale: () => ({ active: 'en', locales: [] }),
+    subscribe: () => () => {},
+    setLocale: () => {},
+    addLanguage: () => () => {},
+    register: (ns, locale) => { registered.push(locale) },
+    bind: () => (key) => key,
+  }
+  const ctx = { get: (name) => (name === 'locale' ? svcRef : undefined) }
+  inst.installI18n(ctx, () => {})
+  check('晚到：首探失败走回退（browserLocale/zh）', typeof inst.getUiLocale() === 'string')
+  svcRef = svc
+  await new Promise((r) => setTimeout(r, 60))
+  check('晚到：服务就绪后轮询重入完成三语注册', registered.length === SUPPORTED_UI_LOCALES.length, String(registered.length))
+  check('晚到：UI 语言跟随服务 active', inst.getUiLocale() === 'en')
+}
+{
+  // 轮询上限：服务始终缺席 → 封顶放弃，之后服务再出现也不再注册（定时器有界自灭）
+  const inst = await bundleSrc('src/i18n/index.ts')
+  inst.setLocaleRetryForTest(5, 3)
+  let svcRef
+  const registered = []
+  const ctx = { get: (name) => (name === 'locale' ? svcRef : undefined) }
+  inst.installI18n(ctx, () => {})
+  await new Promise((r) => setTimeout(r, 60)) // 3 次 × 5ms 早已封顶
+  svcRef = {
+    getLocale: () => ({ active: 'en', locales: [] }),
+    subscribe: () => () => {},
+    setLocale: () => {},
+    addLanguage: () => () => {},
+    register: (ns, locale) => { registered.push(locale) },
+    bind: () => (key) => key,
+  }
+  await new Promise((r) => setTimeout(r, 60))
+  check('晚到：达上限后放弃（迟到服务不再注册）', registered.length === 0, String(registered.length))
+}
+{
+  // 老宿主（ctx 连 get 都没有）→ v0.28.0 决策的永久回退场景：不轮询、不炸
+  const inst = await bundleSrc('src/i18n/index.ts')
+  inst.setLocaleRetryForTest(5, 5)
+  inst.installI18n({}, () => {})
+  check('老宿主：无 get 能力走静态查表回退', inst.getUiLocale() === 'zh')
+  await new Promise((r) => setTimeout(r, 40))
+  check('老宿主：不轮询不炸', inst.getUiLocale() === 'zh')
+}
+
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed === 0 ? 0 : 1)
