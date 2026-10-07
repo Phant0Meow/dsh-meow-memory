@@ -38,8 +38,20 @@ export const zh: Record<UiKey, string> = {
   'notice.dream.interrupted': '▸ 梦境记忆整理已中断，稍后自动重试。',
 
   // ── 会话菜单 ──────────────────────────────────────────────────────────────
-  'menu.skipDream': '跳过梦境整理记忆',
-  'menu.unskipDream': '取消跳过梦境整理记忆',
+  'part.menu': '记忆参与',
+  'part.state.active': '参与中',
+  'part.state.readonly': '免打扰',
+  'part.state.exited': '已退出',
+  'part.state.noConsolidation': '跳过整理',
+  'part.state.noWrite': '停止写入',
+  'part.state.custom': '自定义',
+  'part.panel.read': '停止读入（注入与检索）',
+  'part.panel.consolidate': '跳过整理（dream 与反思）',
+  'part.panel.write': '停止写入',
+  'part.panel.presets': '预设',
+  'part.preset.full': '参与',
+  'part.preset.readonly': '免打扰',
+  'part.preset.exit': '退出',
 
   // ── 设置页 ────────────────────────────────────────────────────────────────
   'settings.title': '喵记忆',

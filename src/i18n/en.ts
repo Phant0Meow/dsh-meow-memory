@@ -49,8 +49,20 @@ export const en: Record<UiKey, string> = {
   'notice.dream.interrupted': '▸ Memory dream task interrupted; retrying automatically later.',
 
   // ── session menu ──────────────────────────────────────────────────────────
-  'menu.skipDream': 'Skip dream memory consolidation',
-  'menu.unskipDream': 'Resume dream memory consolidation',
+  'part.menu': 'Memory participation',
+  'part.state.active': 'Active',
+  'part.state.readonly': 'Do not disturb',
+  'part.state.exited': 'Exited',
+  'part.state.noConsolidation': 'Consolidation off',
+  'part.state.noWrite': 'Writes off',
+  'part.state.custom': 'Custom',
+  'part.panel.read': 'No reads (injection + search)',
+  'part.panel.consolidate': 'Skip consolidation (dream + reflect)',
+  'part.panel.write': 'No writes',
+  'part.panel.presets': 'Presets',
+  'part.preset.full': 'Full',
+  'part.preset.readonly': 'Quiet',
+  'part.preset.exit': 'Exit',
 
   // ── settings tab ──────────────────────────────────────────────────────────
   'settings.title': 'Meow memory',

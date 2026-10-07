@@ -37,9 +37,12 @@ export const DREAM_ICON_ATTR = 'data-meow-dreamed'
 export const DREAMING_ATTR = 'data-meow-dreaming'
 /** 灰调「月牙+斜杠」标记（已跳过梦境整理，v0.18.0）。 */
 export const SKIPPED_ATTR = 'data-meow-skip-dream'
+/** 空心「月牙」标记（v0.30.0：该窗口「停止读入」——不被共享记忆影响）。 */
+export const READONLY_ATTR = 'data-meow-readonly'
 
-/** 图标三态：dreamed（淡黄月牙）/ dreaming（呼吸灯）/ skipped（月牙+斜杠）。 */
-export type DreamIconState = 'dreamed' | 'dreaming' | 'skipped'
+/** 图标四态：dreamed（淡黄月牙）/ dreaming（呼吸灯）/ skipped（月牙+斜杠）/
+ *  readonly（空心月牙，v0.30.0 记忆门控 #38）。 */
+export type DreamIconState = 'dreamed' | 'dreaming' | 'skipped' | 'readonly'
 
 /** 月牙 SVG（Lucide moon 路径，viewBox 24 缩放到 10px——矢量缩放，小尺寸也清晰）。 */
 export const MOON_SVG = '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>'
@@ -47,6 +50,12 @@ export const MOON_SVG = '<svg width="10" height="10" viewBox="0 0 24 24" fill="c
 /** 「月牙+斜杠」的月牙路径（与 MOON_SVG 同源）与斜杠路径。 */
 const SKIP_MOON_PATH = 'M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z'
 const SKIP_SLASH_PATH = 'M2.5 2.5l19 19'
+
+/** 空心月牙（只读态）：同一路径描边不填充——淡而明确「这扇窗不读入」。 */
+function makeReadonlyMoonSvg(): string {
+  return `<svg width="10" height="10" viewBox="0 0 24 24" aria-hidden="true">`
+    + `<path d="${SKIP_MOON_PATH}" fill="none" stroke="currentColor" stroke-width="2.2"/></svg>`
+}
 
 /**
  * 造一个「月牙+斜杠」SVG（macOS 勿扰图标同款：实心月牙被斜杠穿过、
@@ -66,7 +75,8 @@ export function makeSkipMoonSvg(): string {
 
 const ICON_CSS = `[${DREAM_ICON_ATTR}],
 [${DREAMING_ATTR}],
-[${SKIPPED_ATTR}] {
+[${SKIPPED_ATTR}],
+[${READONLY_ATTR}] {
   display: inline-flex;
   flex: none;
   align-items: center;
@@ -85,6 +95,7 @@ const ICON_CSS = `[${DREAM_ICON_ATTR}],
   50% { color: #f2c14e; opacity: 1; }
 }
 [${SKIPPED_ATTR}] { color: #94a3b8; opacity: 0.85; } /* 静音灰：这扇窗不做梦 */
+[${READONLY_ATTR}] { color: #94a3b8; opacity: 0.75; } /* 空心灰：这扇窗不读入 */
 `
 
 /** React fiber 内部属性前缀（React 17+ 稳定约定：__reactFiber$ + 随机后缀）。 */
@@ -125,7 +136,7 @@ function makeIcon(state: DreamIconState): HTMLElement {
   const icon = document.createElement('span')
   icon.setAttribute(attrForState(state) ?? DREAM_ICON_ATTR, 'true')
   icon.setAttribute('aria-hidden', 'true')
-  icon.innerHTML = state === 'skipped' ? makeSkipMoonSvg() : MOON_SVG
+  icon.innerHTML = state === 'skipped' ? makeSkipMoonSvg() : state === 'readonly' ? makeReadonlyMoonSvg() : MOON_SVG
   return icon
 }
 
@@ -134,27 +145,33 @@ function attrForState(state: DreamIconState | undefined): string | null {
   if (state === 'dreaming') return DREAMING_ATTR
   if (state === 'dreamed') return DREAM_ICON_ATTR
   if (state === 'skipped') return SKIPPED_ATTR
+  if (state === 'readonly') return READONLY_ATTR
   return null
 }
 
-/** 图标三属性选择器（查询已有图标用）。 */
-const ANY_ICON_SEL = `[${DREAM_ICON_ATTR}], [${DREAMING_ATTR}], [${SKIPPED_ATTR}]`
+/** 图标属性选择器（查询已有图标用）。 */
+const ANY_ICON_SEL = `[${DREAM_ICON_ATTR}], [${DREAMING_ATTR}], [${SKIPPED_ATTR}], [${READONLY_ATTR}]`
 
 /** 会话行默认扫描选择器。必须子串匹配：行类按 clsx 顺序拼接（sessionRow,
  *  selected, menuOpen…），结尾匹配会让选中/菜单打开中的行失配丢图标。 */
 export const SESSION_ROWS_SEL = 'div[role="treeitem"][class*="_sessionRow"]'
 
 /**
- * 合并 dream 状态与跳过集合为展示态（纯函数，便于测试）：
- * dreaming > skipped > dreamed——进行中的 dream 不被打断，呼吸灯最优先；
- * 跳过压过已整理月牙；两者皆无 → undefined（移除图标）。
+ * 合并 dream 状态、跳过集合与只读集合为展示态（纯函数，便于测试）：
+ * dreaming > skipped > readonly > dreamed——进行中的 dream 不被打断，呼吸灯最优先；
+ * 「退出」（skip_dream，划线月牙）压过「只读」（空心月牙）压过已整理月牙；
+ * 皆无 → undefined（移除图标）。
  */
 export function mergeIconStates(
   dreamStates: ReadonlyMap<string, 'dreamed' | 'dreaming'>,
   skippedIds: ReadonlySet<string>,
+  readonlyIds: ReadonlySet<string> = new Set(),
 ): Map<string, DreamIconState> {
   const merged = new Map<string, DreamIconState>()
   for (const [id, state] of dreamStates) merged.set(id, state)
+  for (const id of readonlyIds) {
+    if (merged.get(id) === undefined || merged.get(id) === 'dreamed') merged.set(id, 'readonly')
+  }
   for (const id of skippedIds) {
     if (merged.get(id) !== 'dreaming') merged.set(id, 'skipped')
   }
@@ -216,19 +233,28 @@ export function applyDreamIcons(states: ReadonlyMap<string, DreamIconState>, row
 export function startDreamIconManager(): () => void {
   const dreamStates = new Map<string, 'dreamed' | 'dreaming'>()
   const skippedIds = new Set<string>()
+  const readonlyIds = new Set<string>()
   let timer = 0
 
-  /** 合并两路状态后重放一轮图标。 */
-  const replay = (): void => applyDreamIcons(mergeIconStates(dreamStates, skippedIds))
+  /** 合并三路状态后重放一轮图标。 */
+  const replay = (): void => applyDreamIcons(mergeIconStates(dreamStates, skippedIds, readonlyIds))
 
   /** 拉跳过集合快照（路由不可用时静默保持现状）。 */
   const refreshSkips = async (): Promise<void> => {
     try {
       const response = await fetch('/meow-memory/skip-dreams', { cache: 'no-store' })
       if (!response.ok) return
-      const data = await response.json() as { sessionIds?: unknown }
+      const data = await response.json() as { sessionIds?: unknown; scopes?: unknown }
       skippedIds.clear()
-      if (Array.isArray(data.sessionIds)) {
+      readonlyIds.clear()
+      if (Array.isArray(data.scopes)) {
+        // v0.30.0 三档明细：skip_dream → 划线月牙；仅 skip_inject → 空心月牙
+        for (const sc of data.scopes as Array<{ sessionId?: unknown; dream?: unknown; inject?: unknown }>) {
+          if (typeof sc.sessionId !== 'string') continue
+          if (sc.dream === true) skippedIds.add(sc.sessionId)
+          else if (sc.inject === true) readonlyIds.add(sc.sessionId)
+        }
+      } else if (Array.isArray(data.sessionIds)) {
         for (const id of data.sessionIds) {
           if (typeof id === 'string') skippedIds.add(id)
         }
@@ -266,7 +292,14 @@ export function startDreamIconManager(): () => void {
   // 修复，见 client-dream-events.ts 头注）。事件语义与旧 SSE 'dream' 帧一致。
   const unsubscribeDreamEvents = subscribeDreamEvents((event) => {
     const { sessionId, state } = event
-    if (state === 'dreamed' || state === 'dreaming') dreamStates.set(sessionId, state)
+    if (state === 'scope' && event.field !== undefined) {
+      // v0.30.0 门控增量：inject 开 → 空心月牙，关 → 交回底层状态
+      //（dream 档的 skip/unskip 另行到达，此处只管只读标记防双写）。
+      if (event.field === 'inject') {
+        if (event.value === true) readonlyIds.add(sessionId)
+        else readonlyIds.delete(sessionId)
+      }
+    } else if (state === 'dreamed' || state === 'dreaming') dreamStates.set(sessionId, state)
     else if (state === 'skip') skippedIds.add(sessionId)
     else if (state === 'unskip') skippedIds.delete(sessionId)
     else dreamStates.delete(sessionId) // 'active'（有新活动）或未知状态：去月亮
@@ -300,6 +333,6 @@ export function startDreamIconManager(): () => void {
     window.clearTimeout(timer)
     unsubscribeDreamEvents()
     style.remove()
-    for (const el of Array.from(document.querySelectorAll<HTMLElement>(`[${DREAM_ICON_ATTR}], [${DREAMING_ATTR}], [${SKIPPED_ATTR}]`))) el.remove()
+    for (const el of Array.from(document.querySelectorAll<HTMLElement>(`[${DREAM_ICON_ATTR}], [${DREAMING_ATTR}], [${SKIPPED_ATTR}], [${READONLY_ATTR}]`))) el.remove()
   }
 }

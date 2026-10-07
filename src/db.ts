@@ -237,7 +237,10 @@ export class MemoryDb {
     )`)
     this.db.exec(`CREATE TABLE IF NOT EXISTS dream_skip (
       session_id TEXT PRIMARY KEY,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      skip_dream INTEGER NOT NULL DEFAULT 1,
+      skip_inject INTEGER NOT NULL DEFAULT 0,
+      skip_write INTEGER NOT NULL DEFAULT 0
     )`)
     this.upgrade()
   }
@@ -284,6 +287,19 @@ export class MemoryDb {
     }
     if (wCols.has('dream_pending')) {
       this.db.exec(`UPDATE windows SET dream_owner = 'legacy-pending', dream_started_at = 0, dream_progress_at = 0, dream_group_idx = 0, dream_T = last_event_time WHERE dream_pending = 1 AND dream_owner IS NULL`)
+    }
+    // dream_skip 表：v0.30.0 起升级为「记忆参与门控」（issue #38）——原有「跳过 dream」
+    // 语义显式化为 skip_dream 列，新增 skip_inject / skip_write。老库补列：存量行的
+    // 语义就是「跳过 dream」（旧行仅在该语义下产生），skip_dream 补默认 1 正确。
+    const sCols = new Set(
+      (this.db.prepare('PRAGMA table_info(dream_skip)').all() as Array<{ name: string }>).map((c) => c.name),
+    )
+    for (const [col, ddl] of [
+      ['skip_dream', 'INTEGER NOT NULL DEFAULT 1'],
+      ['skip_inject', 'INTEGER NOT NULL DEFAULT 0'],
+      ['skip_write', 'INTEGER NOT NULL DEFAULT 0'],
+    ] as const) {
+      if (!sCols.has(col)) this.db.exec(`ALTER TABLE dream_skip ADD COLUMN ${col} ${ddl}`)
     }
   }
 
@@ -610,28 +626,56 @@ export class MemoryDb {
       .run(Date.now(), sessionId).changes === 1
   }
 
-  // ── dream_skip 跳过表（v0.16.0：用户按会话跳过自动 dream；侧边栏菜单 toggle） ──
+  // ── dream_skip 门控表（v0.16.0 跳过 dream → v0.30.0 升级为「记忆参与」三档门控，#38）──
+  // 一行 = 一个窗口的门控状态：skip_dream（跳过整理：自动 dream + 自动反思）、
+  // skip_inject（停止读入：首轮快照/命中/重注入/search/read 等读入口）、skip_write
+  // （停止写入：普通轮的 remember/update；整理轮写入跟随整理档）。三档全 false 删行。
 
-  /** 设置/清除某会话的跳过标记。skip=true 写入，false 删除。 */
-  setDreamSkip(sessionId: string, skip: boolean): void {
-    if (skip) {
-      this.db
-        .prepare(`INSERT INTO dream_skip (session_id, created_at) VALUES (?, ?)
-          ON CONFLICT(session_id) DO UPDATE SET created_at = excluded.created_at`)
-        .run(sessionId, Date.now())
-    } else {
+  /** 读某窗口的门控状态（无行 = 三档全开）。 */
+  getMemoryScope(sessionId: string): { dream: boolean; inject: boolean; write: boolean } {
+    const row = this.db
+      .prepare(`SELECT skip_dream, skip_inject, skip_write FROM dream_skip WHERE session_id = ?`)
+      .get(sessionId) as { skip_dream: number; skip_inject: number; skip_write: number } | undefined
+    if (row === undefined) return { dream: false, inject: false, write: false }
+    return { dream: row.skip_dream === 1, inject: row.skip_inject === 1, write: row.skip_write === 1 }
+  }
+
+  /** 设置某窗口某档的开关；三档全 false 时删行（表只存有门槛的窗口）。
+   *  新行显式插 0（DDL 的 DEFAULT 1 只服务于老行迁移——老行语义就是 dream 跳过）。 */
+  setMemoryScopeField(sessionId: string, field: 'dream' | 'inject' | 'write', value: boolean): void {
+    const col = field === 'dream' ? 'skip_dream' : field === 'inject' ? 'skip_inject' : 'skip_write'
+    this.db
+      .prepare(`INSERT INTO dream_skip (session_id, created_at, skip_dream, skip_inject, skip_write) VALUES (?, ?, 0, 0, 0) ON CONFLICT(session_id) DO NOTHING`)
+      .run(sessionId, Date.now())
+    this.db.prepare(`UPDATE dream_skip SET ${col} = ? WHERE session_id = ?`).run(value ? 1 : 0, sessionId)
+    const scope = this.getMemoryScope(sessionId)
+    if (!scope.dream && !scope.inject && !scope.write) {
       this.db.prepare(`DELETE FROM dream_skip WHERE session_id = ?`).run(sessionId)
     }
   }
 
-  /** 该会话是否被跳过自动 dream（只挡定时器自动触发；手动触发不受限）。 */
-  isDreamSkipped(sessionId: string): boolean {
-    return this.db.prepare(`SELECT 1 FROM dream_skip WHERE session_id = ?`).get(sessionId) !== undefined
+  /** 全部门控状态（client 全量对账用）。 */
+  listMemoryScopes(): Array<{ session_id: string; dream: boolean; inject: boolean; write: boolean }> {
+    const rows = this.db
+      .prepare(`SELECT session_id, skip_dream, skip_inject, skip_write FROM dream_skip
+        WHERE skip_dream = 1 OR skip_inject = 1 OR skip_write = 1`)
+      .all() as Array<{ session_id: string; skip_dream: number; skip_inject: number; skip_write: number }>
+    return rows.map((r) => ({ session_id: r.session_id, dream: r.skip_dream === 1, inject: r.skip_inject === 1, write: r.skip_write === 1 }))
   }
 
-  /** 全部被跳过的会话 id（client 全量对账用）。 */
+  /** 设置/清除某会话的跳过标记（v0.30.0 起委派门控表 dream 档；旧调用点/测试兼容）。 */
+  setDreamSkip(sessionId: string, skip: boolean): void {
+    this.setMemoryScopeField(sessionId, 'dream', skip)
+  }
+
+  /** 该会话是否被跳过自动 dream（只挡定时器自动触发；手动触发不受限）。 */
+  isDreamSkipped(sessionId: string): boolean {
+    return this.getMemoryScope(sessionId).dream
+  }
+
+  /** 全部被跳过的会话 id（client 全量对账用，v0.30.0 起为 dream 档子集）。 */
   listDreamSkips(): string[] {
-    return (this.db.prepare(`SELECT session_id FROM dream_skip`).all() as Array<{ session_id: string }>).map((r) => r.session_id)
+    return this.listMemoryScopes().filter((s) => s.dream).map((s) => s.session_id)
   }
 
   // ── 全局检查门（dream 定时器防叠加） ─────────────────────────────────────

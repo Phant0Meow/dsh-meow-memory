@@ -52,7 +52,7 @@ import { buildHitInjection, buildInjection, buildReinjection, clearReinjectPendi
 import { migrateLegacy } from './migrate.js'
 import { buildReflectMessage, consecutiveToolSteps, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { isMeowSource } from './source.js'
-import { registerMemoryTools } from './tools.js'
+import { registerMemoryTools, setMemoryToolGate } from './tools.js'
 import { resolveSlotText, setPromptLang } from './prompt-loader.js'
 
 /** 首次欢迎引导的 seen 记账 id（accessed 通道，非真实记忆 id；releaseSeen 不清除）。 */
@@ -250,6 +250,10 @@ const config = z.object({
       rulesReviewDays: z.number().min(0).default(DEFAULT_RULES_REVIEW_DAYS),
     })
     .default({}),
+  /** 记忆停用工作区名单（#28）：cwd 精确匹配（路径归一：斜杠统一 + 去尾斜杠 + 大小写
+   *  不敏感）。命中的工作区完全停用记忆（读/整理/写全拒，含手动 /dream）——一次性
+   *  任务的工作区不污染记忆库。 */
+  disabledWorkspaces: z.array(z.string()).default([]),
   /** 整理任务的模型（可选换模型）。反思/梦境永远在主窗口执行（steer）——配置了
    *  model 时仅在这两类轮的请求上经 agent/request waterfall 覆盖 provider/model，
    *  轮次结束自动换回主模型；不再提供"独立执行"开关（v0.24 移除）。 */
@@ -343,6 +347,12 @@ export function validateConfigUserLayer(value: unknown): void {
     // user 层里残留的这两个键只忽略不报错（手编配置宽容，读取方不再消费）。
     if (ddg.model !== undefined && typeof ddg.model !== 'string') throw new Error('delegate.model 必须是字符串')
   }
+  if (v.disabledWorkspaces !== undefined) {
+    if (!Array.isArray(v.disabledWorkspaces)) throw new Error('disabledWorkspaces 必须是字符串数组')
+    for (const p of v.disabledWorkspaces) {
+      if (typeof p !== 'string' || p.trim().length === 0) throw new Error('disabledWorkspaces 每项必须是非空字符串')
+    }
+  }
 }
 
 /**
@@ -382,6 +392,8 @@ interface ResolvedConfig {
   promptLang: string | undefined
   dream: DreamConfig
   delegate: { modelSpec: AgentOptionsSpec | undefined }
+  /** 工作区停用名单（#28）：原样保留，判定时路径归一。 */
+  disabledWorkspaces: string[]
 }
 
 function resolveConfig(config: unknown): ResolvedConfig {
@@ -412,6 +424,9 @@ function resolveConfig(config: unknown): ResolvedConfig {
       // waterfall 在插件轮请求上覆盖模型（轮次结束自动换回主模型）。
       return { modelSpec: parseModelSpec(dg.model) }
     })(),
+    disabledWorkspaces: Array.isArray(c.disabledWorkspaces)
+      ? c.disabledWorkspaces.map((p) => String(p).trim()).filter((p) => p.length > 0)
+      : [],
   }
 }
 
@@ -613,8 +628,20 @@ const SETTINGS_SOURCE_WAIT_MS = 250
 // 注册期消费的字段（projectDir/homeDir/enabled/delegate.modelSpec + setPromptLang 的
 // 启动调用）保持冻结：热改需要 dispose+重入，设置页按「需重载」语义对待（#26 同口径）。
 
-const LIVE_CONFIG_KEYS = ['hitTopK', 'titleMax', 'reflect', 'reflectTurns', 'autoMigrate', 'promptLang'] as const
+const LIVE_CONFIG_KEYS = ['hitTopK', 'titleMax', 'reflect', 'reflectTurns', 'autoMigrate', 'promptLang', 'disabledWorkspaces'] as const
 const LIVE_DREAM_KEYS = ['enabled', 'idleMinutes', 'suppressWindows', 'suppressLeadMinutes', 'checkMinutes', 'timeZone', 'rulesReviewDays'] as const
+
+/** 工作区路径归一（#28 匹配口径）：斜杠统一、去尾斜杠、大小写不敏感（Windows 盘符
+ *  友好）。导出供测试直调。 */
+export function normalizeWorkspacePath(p: string): string {
+  return p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+/** 工作区是否在停用名单（归一后精确匹配）。导出供测试直调。 */
+export function workspaceDisabledMatch(list: readonly string[], ws: string): boolean {
+  const n = normalizeWorkspacePath(ws)
+  return list.some((p) => normalizeWorkspacePath(p) === n)
+}
 
 /** 活配置读取器：源引用变化（或首次读取/节流窗口过后）才重新 resolveConfig，
  *  其余读取返回同一缓存对象（引用稳定，调用方可做 identity 比较）。导出供测试直调。 */
@@ -1046,13 +1073,25 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 注册期字段（projectDir/homeDir/enabled/delegate）按 patch 层默认值生效（本次
   // 启动内不纠正），运行时反复读取的热字段（注入/反思/dream 全系）在命名空间就绪
   // 后的下一次读取自动纠正，不再需要重启。
-  const resolved = applyLiveConfig(
-    resolveConfig(merged),
-    liveConfigReader(config, () => settingsGet?.() as Record<string, unknown> | undefined, SETTINGS_SOURCE_WAIT_MS),
-  )
+  const readLiveConfig = liveConfigReader(config, () => settingsGet?.() as Record<string, unknown> | undefined, SETTINGS_SOURCE_WAIT_MS)
+  const resolved = applyLiveConfig(resolveConfig(merged), readLiveConfig)
   resolvedView = resolved
   if (sourceWaitArmed && settingsGet === undefined) {
     ctx.logger.warn('meow-memory: settings 服务在有界等待内未就绪——注册期字段本次启动按 patch 层默认值生效（需重载纠正）；热字段（注入/反思/dream）会在命名空间就绪后自动纠正（issue #26）')
+  }
+  // ── 记忆门控（issue #38/#28）───────────────────────────────────────────────
+  // 工作区停用（#28）：disabledWorkspaces 名单（cwd 归一匹配）= 硬开关，读/整理/写
+  // 全拒（含手动 /dream）。窗口级三档（#38）写 dream_skip 表：skip_dream（跳过整理）
+  // / skip_inject（停止读入）/ skip_write（停止写入，整理轮豁免——写入档只管普通轮）。
+  const workspaceDisabled = (ws: string): boolean => workspaceDisabledMatch(readLiveConfig().disabledWorkspaces, ws)
+  const memoryReadOff = (ws: string, sid: string): boolean => {
+    if (workspaceDisabled(ws)) return true
+    if (!existsSync(memoryDbPath(ws, resolved.projectDir))) return false
+    try {
+      return getDb(ws, resolved.projectDir).getMemoryScope(sid).inject
+    } catch {
+      return false // 库损坏按未停用处理：fail-open 与其余路径同风格
+    }
   }
   // ── 全局目录解析+切换（含首迁/回迁）：必须先于 sweep/loadWindowIndex——它们吃新目录。
   // disabled 检查之前执行：插件停用时配置变更也要生效（switchHomeDir 幂等，重复启动无害）。
@@ -1087,6 +1126,21 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 否则新 apply 重复注册同名工具会抛异常 → apply 中断 → 工具/手册/pre-step 全失效
   // （真机踩坑 2026-08-17：04:35 配置变更触发的 reload 后首轮注入消失）。
   const toolDisposers: Array<() => void> = []
+  // 记忆门控判定器（issue #38/#28）：工具层经 setMemoryToolGate 读取（活配置闭包）。
+  // 写档的整理轮豁免 = isPluginTurn（dream/reflect 指令轮的标记，本文件事件链维护）。
+  setMemoryToolGate({
+    refuseRead: (ws, sid) => {
+      if (workspaceDisabled(ws)) return '记忆对该工作区已停用（disabledWorkspaces 名单）：memory 工具不可用，请更换工作区或调整配置。'
+      if (sid === null || !existsSync(memoryDbPath(ws, resolved.projectDir))) return null
+      return getDb(ws, resolved.projectDir).getMemoryScope(sid).inject ? '此窗口已停止读入记忆（记忆参与开关）：注入与检索均已关闭。' : null
+    },
+    refuseWrite: (ws, sid) => {
+      if (workspaceDisabled(ws)) return '记忆对该工作区已停用（disabledWorkspaces 名单）：写入被拒绝。'
+      if (sid === null || !existsSync(memoryDbPath(ws, resolved.projectDir))) return null
+      if (isPluginTurn.get(sid) === true) return null // 整理轮豁免：整理轮写入跟随整理档（#38 联动）
+      return getDb(ws, resolved.projectDir).getMemoryScope(sid).write ? '此窗口已停止写入记忆（记忆参与开关）。' : null
+    },
+  })
   registerMemoryTools((t) => {
     const dispose = ctx.tools.register(t)
     if (typeof dispose === 'function') toolDisposers.push(dispose)
@@ -1095,7 +1149,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 完成推 dreamed、有新活动推 active。
   const broadcast = new DreamStateBroadcast(ctx.logger)
   const signalDreamState = (sessionId: string, state: 'dreaming' | 'dreamed' | 'active'): void => broadcast.broadcast(sessionId, state)
-  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays))
+  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays, workspaceDisabled))
   if (typeof disposeDreamTool === 'function') toolDisposers.push(disposeDreamTool)
   ctx.logger.info('meow-memory: memory_remember/search/read/update + memory_dream registered')
 
@@ -1292,6 +1346,10 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     const userMsgs = decision.messages.filter((m: { source?: { kind?: string } }) => m.source?.kind === 'user')
     if (userMsgs.length === 0) return decision // 工具轮/纯插件消息：不注入
 
+    // 记忆门控（issue #38/#28）：本窗口「停止读入」或工作区被配置停用 → 跳过全部
+    // 注入路径（重注入/首轮快照/引导/命中链）。读的入口统一在此封口。
+    if (ws !== null && memoryReadOff(ws, sid)) return decision
+
     // 压缩重注入（v0.21.0）：compaction/end 成功后置位的待办——下一个含真实用户
     // 消息的请求在消息前注入「长期记忆快照 + 本会话此前查阅过的项目全景」，然后清待办。
     // 本轮不跑命中链路（等同新首轮：快照先行，命中从下一轮起）。待办置位但无可注入
@@ -1464,6 +1522,15 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       return
     }
 
+    // 窗口/工作区整理门控（issue #38/#28）：「跳过整理」或工作区停用 → 自动反思一并
+    // 挡下（手动 /dream 不受限，手动=明确意愿）。dream 轮推进在上方分支已处理，不受此守卫影响。
+    if (wsTs !== null) {
+      try {
+        if (workspaceDisabled(wsTs) || (existsSync(memoryDbPath(wsTs, resolved.projectDir)) && getDb(wsTs, resolved.projectDir).getMemoryScope(sidTs).dream)) return
+      } catch {
+        /* 门控读失败：放行（fail-open 同风格） */
+      }
+    }
     if (!resolved.reflect) return
     const ws = workspaceOfAgent(agent)
     if (!ws) return
@@ -1525,7 +1592,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   }
 
   // 3) 空闲整理（按窗口；windowIndex 记录 sessionId → workspace）。
-  const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex, signalDreamState)
+  const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex, signalDreamState, workspaceDisabled)
   ctx.logger.info(
     `meow-memory: dream scheduled (idle ${resolved.dream.idleMinutes}m, suppress ${resolved.dream.suppressWindows.map((w) => `${w.start}-${w.end}`).join(' ')} lead ${resolved.dream.suppressLeadMinutes}m, every ${resolved.dream.checkMinutes}m, tz ${resolved.dream.timeZone}, rules review ${resolved.dream.rulesReviewDays}d)`,
   )
@@ -1575,11 +1642,13 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         path: '/meow-memory/dream-events',
         handler: (req, res) => broadcast.handle(req as never, res as never),
       })
-      // 跳过自动 dream（v0.16.0，侧边栏会话菜单 toggle 的数据面）：
-      //    - GET  /meow-memory/skip-dreams → { sessionIds }（全部已知工作区合并去重）；
-      //    - POST /meow-memory/skip-dreams { sessionId, skip } → { ok, skipped }，
-      //      写库后经既有 SSE 通道推 skip/unskip（同实例多标签页即时同步；
-      //      跨实例浏览器标签靠重连对账补齐——与 dream 图标同一限制）。
+      // 记忆参与门控（v0.16.0 跳过 dream → v0.30.0 三档门控，issue #38 的数据面）：
+      //    - GET  /meow-memory/skip-dreams → { sessionIds, scopes }（全部已知工作区
+      //      合并；scopes = 每窗口三档明细，sessionIds 保留旧客户端的 dream 档子集）；
+      //    - POST /meow-memory/skip-dreams { sessionId, field, value }（三档）或
+      //      { sessionId, skip }（旧形态 = dream 档），写库后经既有事件通道推
+      //      skip/unskip（dream 档，图标旧通道兼容）+ scope 明细（面板/新客户端）；
+      //      同实例多标签页即时同步，跨实例靠重连对账补齐——与 dream 图标同一限制）。
       registerOne({
         kind: 'exact',
         path: '/meow-memory/skip-dreams',
@@ -1587,31 +1656,46 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           void (async () => {
             try {
               if ((req as { method?: string }).method === 'POST') {
-                const body = await readJsonBody(req) as { sessionId?: unknown; skip?: unknown }
+                const body = await readJsonBody(req) as { sessionId?: unknown; skip?: unknown; field?: unknown; value?: unknown }
                 const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
-                const skip = body.skip === true
                 if (sessionId.length === 0) return writeJson(res, 400, { ok: false, error: 'sessionId required' })
+                // 双形态：{ sessionId, skip }（v0.16.0 旧客户端）= dream 档；
+                // { sessionId, field, value }（v0.30.0 面板）= 三档任一。
+                let field: 'dream' | 'inject' | 'write' = 'dream'
+                let value = body.skip === true
+                if (body.field !== undefined) {
+                  if (body.field !== 'dream' && body.field !== 'inject' && body.field !== 'write') {
+                    return writeJson(res, 400, { ok: false, error: 'field must be dream|inject|write' })
+                  }
+                  field = body.field
+                  value = body.value === true
+                }
                 const ws = await resolveWorkspaceForSession(ctx, sessionId)
                 if (ws === null) return writeJson(res, 404, { ok: false, error: 'unknown session (no workspace)' })
-                getDb(ws, resolved.projectDir).setDreamSkip(sessionId, skip)
-                broadcast.broadcast(sessionId, skip ? 'skip' : 'unskip')
-                ctx.logger.info(`meow-memory: dream skip ${skip ? 'on' : 'off'} for ${shortSessionId(sessionId)}`)
-                return writeJson(res, 200, { ok: true, skipped: skip })
+                getDb(ws, resolved.projectDir).setMemoryScopeField(sessionId, field, value)
+                if (field === 'dream') broadcast.broadcast(sessionId, value ? 'skip' : 'unskip') // dream 图标旧通道
+                broadcast.broadcastScope(sessionId, field, value) // 面板/新客户端通道
+                ctx.logger.info(`meow-memory: memory scope ${field}=${value ? 'on' : 'off'} for ${shortSessionId(sessionId)}`)
+                return writeJson(res, 200, { ok: true, field, value })
               }
               const workspaces = new Set<string>()
               for (const [, w] of windowIndex) {
                 if (typeof w === 'string' && w.length > 0) workspaces.add(w)
               }
               const ids = new Set<string>()
+              const scopes: Array<{ sessionId: string; dream: boolean; inject: boolean; write: boolean }> = []
               for (const w of workspaces) {
                 if (!existsSync(memoryDbPath(w, resolved.projectDir))) continue // 无记忆库不新建（collectDreamStates 同款）
                 try {
-                  for (const id of getDb(w, resolved.projectDir).listDreamSkips()) ids.add(id)
+                  for (const sc of getDb(w, resolved.projectDir).listMemoryScopes()) {
+                    scopes.push({ sessionId: sc.session_id, dream: sc.dream, inject: sc.inject, write: sc.write })
+                    if (sc.dream) ids.add(sc.session_id) // 旧客户端字段（dream 档子集）
+                  }
                 } catch {
                   /* 单工作区库损坏：跳过 */
                 }
               }
-              writeJson(res, 200, { sessionIds: [...ids] })
+              writeJson(res, 200, { sessionIds: [...ids], scopes })
             } catch (e) {
               writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
             }
@@ -1642,7 +1726,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       | undefined
     if (commands !== undefined && typeof commands.register === 'function') {
       try {
-        commandDisposers.push(ctx.effect(() => commands.register(dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays))))
+        commandDisposers.push(ctx.effect(() => commands.register(dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays, workspaceDisabled))))
         ctx.logger.info('meow-memory: /dream user command registered')
       } catch (e) {
         ctx.logger.warn(`meow-memory: /dream 命令注册失败: ${e instanceof Error ? e.message : String(e)}`)
@@ -1828,4 +1912,5 @@ export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.j
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
+export { setMemoryToolGate, registerMemoryTools } from './tools.js'
 export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'

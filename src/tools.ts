@@ -23,6 +23,32 @@ import { buildProjectSectionText, markProjectQueried, markWritten, readSeen, mar
 
 export type { Level }
 
+// ── 记忆门控（issue #38/#28）：host 注册工具时注入判定器 ─────────────────────
+// 读档 = skip_inject / disabledWorkspaces → search/read/findSimilar/project 拒绝；
+// 写档 = skip_write / disabledWorkspaces → remember/update 拒绝（整理轮豁免由 host
+// 侧的 refuseWrite 闭包判定——工具层不感知轮次语义）。refusal 文案随既有工具错误
+// 通道（throw new Error）走，模型可直接读到原因。
+export interface MemoryToolGate {
+  refuseRead?: (workspace: string, sessionId: string | null) => string | null
+  refuseWrite?: (workspace: string, sessionId: string | null) => string | null
+}
+
+let toolGate: MemoryToolGate | undefined
+/** host 在 apply 时注入门控判定器（活配置闭包；随插件重载重建）。 */
+export function setMemoryToolGate(gate: MemoryToolGate | undefined): void {
+  toolGate = gate
+}
+
+/** 门控检查：拒绝时抛出带理由的 Error（工具错误的既有通道）。 */
+function refuseOrThrow(kind: 'read' | 'write', exec: ToolRunContext): void {
+  if (toolGate === undefined) return
+  const workspace = workspaceOf(exec)
+  if (workspace === undefined) return
+  const sessionId = sessionIdOf(exec)
+  const refusal = kind === 'read' ? toolGate.refuseRead?.(workspace, sessionId) : toolGate.refuseWrite?.(workspace, sessionId)
+  if (refusal !== null && refusal !== undefined) throw new Error(refusal)
+}
+
 // ── 参数通道兜底（issue #24）────────────────────────────────────────────────
 // 部分宿主/模型走 XML 参数通道时，schema 声明为 array/number/boolean 的值会以
 // **字符串**形态到达 execute（用户实测：keywords 变成 '["代码审计","静态扫描"]'
@@ -212,6 +238,7 @@ function rememberTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('write', exec)
       const parsed = args as { content?: unknown; level?: unknown; project?: unknown; subcategory?: unknown; goal?: unknown; importance?: unknown; corrected?: unknown; keywords?: unknown }
       const content = typeof parsed.content === 'string' ? parsed.content.trim() : ''
       // 四必填：缺失逐个报错并引导重填（用户拍板 2026-08-19）。
@@ -374,6 +401,7 @@ function searchTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('read', exec)
       const parsed = args as { query?: unknown; level?: unknown; project?: unknown; status?: unknown; days?: unknown; k?: unknown; content_max?: unknown }
       const query = typeof parsed.query === 'string' ? parsed.query.trim() : ''
       if (!query) throw new Error('memory_search: query 必填且不能为空（例：{"query": "关键词"}）；浏览项目全貌请用 memory_project')
@@ -509,6 +537,7 @@ function findSimilarTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('read', exec)
       const parsed = args as { id?: unknown; k?: unknown; content_max?: unknown }
       const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
       if (!id) throw new Error('memory_find_similar: id 不能为空')
@@ -601,6 +630,7 @@ function readTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('read', exec)
       const parsed = args as { id?: unknown }
       const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
       if (!id) throw new Error('memory_read: id 不能为空')
@@ -669,6 +699,7 @@ function updateTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('write', exec)
       const parsed = args as { id?: unknown; content?: unknown; status?: unknown; importance?: unknown; goal?: unknown; project?: unknown; keywords?: unknown }
       const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
       if (!id) throw new Error('memory_update: id 不能为空')
@@ -745,6 +776,7 @@ function projectTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('read', exec)
       const parsed = args as { project?: unknown }
       const project = typeof parsed.project === 'string' ? parsed.project.trim() : ''
       if (!project) throw new Error('memory_project: project 不能为空')
@@ -828,6 +860,7 @@ function homeTool(): ToolDefinition {
 }
 
 export function registerMemoryTools(register: (t: ToolDefinition) => void, dir = '.dsh-meow'): void {
+  // 门控判定器经 setMemoryToolGate 注入（apply 期设置；工具工厂签名保持不变）。
   register(rememberTool(dir))
   register(searchTool(dir))
   register(findSimilarTool(dir))
