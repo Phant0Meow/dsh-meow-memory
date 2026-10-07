@@ -563,7 +563,15 @@ function installSettingsSectionCompat(
   // 旧版（dsh 0.1.2 及以下）：复刻 installSettingsSection 的 register + effect + watch。
   const register = settings.register
   if (typeof register !== 'function') {
-    throw new Error('settings service exposes neither installSection nor register')
+    // 0.1.7+：SettingsForms 已删 installSection/register，设置页由 Config schema 的
+    // describe 自动表单渲染，值读写走上方 describe/write 兼容腿——本函数无可注册项，
+    // 静默跳过。其余未知宿主：设置页本就不可用，warn 留痕（与注册失败 catch 路径同
+    // 口径）。原实现在此 throw，但它落在 inject 回调里、外层 catch 接不住，只会每轮
+    // 装配刷一条误导性 error（issue #34：功能其实全部正常），故一律不再抛。
+    const proto = Object.getPrototypeOf(settings) as { describe?: unknown } | null
+    if (proto !== null && typeof proto.describe === 'function') return
+    ownerCtx.logger.warn('meow-memory: settings 服务无 installSection/register（非 0.1.7+ 形态），跳过设置区注册（配置走 patch 层）')
+    return
   }
   const scope = register.call(settings, ns, schema, {
     base: entry,
