@@ -64,3 +64,9 @@
 ### memory_dream
 
 - memory_dream.description: Agenda agora mesmo uma consolidação de memória (dream) para esta janela: tudo que esta janela criou ou trouxe à tona é enviado ao agente principal rodada a rodada para ser arrumado e guardado (rodada 1 = memórias atômicas, project/fact/lesson/rules/soul/user; rodada 2 = memórias de topic; rodada 3 = resumo de projeto, acrescentado apenas quando esta janela realmente mexeu com um projeto). Ela dispara automaticamente após 3+ horas de ociosidade da janela (suprimida nos horários de pico, 09:00-12:00 e 14:00-18:00 no horário de Pequim, mais os 15 minutos antes de cada um); esta ferramenta é o gatilho manual.
+
+### memory_home
+
+- memory_home.description: Visualiza ou troca o diretório global de dados do meow-memory (onde ficam dados em nível de instância, como logs e o ledger da janela de dream; o armazenamento de memória em si fica dentro de cada projeto e não é afetado). Chame sem parâmetros para obter o diretório atual e os locais reais dos três presets; a troca move automaticamente o conteúdo do diretório antigo (mover no mesmo disco / copiar entre discos). Após uma cópia entre discos, o diretório antigo é mantido, não excluído — lembre o usuário de apagá-lo manualmente depois de verificar; se várias instâncias do dsh compartilharem um mesmo diretório, lembre o usuário de atualizá-las em conjunto. Chame isto quando o usuário quiser mover os dados de memória ou os logs para fora do disco do sistema ou para outro local.
+- memory_home.param.target: Local de destino. Ou um marcador de preset: default = home do usuário do sistema (o padrão), dsh-storage = pasta meow-memory dentro das storages da home do DSH, plugin-root = pasta de storage ao lado do próprio plugin; ou um caminho absoluto. Omita para visualizar o estado atual sem alterar nada.
+- memory_home.out.note: Resultado da visualização/troca: o diretório atual ou o novo, quantos arquivos foram movidos e o que fazer com o diretório antigo.
