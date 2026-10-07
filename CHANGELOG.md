@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.30.0 (2026-10-07)
+
+### 修复：设置页配置不生效（#26）——热字段即改即生效，无需重启
+
+- 两层根因（报告人 @7Crimson7 实机定位）：① 250ms 有界等待在重 profile 上必输（settings 命名空间实测晚 5.5s 就绪），`settingsGet` 恒 undefined，`resolved` 全按出厂默认跑满进程生命周期；② `resolved` 在 apply 期一次定型，onChange 只热切 homeDir，`meta.volatile` 在 cordis 中无实现（死标记），「重载后生效」对绝大多数字段不成立。
+- **活配置**：`resolved` 热字段（hitTopK/titleMax/reflect/reflectTurns/autoMigrate/promptLang + dream 全系 7 键）getter 化，背后接按引用相等做变更检测的缓存读取器（0.1.3+ 提交前返回同一 frozen 对象，引用没变即未变；0.1.7 describe 壳引用恒新，250ms 节流兜底）——不重排 40+ 消费点，现有 `resolved.X` 读取自动变活。
+- **scheduleDream 自调度**：setInterval → 自调度 setTimeout（cfg 双模式：对象兼容旧调用 / getter 活读）——checkMinutes 变活值；enabled=false 的 tick 在任何 DB 操作（含 60s 检查门 SQLite 往返）前短路；启停转换打日志（去「静默跳过 vs 没跑」观测盲点）。
+- **rulesReviewDays 双模式**（数字兼容 / getter 活读），dreamTool/dreamCommandDefinition 每次触发现读。
+- **promptLang 热刷新**：onChange / 0.1.7 write 壳重调 setPromptLang（运行时 T() 文案热切；工具描述与手册段为注册期文案，保持启动语言）。
+- 注册期字段保持冻结（projectDir/homeDir/enabled/delegate.modelSpec，与报告人同口径：热改需 dispose+重入）；竞速输掉升级为 warn 日志，热字段会在命名空间就绪后自动纠正。
+
+### 修复：dream 自动轮静默失败丢记忆（#36）
+
+- 根因（宿主逐版本实证 0.1.5-rc.1 起一致，与版本无关）：`agents.resume()` 不传 agentOptions 时宿主按 `{}` 处理——复活 agent 无 provider/model，人设 `{{model}}` 严格插值抛错 + `prepareRequest` 空 route 二次抛，重启后非 live 窗口的自动 dream **必然**产生凭空失败轮。
+- **resume 组装路由**：优先恢复会话日志最近一次 `request/header` 的原路由（多帧 zstd 逐帧解压复用 migrate-v0 解压器；同模型才命中 prompt cache 前缀），回退 `agentDefaultModel.currentSelection()`（与宿主新建会话同源），均无才裸 resume。
+- **失败即时处理**：`session/event` 的 turn/end error（实证宿主 turn-stopping 只在 step 成功后发射，首个 step 前的失败对它是死代码）→ 有租约则失败计数 +1 后释放重试；「裸轮」error（全程零 user/message，任务被 claim 后未及落盘就崩溃的形状）+ 活跃租约同样处理。
+- **零进展不盖章**：group_idx=0 的中断补收尾改为记数释放（下个 sweep 自动重试，dedup 合并兜底幂等）；连续 3 次才封存止损（warn 留痕，不再无声）。计数落 dream_meta，T 变化重计，finishDream 清零。
+- 广播修正：失败释放 ≠ 整理完成——去月亮（active）而非 dreamed。
+
+### 修复：冷启动设置页 UI 卡英文（#32，#33 同症状）
+
+- 回退路径区分两种「没服务」：ctx.get 存在但 locale 服务未注册（纯时序）→ 有界轮询重入 installI18n（幂等，1s × 30 封顶自清，不挂 dispose），就绪即注册 + notify（DOM 重放层随动，文案无需重启即纠正）；ctx 连 get 都没有（老宿主/受限动态包）→ 永久回退不重试（v0.28.0「locale 不进 inject」红线保留）。
+
+### 修复：0.1.7+ 装配每轮抛误导性 error（#34）
+
+- `installSettingsSectionCompat` 在 register 缺席时不再 throw（throw 落在 inject 回调里、外层 catch 接不住）：0.1.7+ 形态（原型带 describe）静默跳过注册（设置页由 schema describe 自动表单接管，值读写走 v0.29.0 兼容腿）；其余未知宿主 warn 留痕。纯降级改动，0.1.2–0.1.6 行为不变。#35（0.2.0-rc.2 冷启动不弹窗）疑似同根，升级后待复测。
+
+### 加固：update 短 id 前缀歧义拒绝（#23 复盘顺带）
+
+- 短 id（模型截断输出）的前缀匹配保留，但 update 前先解析：唯一命中升级为全 id 精确更新；多行命中拒绝并 warn（不再静默改掉一批无关注记）；零命中与旧行为一致返回 false。全 id 路径逐字节不变。
+
+### 其他
+
+- pt-br 语言包补齐 `memory_home` 缺失键位（#39，感谢 @coutogilson）。
+
+### 测试
+
+- host 467→500（#36 失败处理与计数 13 项、活配置/tick 15 项、短 id 歧义 5 项）；client-i18n 61→67（locale 晚到重试 6 项）。全量 500+11+67+66+24+25 绿。
+
 ## v0.29.0 (2026-09-25)
 
 ### 新增：全局数据目录可配置（homeDir）——三预设 + 自动迁移 + 热切换
