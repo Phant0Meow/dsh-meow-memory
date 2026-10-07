@@ -598,6 +598,73 @@ function installSettingsSectionCompat(
  *  这里给足余量；仅当 settings 服务异常/注册回调始终不回填时才真的等满。 */
 const SETTINGS_SOURCE_WAIT_MS = 250
 
+// ── 活配置（issue #26）────────────────────────────────────────────────────────
+// 250ms 有界等待在重 profile 上必输（实测 settings 命名空间晚 5.5s 就绪），输掉后
+// settingsGet 恒 undefined、resolved 全按出厂默认跑满进程生命周期——onChange 只热切
+// homeDir，meta.volatile 在 cordis 中无实现（死标记），「重载后生效」对绝大多数字段
+// 不成立。修法不重排 40+ 消费点：在 apply 解析出的 resolved 对象上，把「运行时被
+// 反复读取」的热字段换成 getter，背后接按引用相等做变更检测的缓存读取器。
+// 引用相等的前提：0.1.3+ installSection 作用域在写入提交前返回同一 frozen 对象
+// （commit 时才换引用），引用没变即未变，读取近乎零成本；0.1.7 describe 壳每次
+// 调用全量重建（引用恒新）→ 毫秒级节流兜底最坏路径。
+// ⚠️ 接线坑（#26 报告人 v1 实机踩坑）：settingsGet 本身是个函数（()=>scope.get()），
+// 外层必须再包一层 thunk 捕获 applyInner 作用域里那个稍后才赋值的 let——把函数本体
+// 当源传进去，引用恒定 → 缓存永不失效 → 单测全绿而实机仍按启动默认值跑。
+// 注册期消费的字段（projectDir/homeDir/enabled/delegate.modelSpec + setPromptLang 的
+// 启动调用）保持冻结：热改需要 dispose+重入，设置页按「需重载」语义对待（#26 同口径）。
+
+const LIVE_CONFIG_KEYS = ['hitTopK', 'titleMax', 'reflect', 'reflectTurns', 'autoMigrate', 'promptLang'] as const
+const LIVE_DREAM_KEYS = ['enabled', 'idleMinutes', 'suppressWindows', 'suppressLeadMinutes', 'checkMinutes', 'timeZone', 'rulesReviewDays'] as const
+
+/** 活配置读取器：源引用变化（或首次读取/节流窗口过后）才重新 resolveConfig，
+ *  其余读取返回同一缓存对象（引用稳定，调用方可做 identity 比较）。导出供测试直调。 */
+export function liveConfigReader(patch: unknown, getSource: () => Record<string, unknown> | undefined, minIntervalMs: number): () => ResolvedConfig {
+  let lastSource: Record<string, unknown> | undefined
+  let lastAt = Number.NEGATIVE_INFINITY
+  let cached: ResolvedConfig | undefined
+  return (): ResolvedConfig => {
+    const now = Date.now()
+    if (cached !== undefined && now - lastAt < minIntervalMs) return cached
+    let source: Record<string, unknown> | undefined
+    try {
+      source = getSource()
+    } catch {
+      source = undefined // 源读失败按「无 user 层」处理（patch 层兜底），绝不抛进事件链
+    }
+    if (cached === undefined || source !== lastSource) {
+      lastSource = source
+      cached = resolveConfig(mergeConfigLayer(patch, source))
+    }
+    lastAt = now
+    return cached
+  }
+}
+
+/** 把 resolved 上的热字段替换为 getter（背后走活读取器）。dream 子对象整体换成
+ *  一个属性全 getter 的视图——引用稳定，scheduleDream 捕获它不会丢活性。
+ *  ⚠️ resolved 必须是独立于读取器缓存的对象（生产=resolveConfig(merged) 的新实例）：
+ *  若误传读取器自身缓存，getter 读回同一对象会无限递归——defineLive 对此有防御
+ *  （回退 defineProperty 前的原值），但防御态下热字段在下次源变化前不再更新。
+ *  导出供测试直调。 */
+export function applyLiveConfig(resolved: ResolvedConfig, readLiveConfig: () => ResolvedConfig): ResolvedConfig {
+  const defineLive = <O extends object, K extends keyof O>(obj: O, key: K, live: () => O): void => {
+    const fallback = obj[key]
+    Object.defineProperty(obj, key, {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        const cur = live()
+        return cur === obj ? fallback : cur[key]
+      },
+    })
+  }
+  for (const key of LIVE_CONFIG_KEYS) defineLive(resolved, key, readLiveConfig)
+  const dreamView = {} as DreamConfig
+  for (const key of LIVE_DREAM_KEYS) defineLive(dreamView, key, (): DreamConfig => readLiveConfig().dream)
+  Object.defineProperty(resolved, 'dream', { configurable: true, enumerable: true, get: () => dreamView })
+  return resolved
+}
+
 /** 全局目录切换结果落日志（apply 与设置页 onChange 共用口径；跨盘复制带多实例提醒）。 */
 function logHomeDirSwitch(ctx: Context, sw: ReturnType<typeof switchHomeDir>): void {
   if (sw.mode === 'copy') {
@@ -658,6 +725,15 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   let markSourceReady: (() => void) | undefined
   const sourceReady = new Promise<void>((resolve) => { markSourceReady = resolve })
   let sourceWaitArmed = false
+  // 活配置的 promptLang 热刷新出口（issue #26）：onChange / 0.1.7 写入壳回调。两者都
+  // 可能在 resolved 初始化之前同步触发（0.1.6 旧路径 installSettingsSectionCompat 的
+  // register 分支注册期就调一次 onChange）——holder 未置入时静默跳过，绝不能在
+  // inject 回调里踩 TDZ 把设置区注册炸掉。
+  let resolvedView: ResolvedConfig | undefined
+  const refreshPromptLang = (): void => {
+    if (resolvedView === undefined) return
+    setPromptLang(resolvedView.promptLang ?? 'zh')
+  }
   try {
     // 双版本设置区注册（0.1.2 及以下旧版 / 0.1.3+ 新版）分流见 installSettingsSectionCompat：
     // 新版走 settings.installSection；旧版回退 settings.register 复刻旧自由函数行为。
@@ -853,6 +929,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
                   if (String(args[0]) === SETTINGS_NS) {
                     ctx.logger.info('meow-memory: 配置已通过设置页更新（重载/重启插件后生效）')
                     hotSwitchHomeDir(ctx, config, settingsGet)
+                    // promptLang 热字段刷新（issue #26）——0.1.7 无 installSection，
+                    // 这层 write 壳就是 onChange 的等位出口。
+                    refreshPromptLang()
                   }
                   return v
                 })
@@ -878,6 +957,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           // 全局目录消费点全是轻量读写（日志追加/小 JSON/按需读覆盖层），切模块级
           // 状态口即可，dsh 主进程不重启、插件不重载、在跑会话无感知。
           hotSwitchHomeDir(ctx, config, settingsGet)
+          // promptLang 热字段刷新（issue #26）：运行时 T() 文案随活配置切换；工具
+          // 描述与 system prompt 手册段在注册期定型，保持启动语言直到重载。
+          refreshPromptLang()
         },
       })
     })
@@ -960,7 +1042,18 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     ])
   }
   const merged = mergeConfigLayer(config, settingsGet?.() as Record<string, unknown> | undefined)
-  const resolved = resolveConfig(merged)
+  // 活配置（issue #26）：热字段 getter 化——settings 命名空间晚于有界等待就绪时，
+  // 注册期字段（projectDir/homeDir/enabled/delegate）按 patch 层默认值生效（本次
+  // 启动内不纠正），运行时反复读取的热字段（注入/反思/dream 全系）在命名空间就绪
+  // 后的下一次读取自动纠正，不再需要重启。
+  const resolved = applyLiveConfig(
+    resolveConfig(merged),
+    liveConfigReader(config, () => settingsGet?.() as Record<string, unknown> | undefined, SETTINGS_SOURCE_WAIT_MS),
+  )
+  resolvedView = resolved
+  if (sourceWaitArmed && settingsGet === undefined) {
+    ctx.logger.warn('meow-memory: settings 服务在有界等待内未就绪——注册期字段本次启动按 patch 层默认值生效（需重载纠正）；热字段（注入/反思/dream）会在命名空间就绪后自动纠正（issue #26）')
+  }
   // ── 全局目录解析+切换（含首迁/回迁）：必须先于 sweep/loadWindowIndex——它们吃新目录。
   // disabled 检查之前执行：插件停用时配置变更也要生效（switchHomeDir 幂等，重复启动无害）。
   logHomeDirSwitch(ctx, switchHomeDir(resolveHomeDir(resolved.homeDir)))
@@ -1001,8 +1094,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 会话列表"已 dream"小月牙信号（用户拍板 2026-08-19）：dream 开始推 dreaming、
   // 完成推 dreamed、有新活动推 active。
   const broadcast = new DreamStateBroadcast(ctx.logger)
-  const signalDreamState = (sessionId: string, state: 'dreaming' | 'dreamed'): void => broadcast.broadcast(sessionId, state)
-  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays))
+  const signalDreamState = (sessionId: string, state: 'dreaming' | 'dreamed' | 'active'): void => broadcast.broadcast(sessionId, state)
+  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays))
   if (typeof disposeDreamTool === 'function') toolDisposers.push(disposeDreamTool)
   ctx.logger.info('meow-memory: memory_remember/search/read/update + memory_dream registered')
 
@@ -1549,7 +1642,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       | undefined
     if (commands !== undefined && typeof commands.register === 'function') {
       try {
-        commandDisposers.push(ctx.effect(() => commands.register(dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays))))
+        commandDisposers.push(ctx.effect(() => commands.register(dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays))))
         ctx.logger.info('meow-memory: /dream user command registered')
       } catch (e) {
         ctx.logger.warn(`meow-memory: /dream 命令注册失败: ${e instanceof Error ? e.message : String(e)}`)
@@ -1735,4 +1828,4 @@ export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.j
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'
