@@ -1,42 +1,40 @@
 /**
- * meow-memory — 会话菜单「跳过梦境整理记忆」toggle（client 端，v0.16.0 / v0.18.0 重构锚点）。
+ * meow-memory — 会话菜单「记忆参与」门控（client 端，v0.16.0 跳过 dream → v0.30.0
+ * 三档门控 + 面板交互，issue #38/#28）。
  *
- * 目标：左侧边栏会话行「…」菜单（dsh SessionNodeItem 硬编码 rename/fork/archive
- * 三项，primitives Menu portal 到 document.body，无扩展点）里追加一项：
- *   未跳过 → 「跳过梦境整理记忆」（斜杠月牙图标）；已跳过 → 「取消跳过梦境整理记忆」
- *   （实心月牙图标）。点击原地翻转、菜单不关（用户拍板交互）；状态持久化在 host 端
- * memory.db 的 dream_skip 表（POST /meow-memory/skip-dreams），只挡自动 dream。
+ * 目标：左侧会话行「…」菜单里保留一项「记忆参与」（带状态后缀），点击弹出一个
+ * 插件自有 DOM 面板（不是子菜单——不赌宿主 Menu 组件的嵌套支持），内含三档独立
+ * 开关 + 预设按钮：
+ *   - 停止读入（skip_inject）：首轮快照/每轮命中/压缩重注入/search+read 等读入口全关；
+ *   - 跳过整理（skip_dream）：自动 dream 与自动 reflect 都不触发（手动 /dream 仍可用，
+ *     「手动=明确意愿」的既定设计不变；v0.16.0 的「跳过梦境整理记忆」是本档的子集）；
+ *   - 停止写入（skip_write）：普通轮的 memory_remember/update 拒绝；整理轮写入跟随
+ *     整理档（写档单独关而整理开着时，整理轮写入不受影响——否则整理白跑）。
+ * 预设：参与（全开）/ 免打扰（只停读入）/ 退出（全关）。
+ * 工作区级停用（#28）是配置侧硬开关（disabledWorkspaces），面板不覆盖它。
  *
- * 注入方式（零 dsh 改动）：
- * - 身份解析：dsh Rows.tsx 在菜单打开期间给行挂 menuOpen 类——读该行 fiber key
- *   即得 session id，任意时刻可确定「谁的菜单开着」，不受挂载延迟影响；
- *   pointerdown 捕获（行操作区 → readSessionId）仅在「menuOpen 会话行存在但
- *   fiber 读失败」时兜底，且仅限点击后 1.5s 时间窗内；页面上没有 menuOpen
- *   会话行（如工作区菜单开着，issue #8）一律不注入。
- * - MutationObserver 双路注入：快路径扫 addedNodes 里的 [role="menu"]；防抖自愈
- *   （syncOpenMenus）在每次 DOM 变化后收敛——迟挂载/模板晚到/项被冲掉/容器复用
- *   串味统一处理。取现有 menuitem 做 cloneNode 模板——像素级对齐本体菜单；找不到
- *   模板/文本叶子一律静默放弃（不报错不残留），后续 mutation 重试。
- * - 幂等锚点=「子项存在且绑定同一会话」；绑定别会话的残留项拆掉重注。
- * - 点击用 capture+stopPropagation+preventDefault：React 18 事件委托不会把它当
- *   原生三项处理，也不会关闭菜单。乐观翻转文案与图标，POST 失败回滚。
+ * 注入方式（零 dsh 改动，与 v0.18.0 相同）：dsh Rows.tsx 在菜单打开期间给行挂
+ * menuOpen 类 → 读行 fiber key 得 session id；MutationObserver 双路注入 + 防抖自愈；
+ * cloneNode 模板像素级对齐本体菜单。点击 capture+stopPropagation：React 委托不会
+ * 误触发原生三项；面板打开期间把菜单 portal 暂时隐藏（visibility），关面板恢复。
  *
- * 数据同步：启动 GET 一次全量对账 + 订阅既有 /meow-memory/dream-events SSE 的
- * skip/unskip 事件（同实例多标签页即时同步；跨实例浏览器标签靠重连对账补齐）。
- * 已知限制：键盘 ↑↓ 导航只走 React 受管的原生三项，不含本项（鼠标优先功能）。
+ * 数据同步：启动 GET 全量对账（scopes 三档明细）+ 订阅共享轮询 diff 的 scope 事件
+ * （同实例多标签页即时同步；跨实例浏览器标签靠重连对账补齐）。已知限制：键盘
+ * ↑↓ 导航只走 React 受管的原生三项（v0.16.0 起不变）。
  */
 
-import { MOON_SVG, makeSkipMoonSvg, readSessionId } from './client-dream-icon.ts'
+import { MOON_SVG, readSessionId } from './client-dream-icon.ts'
 import { subscribeDreamEvents } from './client-dream-events.ts'
 import { registerUiReplayer } from './client-i18n-replay.ts'
 import { t } from './i18n/index.js'
+import type { UiKey } from './i18n/index.js'
 
 /** 测试接点：界面语言（生产代码读 DSH locale 服务）。 */
 export { setUiLocaleForTest, getUiLocale } from './i18n/index.js'
 
 /** 注入项标记属性（清理与幂等锚点；data-meow-session-id 记录绑定会话）。 */
 export const SKIP_ITEM_ATTR = 'data-meow-skip-item'
-/** 会话行操作区（…按钮所在 span）的 CSS Modules 后缀选择器。
+/** 行操作区（…按钮所在 span）的 CSS Modules 后缀选择器。
  *  子串匹配：生成格式为 `<hash>_<local>`，`_rowActions` 子串全库唯一。 */
 const ROW_ACTIONS_SEL = '[class*="_rowActions"]'
 /** 会话行选择器（dream 图标同款）。
@@ -55,20 +53,35 @@ export const MENU_OPEN_ROW_SEL = '[role="treeitem"][class*="_sessionRow"][class*
 /** 点击→菜单挂载的判定窗口（ms；仅作 menuOpen 锚点失效时的兜底）。 */
 const MENU_WINDOW_MS = 1500
 
-/** 菜单项文案（用户拍板：按一下翻转，再按恢复；文案经 i18n 层，跟随 DSH 语言设置）。 */
-export function skipLabel(skipped: boolean): string {
-  return skipped ? t('menu.unskipDream') : t('menu.skipDream')
+/** 三档门控状态：dream=跳过整理 / inject=停止读入 / write=停止写入。 */
+export interface MemoryScope {
+  dream: boolean
+  inject: boolean
+  write: boolean
 }
 
-/**
- * 菜单项图标（v0.18.0，用户实测纠正）：菜单项是**动作按钮**，图标画「点击后将变成的
- * 状态」，与标签动词呼应——「跳过梦境整理记忆」配灰调月牙+斜杠（点下去就静音）、
- * 「取消跳过梦境整理记忆」配实心月牙（点下去就恢复）。@param skipped 当前状态；
- * 模板没有 svg 就保持纯文本。
- */
-export function setMenuIcon(item: HTMLElement, skipped: boolean): void {
-  const icon = item.querySelector('svg')
-  if (icon !== null) icon.outerHTML = skipped ? MOON_SVG : makeSkipMoonSvg()
+/** 窗口门控汇总（菜单后缀用）：两开关（自动注入/自动整理）的 4 种组合全部命名。
+ *  写档（skip_write）不参与命名——面板不露出，仅工作区停用与存量数据仍生效。 */
+export type ParticipationState = 'active' | 'writeonly' | 'readonly' | 'exited'
+
+const PART_STATE_KEYS: Record<ParticipationState, UiKey> = {
+  active: 'part.state.active',
+  writeonly: 'part.state.writeonly',
+  readonly: 'part.state.readonly',
+  exited: 'part.state.exited',
+}
+
+export function participationState(scope: MemoryScope): ParticipationState {
+  const { dream, inject } = scope
+  if (!inject && !dream) return 'active'
+  if (inject && !dream) return 'writeonly' // 停止读入 + 照常整理：只往库里写，不被记忆影响
+  if (!inject && dream) return 'readonly' // 照常读入 + 跳过整理：用记忆但不再整理
+  return 'exited'
+}
+
+/** 菜单项文案：主文案 + 状态后缀（四态全命名，含默认态「功能全开」）。 */
+export function participationLabel(scope: MemoryScope): string {
+  return `${t('part.menu')} · ${t(PART_STATE_KEYS[participationState(scope)])}`
 }
 
 /**
@@ -126,13 +139,24 @@ export function resolveMenuSessionId(
   return sid !== null ? sid : fallback
 }
 
+// ── 本地门控状态（模块内可变；读写函数便于注入/面板复用） ────────────────────
+const scopes = new Map<string, MemoryScope>()
+function readScope(sid: string): MemoryScope {
+  return scopes.get(sid) ?? { dream: false, inject: false, write: false }
+}
+function writeScopeField(sid: string, field: keyof MemoryScope, val: boolean): void {
+  const cur = readScope(sid)
+  cur[field] = val
+  scopes.set(sid, cur)
+}
+
 interface SkipItemHost {
-  /** toggle 后回调（发 POST + 更新本地集合），由管理器注入。 */
-  onToggle: (sessionId: string, skip: boolean, rollback: () => void) => void
+  /** 点击菜单项：打开该会话的门控面板（由管理器注入实现）。 */
+  onOpen: (sessionId: string, item: HTMLElement) => void
 }
 
 /**
- * 向一个刚挂载的 [role="menu"] 注入跳过项。幂等锚点=「子项存在且绑定同一会话」：
+ * 向一个刚挂载的 [role="menu"] 注入门控启动项。幂等锚点=「子项存在且绑定同一会话」：
  * portal 容器跨开关复用，若容器里残留的是**别的会话**的注入项（上次开菜单的
  * 残留），拆掉重注，绝不让 A 会话的菜单显示 B 的状态。
  * @returns 注入的元素；无法注入（无模板/无文本叶子）返回 null（调用方静默放弃，
@@ -150,24 +174,17 @@ export function injectSkipItem(menu: Element, sessionId: string, host: SkipItemH
   for (const el of Array.from(item.querySelectorAll('[id]'))) el.removeAttribute('id')
   item.setAttribute('role', 'menuitem')
   // 文案替换必须成功才继续——失败路径不留下任何半配置状态（属性/监听器都还没挂）。
-  if (!retitleLeaf(item, skipLabel(readSkipped(sessionId)))) return null
+  if (!retitleLeaf(item, participationLabel(readScope(sessionId)))) return null
   item.setAttribute(SKIP_ITEM_ATTR, 'true')
   item.setAttribute('data-meow-session-id', sessionId)
-  // 图标画「点击后将变成的状态」（未跳过→斜杠月牙；已跳过→实心月牙），与标签动词呼应
-  setMenuIcon(item, readSkipped(sessionId))
+  // 图标固定月牙（启动项=面板入口；「点击后变成的状态」语义随面板化退役）。
+  const icon = item.querySelector('svg')
+  if (icon !== null) icon.outerHTML = MOON_SVG
   // 点击：capture 截停，不让事件冒泡进 React 委托（防误触发原生三项/关菜单）。
   const onClick = (e: Event): void => {
     e.stopPropagation()
     e.preventDefault()
-    const next = !readSkipped(sessionId)
-    writeSkipped(sessionId, next)
-    retitleLeaf(item, skipLabel(next))
-    setMenuIcon(item, next)
-    host.onToggle(sessionId, next, () => {
-      writeSkipped(sessionId, !next)
-      retitleLeaf(item, skipLabel(!next))
-      setMenuIcon(item, !next)
-    })
+    host.onOpen(sessionId, item)
   }
   item.addEventListener('click', onClick, true)
   item.addEventListener('pointerdown', (e) => e.stopPropagation())
@@ -175,21 +192,145 @@ export function injectSkipItem(menu: Element, sessionId: string, host: SkipItemH
   return item
 }
 
-// ── 管理器 ──────────────────────────────────────────────────────────────────
+// ── 门控面板（issue #38 交互面）─────────────────────────────────────────────
+let openPanel: HTMLElement | null = null
+let openPanelMenu: HTMLElement | null = null
+let outsideCloseHandler: ((e: PointerEvent) => void) | null = null
+let escapeCloseHandler: ((e: KeyboardEvent) => void) | null = null
+/** 面板重渲染回调（scope 变化时由管理器驱动刷新勾选态）。 */
+let panelRerender: (() => void) | null = null
 
-/** 本地跳过集合（模块内可变状态；读写函数便于注入逻辑复用）。 */
-const skipped = new Set<string>()
-function readSkipped(sid: string): boolean {
-  return skipped.has(sid)
+function closeScopePanel(): void {
+  if (openPanel === null) return
+  openPanel.remove()
+  openPanel = null
+  if (openPanelMenu !== null) {
+    try {
+      openPanelMenu.style.visibility = ''
+    } catch {
+      /* 菜单已被 React 卸载：无需恢复 */
+    }
+  }
+  openPanelMenu = null
+  if (outsideCloseHandler !== null) document.removeEventListener('pointerdown', outsideCloseHandler, true)
+  if (escapeCloseHandler !== null) document.removeEventListener('keydown', escapeCloseHandler, true)
+  outsideCloseHandler = null
+  escapeCloseHandler = null
+  panelRerender = null
 }
-function writeSkipped(sid: string, val: boolean): void {
-  if (val) skipped.add(sid)
-  else skipped.delete(sid)
+
+function buildScopePanel(sid: string, post: (field: keyof MemoryScope, value: boolean) => void): HTMLElement {
+  const panel = document.createElement('div')
+  panel.setAttribute('data-meow-scope-panel', 'true')
+  panel.style.cssText =
+    'position:fixed;z-index:2147483647;background:#0f172a;color:#e2e8f0;border:1px solid #334155;' +
+    'border-radius:8px;padding:8px 8px 6px;font-size:12px;line-height:1.6;min-width:276px;' +
+    'box-shadow:0 8px 24px rgba(0,0,0,0.45);font-family:inherit;'
+
+  const rerender = (): void => renderRows(sid)
+  panelRerender = rerender
+
+  // 标题行（含关闭钮）。
+  const title = document.createElement('div')
+  title.style.cssText = 'font-weight:600;margin-bottom:4px;display:flex;justify-content:space-between;align-items:center;gap:12px;'
+  const titleText = document.createElement('span')
+  titleText.textContent = t('part.menu')
+  const close = document.createElement('span')
+  close.textContent = '✕'
+  close.style.cssText = 'cursor:pointer;opacity:0.7;padding:0 3px;'
+  close.addEventListener('click', () => closeScopePanel())
+  title.append(titleText, close)
+  panel.appendChild(title)
+
+  // 两个开关行（用户拍板：记忆工具默认开着不关，想限制口头告诉 AI 即可）：
+  // 整行可点，右侧「打开/关闭」表达当前态（打开=该能力在参与记忆）。
+  const rows: Array<{ field: keyof MemoryScope; key: UiKey }> = [
+    { field: 'inject', key: 'part.panel.inject' },
+    { field: 'dream', key: 'part.panel.consolidate' },
+  ]
+  const rowEls: Array<{ el: HTMLElement; field: keyof MemoryScope; state: HTMLElement }> = []
+  for (const { field, key } of rows) {
+    const row = document.createElement('div')
+    row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:16px;padding:5px 6px;border-radius:4px;cursor:pointer;white-space:nowrap;'
+    row.addEventListener('pointerenter', () => { row.style.background = 'rgba(128,128,128,0.18)' })
+    row.addEventListener('pointerleave', () => { row.style.background = 'transparent' })
+    row.addEventListener('click', () => {
+      const next = !readScope(sid)[field]
+      writeScopeField(sid, field, next)
+      post(field, next)
+      rerender()
+      syncOpenMenuLabels()
+    })
+    const label = document.createElement('span')
+    label.textContent = t(key)
+    const state = document.createElement('span')
+    state.style.cssText = 'white-space:nowrap;'
+    row.append(label, state)
+    panel.appendChild(row)
+    rowEls.push({ el: row, field, state })
+  }
+
+  function renderRows(sid2: string): void {
+    const cur = readScope(sid2)
+    for (const { field, state } of rowEls) {
+      const on = cur[field]
+      // 状态列直陈「打开/关闭」：打开=该行能力在参与（非门控），关闭=已停用。
+      state.textContent = on ? t('part.panel.off') : t('part.panel.on')
+      state.style.cssText = on ? 'opacity:0.55;' : 'color:#93c5fd;'
+    }
+  }
+  renderRows(sid)
+
+  return panel
 }
 
 /**
- * 启动会话菜单跳过项管理器：全量对账 + SSE 增量 + 点击捕获 + 菜单注入。
- * @returns 清理函数（插件卸载时调用：断连接、摘监听、移除已注入项与菜单标记）。
+ * 打开门控面板：锚定菜单项（portal 定位，越界收进视口），同时把所属菜单暂时隐藏
+ * （visibility，关面板恢复——React 重渲染会自然复位，不会留僵尸）。同一时刻至多
+ * 一个面板；外部 pointerdown / Escape 关闭。
+ */
+function openScopePanel(
+  sid: string,
+  anchor: HTMLElement,
+  post: (field: keyof MemoryScope, value: boolean) => void,
+): void {
+  closeScopePanel()
+  const menu = anchor.closest('[role="menu"]') as HTMLElement | null
+  const panel = buildScopePanel(sid, post)
+  document.body.appendChild(panel)
+  const rect = anchor.getBoundingClientRect()
+  const pw = panel.offsetWidth
+  const ph = panel.offsetHeight
+  let left = rect.right + 6
+  if (left + pw > window.innerWidth - 8) left = Math.max(8, rect.left - pw - 6)
+  let top = rect.top
+  if (top + ph > window.innerHeight - 8) top = Math.max(8, window.innerHeight - ph - 8)
+  panel.style.left = `${Math.max(8, left)}px`
+  panel.style.top = `${Math.max(8, top)}px`
+  openPanel = panel
+  openPanelMenu = menu
+  if (menu !== null) menu.style.visibility = 'hidden'
+  outsideCloseHandler = (e: PointerEvent): void => {
+    if (openPanel !== null && !openPanel.contains(e.target as Node)) closeScopePanel()
+  }
+  escapeCloseHandler = (e: KeyboardEvent): void => {
+    if (e.key === 'Escape') closeScopePanel()
+  }
+  document.addEventListener('pointerdown', outsideCloseHandler, true)
+  document.addEventListener('keydown', escapeCloseHandler, true)
+}
+
+/** 已注入菜单项的文案/状态同步（scope 变化与语言切换共用）。 */
+function syncOpenMenuLabels(): void {
+  for (const item of Array.from(document.querySelectorAll<HTMLElement>(`[${SKIP_ITEM_ATTR}]`))) {
+    const sid = item.getAttribute('data-meow-session-id')
+    if (sid !== null) retitleLeaf(item, participationLabel(readScope(sid)))
+  }
+}
+
+/**
+ * 启动会话菜单门控管理器：全量对账 + 共享轮询增量 + 点击捕获 + 菜单注入 + 面板。
+ * @returns 清理函数（插件卸载时调用：断连接、摘监听、移除已注入项与面板）。
  */
 export function startDreamSkipManager(): () => void {
   let pendingSid: string | null = null
@@ -199,7 +340,7 @@ export function startDreamSkipManager(): () => void {
   /**
    * 菜单同步（防抖自愈，任何 DOM 变化后收敛一次）：只要检测到「有会话菜单正开着」
    * （menuOpen 行存在；时间窗内的点击捕获作兜底），就确保页面上每个可见
-   * [role=menu] 都带正确会话的跳过项。迟挂载、模板晚到、项被 React 冲掉、
+   * [role=menu] 都带正确会话的门控启动项。迟挂载、模板晚到、项被 React 冲掉、
    * 容器复用串味，全部在这一条路上收敛——不受 1.5s 时间窗限制。
    */
   const syncOpenMenus = (): void => {
@@ -207,7 +348,7 @@ export function startDreamSkipManager(): () => void {
     const sid = resolveMenuSessionId(document, withinWindow ? pendingSid : null)
     if (sid === null) return
     for (const menu of Array.from(document.querySelectorAll('[role="menu"]'))) {
-      injectSkipItem(menu, sid, { onToggle: handleToggle })
+      injectSkipItem(menu, sid, { onOpen: handleOpen })
     }
   }
 
@@ -220,11 +361,11 @@ export function startDreamSkipManager(): () => void {
           for (const node of Array.from(m.addedNodes)) {
             if (!(node instanceof HTMLElement)) continue
             const menus = node.matches('[role="menu"]') ? [node] : Array.from(node.querySelectorAll('[role="menu"]'))
-            for (const menu of menus) injectSkipItem(menu, sid, { onToggle: handleToggle })
+            for (const menu of menus) injectSkipItem(menu, sid, { onOpen: handleOpen })
           }
         }
         for (const menu of Array.from(document.querySelectorAll('[role="menu"]'))) {
-          injectSkipItem(menu, sid, { onToggle: handleToggle })
+          injectSkipItem(menu, sid, { onOpen: handleOpen })
         }
       }
     }
@@ -233,20 +374,28 @@ export function startDreamSkipManager(): () => void {
     observerTimer = window.setTimeout(syncOpenMenus, 120)
   })
 
-  /** toggle 落库：失败回滚由闭包完成（乐观 UI）。 */
-  const handleToggle = (sessionId: string, skip: boolean, rollback: () => void): void => {
+  /** 面板开关落库：失败回滚由闭包完成（乐观 UI；共享轮询对账兜底）。 */
+  const handlePost = (sessionId: string, field: keyof MemoryScope, value: boolean): void => {
     void (async () => {
       try {
         const resp = await fetch('/meow-memory/skip-dreams', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sessionId, skip }),
+          body: JSON.stringify({ sessionId, field, value }),
         })
         if (!resp.ok) throw new Error(String(resp.status))
       } catch {
-        rollback() // 网络/路由失败：文案翻回去，集合还原（SSE 对账也会兜底）
+        writeScopeField(sessionId, field, !value) // 网络/路由失败：本地还原
+        panelRerender?.()
+        syncOpenMenuLabels()
       }
     })()
+  }
+
+  const handleOpen = (sessionId: string, item: HTMLElement): void => {
+    openScopePanel(sessionId, item, (field, value) => {
+      handlePost(sessionId, field, value)
+    })
   }
 
   const onPointerDown = (e: PointerEvent): void => {
@@ -256,38 +405,46 @@ export function startDreamSkipManager(): () => void {
     pendingAt = Date.now()
   }
 
-  /** 全量对账（挂载/SSE 重连时）：GET 合并快照重建集合。 */
+  /** 全量对账（挂载/重连时）：GET 合并快照重建门控表。 */
   const refresh = async (): Promise<void> => {
     try {
       const response = await fetch('/meow-memory/skip-dreams', { cache: 'no-store' })
       if (!response.ok) return
-      const data = await response.json() as { sessionIds?: unknown }
-      skipped.clear()
-      if (Array.isArray(data.sessionIds)) {
+      const data = await response.json() as { sessionIds?: unknown; scopes?: unknown }
+      scopes.clear()
+      if (Array.isArray(data.scopes)) {
+        for (const sc of data.scopes as Array<{ sessionId?: unknown; dream?: unknown; inject?: unknown; write?: unknown }>) {
+          if (typeof sc.sessionId !== 'string') continue
+          scopes.set(sc.sessionId, { dream: sc.dream === true, inject: sc.inject === true, write: sc.write === true })
+        }
+      } else if (Array.isArray(data.sessionIds)) {
+        // 旧形态兜底（不应发生：client/host 同版本发布）
         for (const id of data.sessionIds) {
-          if (typeof id === 'string') skipped.add(id)
+          if (typeof id === 'string') scopes.set(id, { dream: true, inject: false, write: false })
         }
       }
+      syncOpenMenuLabels()
     } catch {
       // 路由不可用（旧版本 host / webServer 缺失）：静默降级，菜单项照常注入但
-      // toggle 会失败回滚——比整个功能消失更可诊断。
+      // 面板 toggle 会失败还原——比整个功能消失更可诊断。
     }
   }
 
-  // 增量订阅：skip/unskip 同步本标签页集合（v0.18.0 起 dream 图标管理器也消费
-  // 同通道的 skip/unskip 渲染「月牙+斜杠」——两边各自对账，互不干扰）。
-  // 【2026-09-05 连接池修复】共享 60s 轮询 diff 替代原每页一条的 EventSource
-  // （连接池饥饿修复，见 client-dream-events.ts 头注）。事件语义与旧 SSE 一致。
+  // 增量订阅：scope 事件同步三档（dream 档变化同时会收到旧 skip/unskip，幂等忽略）；
+  // 旧 skip/unskip 也处理（防只有旧通道的场景）。已开着的菜单/面板即时刷新。
   const unsubscribeDreamEvents = subscribeDreamEvents((event) => {
     const { sessionId, state } = event
-    if (state === 'skip') {
-      skipped.add(sessionId)
+    if (state === 'scope' && (event.field === 'dream' || event.field === 'inject' || event.field === 'write')) {
+      writeScopeField(sessionId, event.field, event.value === true)
+    } else if (state === 'skip') {
+      writeScopeField(sessionId, 'dream', true)
     } else if (state === 'unskip') {
-      skipped.delete(sessionId)
+      writeScopeField(sessionId, 'dream', false)
     } else {
       return
     }
-    void syncOpenMenus() // 已开着的菜单文案/图标同步翻转
+    syncOpenMenuLabels()
+    panelRerender?.()
   })
 
   document.addEventListener('pointerdown', onPointerDown, true)
@@ -296,18 +453,17 @@ export function startDreamSkipManager(): () => void {
 
   // UI 语言切换后重放已开着的菜单项文案（纯 DOM 写入，不随 React 重渲染更新）。
   const unregisterReplay = registerUiReplayer(() => {
-    for (const item of Array.from(document.querySelectorAll<HTMLElement>(`[${SKIP_ITEM_ATTR}]`))) {
-      const sid = item.getAttribute('data-meow-session-id')
-      if (sid !== null) retitleLeaf(item, skipLabel(readSkipped(sid)))
-    }
+    syncOpenMenuLabels()
   })
 
   return () => {
     unregisterReplay()
+    closeScopePanel()
     document.removeEventListener('pointerdown', onPointerDown, true)
     observer.disconnect()
     window.clearTimeout(observerTimer)
     unsubscribeDreamEvents()
     for (const item of Array.from(document.querySelectorAll(`[${SKIP_ITEM_ATTR}]`))) item.remove()
+    for (const el of Array.from(document.querySelectorAll('[data-meow-scope-panel]'))) el.remove()
   }
 }

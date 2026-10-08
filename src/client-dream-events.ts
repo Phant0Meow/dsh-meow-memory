@@ -18,11 +18,16 @@
  * 本模块零 DOM 依赖：纯 订阅表 + 定时器 + fetch diff，可单测。
  */
 
-/** 一条 dream 状态增量（与旧 SSE 'dream' 帧的 data 同形）。 */
+/** 一条 dream 状态增量（与旧 SSE 'dream' 帧的 data 同形；v0.30.0 增 scope 明细）。 */
 export interface DreamEvent {
   sessionId: string
-  /** 'dreamed' | 'dreaming' | 'active'（新活动/退出整理） | 'skip' | 'unskip' */
+  /** 'dreamed' | 'dreaming' | 'active'（新活动/退出整理） | 'skip' | 'unskip'
+   *  | 'scope'（v0.30.0 记忆门控变化，随 field/value 明细） */
   state: string
+  /** scope 事件专有：变化的三档（dream=跳过整理 / inject=停止读入 / write=停止写入）。 */
+  field?: 'dream' | 'inject' | 'write'
+  /** scope 事件专有：true=该档已开启（停用语义），false=恢复。 */
+  value?: boolean
 }
 
 type DreamListener = (event: DreamEvent) => void
@@ -31,15 +36,16 @@ const listeners = new Set<DreamListener>()
 let pollTimer = 0
 let lastStates = new Map<string, string>()
 let lastSkipped = new Set<string>()
+let lastScopes = new Map<string, { dream: boolean; inject: boolean; write: boolean }>()
 /** 是否已建立基线快照。首轮 poll 只建基线不 emit——各管理器挂载时已各自
  *  refresh() 全量对账，首轮把存量状态当"增量"发出去是纯冗余（库里几百个
  *  已 dream 会话时 = 订阅回调连发上百次幂等 DOM 重放）。 */
 let hasBaseline = false
 
-function emit(sessionId: string, state: string): void {
+function emit(sessionId: string, state: string, detail?: { field: 'dream' | 'inject' | 'write'; value: boolean }): void {
   for (const listener of [...listeners]) {
     try {
-      listener({ sessionId, state })
+      listener(detail === undefined ? { sessionId, state } : { sessionId, state, ...detail })
     } catch {
       // 单订阅者异常不影响其他订阅者（与旧 SSE 各自 try/catch 同语义）。
     }
@@ -50,6 +56,7 @@ function emit(sessionId: string, state: string): void {
 export async function pollDreamEventsOnce(): Promise<void> {
   let states: Map<string, string>
   let skipped: Set<string>
+  let scopes: Map<string, { dream: boolean; inject: boolean; write: boolean }>
   try {
     const [statesRes, skipRes] = await Promise.all([
       fetch('/meow-memory/dreamed-sessions', { cache: 'no-store' }),
@@ -57,7 +64,7 @@ export async function pollDreamEventsOnce(): Promise<void> {
     ])
     if (!statesRes.ok || !skipRes.ok) return
     const statesData = await statesRes.json() as { sessionIds?: unknown; dreamingIds?: unknown }
-    const skipData = await skipRes.json() as { sessionIds?: unknown }
+    const skipData = await skipRes.json() as { sessionIds?: unknown; scopes?: unknown }
     states = new Map()
     if (Array.isArray(statesData.sessionIds)) {
       for (const id of statesData.sessionIds) if (typeof id === 'string') states.set(id, 'dreamed')
@@ -66,9 +73,17 @@ export async function pollDreamEventsOnce(): Promise<void> {
       for (const id of statesData.dreamingIds) if (typeof id === 'string') states.set(id, 'dreaming')
     }
     skipped = new Set()
-    if (Array.isArray(skipData.sessionIds)) {
+    scopes = new Map()
+    if (Array.isArray(skipData.scopes)) {
+      // v0.30.0 三档明细（issue #38）
+      for (const sc of skipData.scopes as Array<{ sessionId?: unknown; dream?: unknown; inject?: unknown; write?: unknown }>) {
+        if (typeof sc.sessionId !== 'string') continue
+        scopes.set(sc.sessionId, { dream: sc.dream === true, inject: sc.inject === true, write: sc.write === true })
+      }
+    } else if (Array.isArray(skipData.sessionIds)) {
       for (const id of skipData.sessionIds) if (typeof id === 'string') skipped.add(id)
     }
+    for (const id of skipped) if (!scopes.has(id)) scopes.set(id, { dream: true, inject: false, write: false })
   } catch {
     // 路由不可用（webServer 缺失/旧版本 host）：静默降级，下轮再试。
     return
@@ -77,6 +92,7 @@ export async function pollDreamEventsOnce(): Promise<void> {
   if (!hasBaseline) {
     lastStates = states
     lastSkipped = skipped
+    lastScopes = scopes
     hasBaseline = true
     return
   }
@@ -87,15 +103,31 @@ export async function pollDreamEventsOnce(): Promise<void> {
   for (const [sessionId, state] of lastStates) {
     if (!states.has(sessionId)) emit(sessionId, 'active')
   }
-  // skip 增量：新出现 = skip，消失 = unskip。
+  // skip 增量（旧通道，dream 图标消费）：新出现 = skip，消失 = unskip。
   for (const sessionId of skipped) {
     if (!lastSkipped.has(sessionId)) emit(sessionId, 'skip')
   }
   for (const sessionId of lastSkipped) {
     if (!skipped.has(sessionId)) emit(sessionId, 'unskip')
   }
+  // scope 增量（v0.30.0 三档，记忆面板/行图标新变体消费）：逐字段 diff。
+  for (const [sessionId, scope] of scopes) {
+    const prev = lastScopes.get(sessionId) ?? { dream: false, inject: false, write: false }
+    for (const field of ['dream', 'inject', 'write'] as const) {
+      if (scope[field] !== prev[field]) emit(sessionId, 'scope', { field, value: scope[field] })
+    }
+  }
+  for (const sessionId of lastScopes.keys()) {
+    if (!scopes.has(sessionId)) {
+      const prev = lastScopes.get(sessionId)
+      for (const field of ['dream', 'inject', 'write'] as const) {
+        if (prev[field]) emit(sessionId, 'scope', { field, value: false })
+      }
+    }
+  }
   lastStates = states
   lastSkipped = skipped
+  lastScopes = scopes
 }
 
 /**

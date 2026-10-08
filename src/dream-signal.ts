@@ -107,7 +107,20 @@ export class DreamStateBroadcast {
    * （v0.16.0；dream-icon 端按未知状态幂等忽略，dream-skip 端据此同步本地集合）。
    */
   broadcast(sessionId: string, state: 'dreamed' | 'dreaming' | 'active' | 'skip' | 'unskip'): void {
-    const data = JSON.stringify({ sessionId, state })
+    this.write(sessionId, state)
+  }
+
+  /**
+   * 广播一次门控变化（issue #38：state='scope' + field/value 明细）。
+   * dream 档变化时 host 会同时广播旧 'skip'/'unskip'（dream-icon 旧通道兼容），
+   * inject/write 档只有 scope 事件——面板与行图标的新变体消费它。
+   */
+  broadcastScope(sessionId: string, field: 'dream' | 'inject' | 'write', value: boolean): void {
+    this.write(sessionId, 'scope', { field, value })
+  }
+
+  private write(sessionId: string, state: string, detail?: { field: string; value: boolean }): void {
+    const data = JSON.stringify(detail === undefined ? { sessionId, state } : { sessionId, state, ...detail })
     for (const res of this.clients) {
       try {
         res.write(`event: dream\nid: ${Date.now()}\ndata: ${data}\n\n`)
