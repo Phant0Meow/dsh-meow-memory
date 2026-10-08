@@ -416,5 +416,29 @@ console.log('=== 11. source 形态兼容 ===')
   check('无关 kind 不误判', computeFoldGroups(mk({ kind: 'user' })).length === 0)
 }
 
+// ---- 12. turn-trigger 形态：宿主把被领取的 context 节点改标后仍要折叠 ----
+// dsh-client-ui-chat 的 messageDefinition：context 节点 waking=true 时
+// buildViewNode 输出 kind='turn-trigger'（界面 chip 文案「收到执行请求」）。
+// 反思/dream prompt 走 followup 触发新轮 → 实测恒为该形态；只认 'context'
+// 时锚点找不到 → 横条不出现（2026-10-08 本机复现，用户报「整理轮全刷屏」）。
+console.log('=== 12. turn-trigger 形态 ===')
+{
+  const mk = (kind) => {
+    const nodes = new Map([
+      ['ctx-1', { ...contextNode('ctx-1', REFLECT, turnLoc(1)), kind }],
+      ['asst-1', assistantNode('asst-1', turnLoc(1), 'settled')],
+      ['tail-1', { key: 'tail-1', kind: 'turn-tail', location: turnLoc(1), data: { turn: 1 } }],
+    ])
+    return snapshot(['ctx-1', 'asst-1', 'tail-1'], nodes, (t) => t === 1 ? ['ctx-1', 'asst-1', 'tail-1'] : [])
+  }
+  const trig = computeFoldGroups(mk('turn-trigger'))
+  check('turn-trigger 节点识别为反思轮', trig.length === 1 && trig[0].variant === 'reflect')
+  check('turn-trigger 折叠范围含本轮 assistant', trig.length === 1 && trig[0].keys.includes('asst-1'))
+  check('与 context 形态结果一致', JSON.stringify(trig) === JSON.stringify(computeFoldGroups(mk('context'))))
+  const other = mk('turn-trigger')
+  other.chat.nodes.get('ctx-1').data = { ...other.chat.nodes.get('ctx-1').data, source: { kind: 'plugin', plugin: 'other' } }
+  check('turn-trigger + 别的插件 source 不误判', computeFoldGroups(other).length === 0)
+}
+
 console.log(failures === 0 ? '\nALL CLIENT-FOLD TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)
 process.exit(failures === 0 ? 0 : 1)
