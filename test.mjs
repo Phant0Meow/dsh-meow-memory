@@ -63,6 +63,9 @@ import {
   backupMemoryDb,
   liveConfigReader,
   applyLiveConfig,
+  setMemoryToolGate,
+  normalizeWorkspacePath,
+  workspaceDisabledMatch,
   hourInTimeZone,
   minutesInTimeZone,
   isDreamSuppressed,
@@ -128,6 +131,63 @@ check('update by prefix', db.update('topic', topicId.slice(0, 8), { status: 'act
     db.update('fact', 'ambig-1', { content: '精确命中' }) === true && db.findById('ambig-111111')?.row.content === '精确命中')
   check('update: unique prefix left sibling untouched', db.findById('ambig-222222')?.row.content === '歧义前缀乙')
   check('update: prefix with zero matches misses', db.update('fact', 'nomatch', { content: 'x' }) === false)
+}
+
+// ── 记忆参与门控（issue #38/#28）：db 三档 + 工具门 + 工作区停用 ───────────────
+{
+  // db：三档读写 / 全关删行 / listMemoryScopes / setDreamSkip 兼容委派
+  const wsG = mkdtempSync(join(tmpdir(), 'mm-scope-'))
+  const dbG = new MemoryDb(memoryDbPath(wsG))
+  check('scope: default all off', (() => { const sc = dbG.getMemoryScope('win-g1'); return !sc.dream && !sc.inject && !sc.write })())
+  dbG.setMemoryScopeField('win-g1', 'inject', true)
+  check('scope: inject on', (() => { const sc = dbG.getMemoryScope('win-g1'); return sc.inject && !sc.dream && !sc.write })())
+  dbG.setMemoryScopeField('win-g1', 'dream', true)
+  check('scope: dream+inject', (() => { const sc = dbG.getMemoryScope('win-g1'); return sc.inject && sc.dream })())
+  check('scope: listMemoryScopes returns detail', (() => {
+    const rows = dbG.listMemoryScopes()
+    return rows.length === 1 && rows[0].session_id === 'win-g1' && rows[0].dream === true && rows[0].inject === true && rows[0].write === false
+  })())
+  dbG.setMemoryScopeField('win-g1', 'dream', false)
+  dbG.setMemoryScopeField('win-g1', 'inject', false)
+  check('scope: all off removes row', dbG.getMemoryScope('win-g1').dream === false && dbG.listMemoryScopes().length === 0)
+  dbG.setDreamSkip('win-g2', true)
+  check('scope: setDreamSkip delegates to dream field', dbG.getMemoryScope('win-g2').dream === true && dbG.isDreamSkipped('win-g2') === true && dbG.listDreamSkips().join() === 'win-g2')
+  dbG.close()
+
+  // 工作区停用匹配（#28）：归一（斜杠/尾斜杠/大小写）+ 精确（非前缀）
+  check('ws-match: backslash+case+trailing slash normalize', workspaceDisabledMatch(['D:\\Repos\\FemO\\'], 'd:/repos/femo') === true)
+  check('ws-match: exact only (no prefix)', workspaceDisabledMatch(['d:/repos'], 'd:/repos/femo') === false)
+  check('ws-match: empty list never matches', workspaceDisabledMatch([], 'd:/repos') === false)
+  check('ws-norm: self-consistent', normalizeWorkspacePath('C:\\A\\B\\') === normalizeWorkspacePath('c:/a/b'))
+}
+
+// ── 工具门（#38）：读档/写档拒绝 + 整理轮豁免（判定在 host 闭包，桩测工具侧通道）──
+{
+  const wsT = mkdtempSync(join(tmpdir(), 'mm-toolgate-'))
+  const dbT = new MemoryDb(memoryDbPath(wsT))
+  setMemoryToolGate({
+    refuseRead: (ws, sid) => (sid === 'win-ro' ? '此窗口已停止读入记忆' : null),
+    refuseWrite: (ws, sid) => (sid === 'win-ro' && sid !== 'plugin-turn' ? '此窗口已停止写入记忆' : null),
+  })
+  // 直接构造 ToolRunContext 形状走真实工具的 execute：门在校验之前，读档命中时
+  // 不应看到「content 必填」这类后置报错。registerMemoryTools 从 lib 导入收集工具。
+  const mod = await import('./lib/index.js')
+  const registered = []
+  mod.registerMemoryTools((t) => registered.push(t), '.dsh-meow')
+  const byName = Object.fromEntries(registered.map((t) => [t.name, t]))
+  const exec = (sid) => ({ agent: { session: { header: { id: sid ?? 'win-normal', cwd: wsT } } } })
+  const searchErr = await byName.memory_search.execute({ query: 'x' }, exec('win-ro')).then(() => null, (e) => e)
+  check('toolgate: read refused on gated window', searchErr !== null && String(searchErr.message).includes('停止读入'))
+  const rememberErr = await byName.memory_remember.execute({ content: 'c', project: 'p', keywords: ['k'] }, exec('win-ro')).then(() => null, (e) => e)
+  check('toolgate: write refused on gated window', rememberErr !== null && String(rememberErr.message).includes('停止写入'))
+  const searchOk = await byName.memory_search.execute({ query: 'x' }, exec('win-normal')).then(() => true, (e) => (String(e.message).includes('停止') ? false : true))
+  check('toolgate: ungated window passes gate (search runs or unrelated error)', searchOk === true)
+  setMemoryToolGate(undefined)
+  const searchAfter = await byName.memory_search.execute({ query: 'x' }, exec('win-ro')).then(() => true, (e) => !String(e.message).includes('停止'))
+  check('toolgate: clearing gate restores pass', searchAfter === true)
+  dbT.close()
+  closeAllDbs() // 工具内部 getDb 的缓存连接一并关掉（Windows 文件锁）
+  rmSync(wsT, { recursive: true, force: true })
 }
 
 // ── dream v2 数据层：时间前缀 id / 新列 / status 检索语义 / windows ────────

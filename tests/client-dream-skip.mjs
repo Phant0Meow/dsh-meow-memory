@@ -1,7 +1,9 @@
 /**
- * client-dream-skip 纯逻辑测试：skipLabel（文案翻转）/ captureSessionIdFromTarget
- * （会话行操作区捕获 + fiber 读 id）/ retitleLeaf（克隆项文案叶子替换）。
- * 运行：node tests/client-dream-skip.mjs（构建后；内部 esbuild 打包源码保证与 src 同步）。
+ * client-dream-skip 纯逻辑测试（v0.30.0 三档门控 + 面板交互，issue #38/#28）：
+ * participationState / participationLabel（状态汇总与文案）/
+ * captureSessionIdFromTarget（会话行操作区捕获 + fiber 读 id）/
+ * retitleLeaf（克隆项文案叶子替换）/ injectSkipItem（启动项注入 + 面板打开回调）。
+ * 运行：node tests/client-dream-skip.mjs（内部 esbuild 打包源码保证与 src 同步）。
  */
 import { build } from 'esbuild'
 
@@ -15,7 +17,7 @@ const { outputFiles } = await build({
 })
 const code = new TextDecoder().decode(outputFiles[0].contents)
 const modUrl = 'data:text/javascript;base64,' + Buffer.from(code).toString('base64')
-const { skipLabel, captureSessionIdFromTarget, retitleLeaf, setMenuIcon, injectSkipItem, resolveMenuSessionId, SESSION_ROW_SEL, MENU_OPEN_ROW_SEL, SKIP_ITEM_ATTR, setUiLocaleForTest } = await import(modUrl)
+const { participationState, participationLabel, captureSessionIdFromTarget, retitleLeaf, injectSkipItem, resolveMenuSessionId, SESSION_ROW_SEL, MENU_OPEN_ROW_SEL, SKIP_ITEM_ATTR, setUiLocaleForTest } = await import(modUrl)
 
 let passed = 0
 let failed = 0
@@ -24,20 +26,28 @@ function check(name, cond, detail = '') {
   else { failed++; console.log(`FAIL  ${name} ${detail}`) }
 }
 
-// ── skipLabel（文案经 i18n 层：跟随 DSH 语言设置） ───────────────────────────
+// ── participationState（两开关 4 组合全部命名，无 custom） ──────────────────────
+const OFF = { dream: false, inject: false, write: false }
+check('state: TT → active(功能全开)', participationState(OFF) === 'active')
+check('state: FF → exited(只用工具)', participationState({ dream: true, inject: true, write: false }) === 'exited' &&
+  participationState({ dream: true, inject: true, write: true }) === 'exited')
+check('state: FT → writeonly(不自动注入)', participationState({ dream: false, inject: true, write: false }) === 'writeonly')
+check('state: TF → readonly(不自动整理)', participationState({ dream: true, inject: false, write: false }) === 'readonly')
+
+// ── participationLabel（主文案 + 状态后缀；三语；active 无后缀） ───────────────
 setUiLocaleForTest('zh')
-check('label unskipped', skipLabel(false) === '跳过梦境整理记忆')
-check('label skipped', skipLabel(true) === '取消跳过梦境整理记忆')
+check('label: zh 功能全开', participationLabel(OFF) === '记忆参与 · 功能全开')
+check('label: zh 只用工具', participationLabel({ dream: true, inject: true, write: true }) === '记忆参与 · 只用工具')
+check('label: zh 不自动注入', participationLabel({ dream: false, inject: true, write: true }) === '记忆参与 · 不自动注入')
+check('label: zh 不自动整理', participationLabel({ dream: true, inject: false, write: false }) === '记忆参与 · 不自动整理')
 setUiLocaleForTest('en')
-check('en label unskipped', skipLabel(false) === 'Skip dream memory consolidation')
-check('en label skipped', skipLabel(true) === 'Resume dream memory consolidation')
+check('label: en tools only', participationLabel({ dream: true, inject: true, write: true }) === 'Memory participation · Tools only')
+check('label: en no auto-injection', participationLabel({ dream: false, inject: true, write: true }) === 'Memory participation · No auto-injection')
 setUiLocaleForTest('pt-br')
-check('pt-br label unskipped', skipLabel(false) === 'Pular a consolidação de memória (dream)')
+check('label: pt-br só ferramentas', participationLabel({ dream: true, inject: true, write: true }) === 'Participação de memória · Só ferramentas')
 setUiLocaleForTest('zh')
 
-// ── captureSessionIdFromTarget ───────────────────────────────────────────────
-// fake 行：带 React fiber 属性 + return 链上第一个带 key 的 fiber（readSessionId 协议）。
-// closest(sel)：rowActions 查询返回操作区桩，sessionRow 查询返回行自身。
+// ── captureSessionIdFromTarget（与 v0.18.0 协议一致） ────────────────────────
 function fakeRow(fiberKey) {
   const row = {}
   if (fiberKey !== null) row['__reactFiber$abc123'] = { return: { key: fiberKey } }
@@ -60,118 +70,94 @@ check('capture null for non-element target', captureSessionIdFromTarget(null) ==
   captureSessionIdFromTarget('text') === null)
 check('capture null when row has no fiber', captureSessionIdFromTarget(fakeTarget({ rowFiber: null })) === null)
 
-// ── retitleLeaf ──────────────────────────────────────────────────────────────
-// 节点桩：叶子（无 children）有固定文本；父节点文本=子节点拼接；set 写 _text 优先返回。
-function node(children, text) {
-  return {
-    children: children ?? [],
-    _text: undefined,
-    get textContent() {
-      if (this._text !== undefined) return this._text
-      if (this.children.length === 0) return text ?? ''
-      return this.children.map((c) => c.textContent).join('')
-    },
-    set textContent(v) { this._text = v },
-  }
+// ── retitleLeaf ───────────────────────────────────────────────────────────────
+{
+  const menuItem = { children: [{ children: [], textContent: 'old' }], textContent: 'old' }
+  check('retitle replaces last non-empty leaf', retitleLeaf(menuItem, '记忆参与 · 已退出') === true &&
+    menuItem.children[0].textContent === '记忆参与 · 已退出')
+  const empty = { children: [{ children: [], textContent: '  ' }], textContent: '' }
+  check('retitle returns false when no leaf has text', retitleLeaf(empty, 'x') === false)
 }
-const iconLeaf = node(null, '')
-const labelLeaf = node(null, '重命名')
-const menuItem = node([iconLeaf, labelLeaf])
-check('retitle replaces last non-empty leaf', retitleLeaf(menuItem, '跳过梦境整理记忆') === true &&
-  labelLeaf.textContent === '跳过梦境整理记忆' && iconLeaf.textContent === '')
-check('retitle returns false when no leaf has text', (() => {
-  const empty1 = node(null, '')
-  const blank2 = node(null, '   ')
-  return retitleLeaf(node([empty1, blank2]), 'x') === false && blank2.textContent === '   '
-})())
 
-// ── 选择器语义（2026-08-26 根因回归）─────────────────────────────────────────
-// 行类按 clsx 顺序拼接（sessionRow, selected, menuOpen…），`[class$=]` 对整个
-// class 属性串做结尾匹配——选中行/菜单打开行必然失配，导致注入时灵时不灵。
+// ── selectors（issue #8 回归） ────────────────────────────────────────────────
 check('session row selector uses substring match (not end match)', SESSION_ROW_SEL.includes('[class*="_sessionRow"]') && !SESSION_ROW_SEL.includes('class$='))
 check('menuOpen row selector uses substring match', MENU_OPEN_ROW_SEL.includes('[class*="_menuOpen"]'))
-// issue #8 回归：工作区行（projectRow）同样是 role="treeitem" 且共用 _menuOpen
-// 类——menuOpen 锚点必须叠加 _sessionRow 约束，否则工作区菜单被误当会话菜单。
 check('menuOpen anchor is constrained to session rows (issue #8)', MENU_OPEN_ROW_SEL.includes('[class*="_sessionRow"]'))
 
-// ── resolveMenuSessionId：menuOpen 行优先；无 menuOpen 会话行一律不注入 ──────
-function fakeDoc(openRow) {
-  return { querySelector: (sel) => (sel === MENU_OPEN_ROW_SEL ? openRow : null) }
-}
-const fiberRow = { '__reactFiber$abc': { key: 'sess-open', return: null } }
-check('resolve: menuOpen row wins with its fiber key', resolveMenuSessionId(fakeDoc(fiberRow), 'fallback') === 'sess-open')
-// issue #8 回归：工作区菜单开着 = 页面上没有 menuOpen 的会话行。即便 1.5s 窗口内
-// 刚点过某个会话的 …（captured 有值），也绝不能把该会话 id 注进工作区菜单。
+// ── resolveMenuSessionId ──────────────────────────────────────────────────────
+function fiberRow(key) { return { __reactFiber$xyz: { return: { key } } } }
+function fakeDoc(row) { return { querySelector: () => row } }
+check('resolve: menuOpen row wins with its fiber key', resolveMenuSessionId(fakeDoc(fiberRow('sess-open')), 'fallback') === 'sess-open')
 check('resolve: workspace menu open (no session menuOpen row) → null even with captured sid',
   resolveMenuSessionId(fakeDoc(null), 'captured') === null)
 check('resolve: null when neither anchor available', resolveMenuSessionId(fakeDoc(null), null) === null)
 check('resolve: unreadable menuOpen row falls back to captured sid', resolveMenuSessionId(fakeDoc({}), 'captured') === 'captured')
 
-// ── setMenuIcon（v0.18.0 用户实测纠正）：图标画「点击后将变成的状态」──────────
-// 未跳过（当前=false）→ 标签「跳过…」→ 配斜杠月牙（点下去静音）；
-// 已跳过（当前=true）→ 标签「取消跳过…」→ 配实心月牙（点下去恢复）。
-function fakeItemWithSvg() {
-  const svg = { outerHTML: 'old' }
-  return {
-    svg,
-    querySelector(sel) { return sel === 'svg' ? svg : null },
-  }
-}
-const itemUnskipped = fakeItemWithSvg()
-setMenuIcon(itemUnskipped, false)
-check('menu icon: unskipped row gets slash moon (target state)', itemUnskipped.svg.outerHTML.includes('<mask'))
-const itemSkipped = fakeItemWithSvg()
-setMenuIcon(itemSkipped, true)
-check('menu icon: skipped row gets plain moon (target state)', itemSkipped.svg.outerHTML.includes('<path') && !itemSkipped.svg.outerHTML.includes('<mask'))
-const itemNoSvg = { querySelector: () => null }
-check('menu icon: no svg template stays text-only', (() => { setMenuIcon(itemNoSvg, false); return true })())
-
-// ── injectSkipItem：幂等 + 容器复用防串味 ────────────────────────────────────
-// 菜单项模板桩：node() 提供文本叶子协议；克隆体同构（简化 cloneNode）。
-function fakeMenuItem(labelText) {
-  const iconLeaf = node(null, '')
-  const labelLeaf = node(null, labelText)
-  const btn = Object.assign(node([iconLeaf, labelLeaf]), {
-    attrs: {},
-    setAttribute(k, v) { this.attrs[k] = String(v) },
-    getAttribute(k) { return this.attrs[k] ?? null },
-    removeAttribute() {},
-    remove() { this.removed = true },
-    addEventListener() {},
-    querySelector() { return null },
-    querySelectorAll() { return [] },
-    cloneNode() { return fakeMenuItem(labelText) }, // 克隆体同构
-  })
-  btn.labelLeaf = labelLeaf
-  return btn
-}
-function fakeMenu(existingItems) {
-  const template = fakeMenuItem('重命名')
+// ── injectSkipItem：注入 + 打开面板回调（v0.30.0：点击不再直接翻转） ───────────
+function fakeMenu() {
   const appended = []
+  const template = asElement() // cloneNode 等 injectSkipItem 依赖面由元素桩提供
   return {
-    template,
     appended,
-    existingItems,
-    querySelector(sel) { return sel === '[role="menuitem"]' ? template : null },
-    querySelectorAll(sel) { return sel.includes(SKIP_ITEM_ATTR) ? existingItems : [] },
-    appendChild(el) { appended.push(el) },
+    querySelector: (sel) => (sel === '[role="menuitem"]' ? template : null),
+    querySelectorAll: (sel) => (sel.includes('data-meow-skip-item') ? [...appended] : []),
+    appendChild: (el) => appended.push(el),
   }
 }
-const noopHost = { onToggle() {} }
-// 同会话已注入 → 幂等放弃
-const itemA = fakeMenuItem('旧')
-itemA.setAttribute(SKIP_ITEM_ATTR, 'true')
-itemA.setAttribute('data-meow-session-id', 'A')
-const menuSameSid = fakeMenu([itemA])
-check('inject idempotent: same-sid item present → no-op', injectSkipItem(menuSameSid, 'A', noopHost) === null && menuSameSid.appended.length === 0 && itemA.removed !== true)
-// 别会话残留 → 拆掉重注（portal 容器复用串味防护）
-const menuStale = fakeMenu([itemA])
-const injected = injectSkipItem(menuStale, 'B', noopHost)
-check('inject stale: foreign-sid item removed and fresh one bound to B', itemA.removed === true && menuStale.appended.length === 1 && injected.getAttribute('data-meow-session-id') === 'B')
-check('inject fresh item carries skip attr + default label', injected.attrs[SKIP_ITEM_ATTR] === 'true' && injected.labelLeaf.textContent === '跳过梦境整理记忆')
-// 空菜单正常注入
-const menuEmpty = fakeMenu([])
-check('inject empty menu appends one item', injectSkipItem(menuEmpty, 'C', noopHost) !== null && menuEmpty.appended.length === 1)
+/** injectSkipItem 依赖面的最小元素桩（cloneNode/querySelector/attrs/listeners…）。 */
+function asElement() {
+  const listeners = {}
+  const el = {
+    removed: false,
+    attrs: {},
+    children: [{ children: [], textContent: 'native item' }],
+    listeners,
+    cloneNode() { return asElement() },
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    setAttribute(k, v) { el.attrs[k] = v },
+    getAttribute(k) { return el.attrs[k] ?? null },
+    removeAttribute() {},
+    remove() { el.removed = true },
+    addEventListener(type, fn) { (listeners[type] ??= []).push(fn) },
+    removeEventListener() {},
+    appendChild() {},
+    append() {},
+    closest: () => null,
+    style: {},
+  }
+  return el
+}
+
+{
+  const menu = fakeMenu()
+  const opened = []
+  const item = injectSkipItem(menu, 'A', { onOpen: (sid) => opened.push(sid) })
+  check('inject: item appended with attr + bound sid', item !== null && item.attrs[SKIP_ITEM_ATTR] === 'true' && item.attrs['data-meow-session-id'] === 'A')
+  check('inject: label carries active state (named)', item.children[0].textContent === '记忆参与 · 功能全开')
+  const click = (item.listeners.click ?? [])[0]
+  check('inject: click handler registered (capture)', typeof click === 'function')
+  click({ stopPropagation() {}, preventDefault() {} })
+  check('inject: click opens panel (not direct toggle)', opened.length === 1 && opened[0] === 'A')
+}
+{
+  // 幂等/串味回归（与 v0.18.0 同协议）
+  const menuSameSid = fakeMenu()
+  const first = injectSkipItem(menuSameSid, 'A', { onOpen: () => {} })
+  const second = injectSkipItem(menuSameSid, 'A', { onOpen: () => {} })
+  check('inject idempotent: same-sid item present → no-op', second === null && menuSameSid.appended.length === 1 && first.removed !== true)
+
+  const menuStale = fakeMenu()
+  const stale = asElement()
+  stale.attrs[SKIP_ITEM_ATTR] = 'true'
+  stale.attrs['data-meow-session-id'] = 'A'
+  menuStale.querySelectorAll = (sel) => (sel === `[${SKIP_ITEM_ATTR}]` ? [stale] : [])
+  const fresh = injectSkipItem(menuStale, 'B', { onOpen: () => {} })
+  check('inject stale: foreign-sid item removed and fresh one bound to B', stale.removed === true && menuStale.appended.length === 1 && fresh.attrs['data-meow-session-id'] === 'B')
+
+  const menuEmpty = { querySelector: () => null, querySelectorAll: () => [], appendChild: () => {} }
+  check('inject: template-less menu returns null (retry later)', injectSkipItem(menuEmpty, 'C', { onOpen: () => {} }) === null)
+}
 
 console.log(`\n${passed} passed, ${failed} failed`)
-process.exit(failed > 0 ? 1 : 0)
+process.exit(failed === 0 ? 0 : 1)

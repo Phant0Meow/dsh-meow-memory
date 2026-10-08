@@ -40,8 +40,15 @@ export const ptBr: Record<UiKey, string> = {
   'notice.dream.interrupted': '▸ Tarefa de consolidação ociosa de memória interrompida; nova tentativa automática em breve.',
 
   // ── menu da sessão ────────────────────────────────────────────────────────
-  'menu.skipDream': 'Pular a consolidação de memória (dream)',
-  'menu.unskipDream': 'Voltar a fazer a consolidação de memória (dream)',
+  'part.menu': 'Participação de memória',
+  'part.state.active': 'Tudo ativo',
+  'part.state.writeonly': 'Sem injeção automática',
+  'part.state.readonly': 'Sem consolidação automática',
+  'part.state.exited': 'Só ferramentas',
+  'part.panel.inject': 'Injeção automática (primeiro turno, por turno, pós-compactação)',
+  'part.panel.consolidate': 'Consolidação automática (reflect + dream)',
+  'part.panel.on': 'Ativa',
+  'part.panel.off': 'Inativa',
 
   // ── aba de configurações ──────────────────────────────────────────────────
   'settings.title': 'Meow memory',

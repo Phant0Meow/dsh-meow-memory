@@ -44,6 +44,9 @@ export const CONFIG_DEFAULTS = {
   /** 记忆库自动备份（#37 增量②，默认关）：开启后每次 dream 收尾把 memory.db
    *  快照轮转到 memory.db.bak（VACUUM INTO 一致性备份）。 */
   backup: { enabled: false },
+  /** 工作区停用名单（#28）：列出的工作区（cwd 归一匹配）完全停用记忆——读/整理/写
+   *  全部拒绝（含手动 /dream）。用于一次性任务的工作区，避免污染记忆库。 */
+  disabledWorkspaces: [],
 }
 
 /** 字段形状（settings-page 的 FieldSpec 子集：sub 缺省=顶层标量，给定=dream/delegate 子键）。 */

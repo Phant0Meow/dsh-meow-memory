@@ -1,6 +1,6 @@
 /**
  * client-i18n 测试：界面文案层（字典完整性 + 语言解析 + DSH locale 服务接线 +
- * foldLabel / skipLabel / delegateNoticeLabelFor / formatInjectionClock 的多语言输出）。
+ * foldLabel / participationLabel / delegateNoticeLabelFor / formatInjectionClock 的多语言输出）。
  *
  * 运行：node tests/client-i18n.mjs（内部 esbuild 现场打包源码，保证与 src 同步）。
  */
@@ -70,19 +70,19 @@ check('命名空间 = meow-memory', NS === 'meow-memory')
 // ── 2. 无 DSH 服务时的静态查表（降级路径） ───────────────────────────────────
 console.log('=== 2. 静态查表（老宿主降级） ===')
 setUiLocaleForTest('zh')
-check('zh 取中文', t('menu.skipDream') === '跳过梦境整理记忆')
+check('zh 取中文', t('part.menu') === '记忆参与')
 check('zh 占位符填充', t('fold.status.remembered', { title: '记忆反思', n: 3 }) === '记忆反思 · 新增记忆 3 条')
 setUiLocaleForTest('en')
-check('en 取英文', t('menu.skipDream') === 'Skip dream memory consolidation')
+check('en 取英文', t('part.menu') === 'Memory participation')
 check('en 占位符填充', t('fold.status.remembered', { title: 'Memory reflection', n: 3 }) === 'Memory reflection · 3 memories added')
 check('en 日期模板', t('datetime.ymd', { m: 1, d: 2 }) === '1/2')
 setUiLocaleForTest('pt-br')
-check('pt-br 取葡语', t('menu.skipDream') === 'Pular a consolidação de memória (dream)')
+check('pt-br 取葡语', t('part.menu') === 'Participação de memória')
 check('pt-br 占位符填充', t('fold.status.remembered', { title: 'Reflexão de memória', n: 2 }) === 'Reflexão de memória · 2 memórias adicionadas')
 check('pt-br 日期模板（日在前）', t('datetime.ymd', { m: 9, d: 16 }) === '16/9')
 // 未登记的语言（服务给了我们没见过的标签）→ 主标签，仍不匹配落 en。
 setUiLocaleForTest('ja')
-check('未登记语言落 en', t('menu.skipDream') === 'Skip dream memory consolidation')
+check('未登记语言落 en', t('part.menu') === 'Memory participation')
 setUiLocaleForTest('zh')
 
 // ── 3. 语言变化订阅（设置页 / DOM 重放的接点） ────────────────────────────────
@@ -166,10 +166,10 @@ check('注册三语字典', service.calls.register.length === 3 && service.calls
 check('返回已注册语言列表', installed.join(',') === 'zh,en,pt-br', installed.join(','))
 check('无告警', warnings.length === 0, warnings.join(' | '))
 check('active 跟随服务（en）', getUiLocale() === 'en')
-check('服务语言取英文', t('menu.skipDream') === 'Skip dream memory consolidation')
+check('服务语言取英文', t('part.menu') === 'Memory participation')
 
 service.setLocale('pt-br')
-check('切到 pt-br 后取葡语', t('menu.skipDream') === 'Pular a consolidação de memória (dream)')
+check('切到 pt-br 后取葡语', t('part.menu') === 'Participação de memória')
 check('切语言触发订阅（UI 重放）', getUiLocale() === 'pt-br')
 
 // 缺键时走服务自己的 fallback 链（pt-br → en）：安装后把某语言的字典换薄，验证
@@ -178,10 +178,10 @@ const thinService = makeFakeService()
 const thin = await bundleSrc('src/i18n/index.ts')
 thin.installI18n({ get: () => thinService })
 thinService.setLocale('pt-br')
-thinService.thinDict('meow-memory', 'pt-br', { 'menu.skipDream': 'SÓ PT-BR' })
-check('服务字典有键时取服务值', thin.t('menu.skipDream') === 'SÓ PT-BR')
+thinService.thinDict('meow-memory', 'pt-br', { 'part.menu': 'SÓ PT-BR' })
+check('服务字典有键时取服务值', thin.t('part.menu') === 'SÓ PT-BR')
 thinService.thinDict('meow-memory', 'pt-br', {})
-check('服务字典缺键落 en（fallback 链）', thin.t('menu.skipDream') === 'Skip dream memory consolidation')
+check('服务字典缺键落 en（fallback 链）', thin.t('part.menu') === 'Memory participation')
 
 // 重复 install 幂等：不再重复 addLanguage/register。
 const before = { add: service.calls.addLanguage.length, reg: service.calls.register.length }
@@ -197,7 +197,7 @@ const legacyInstalled = legacy.installI18n({ get: () => undefined }, (m) => lega
 check('无服务不抛错且返回空列表', Array.isArray(legacyInstalled) && legacyInstalled.length === 0)
 check('无服务无告警', legacyWarnings.length === 0, legacyWarnings.join(' | '))
 legacy.setUiLocaleForTest('pt-br')
-check('无服务仍能取葡语（静态查表）', legacy.t('menu.skipDream') === 'Pular a consolidação de memória (dream)')
+check('无服务仍能取葡语（静态查表）', legacy.t('part.menu') === 'Participação de memória')
 
 // 服务 addLanguage 抛错（语言已被别的包占用）：只告警，字典照常注册。
 const brokenService = makeFakeService()
@@ -211,7 +211,7 @@ check('语言占用只告警', brokenWarnings.length === 1 && brokenWarnings[0].
 check('语言占用仍注册字典', brokenService.calls.register.length === 3, JSON.stringify(brokenService.calls.register.map((c) => c.locale)))
 
 // ── 5. 各模块的多语言输出 ───────────────────────────────────────────────────
-console.log('=== 5. 模块文案（foldLabel / skipLabel / notice / clock） ===')
+console.log('=== 5. 模块文案（foldLabel / participationLabel / notice / clock） ===')
 const fold = await bundleSrc('src/client-fold.ts')
 const skip = await bundleSrc('src/client-dream-skip.ts')
 const notice = await bundleSrc('src/client-delegate-notice.ts')
@@ -240,11 +240,11 @@ check('pt-br 时钟 今年', fold.formatInjectionClock(earlier, now) === '2/1 08
 check('pt-br 时钟 跨年', fold.formatInjectionClock(crossYear, now) === '31/12/2025 23:59')
 
 skip.setUiLocaleForTest('zh')
-check('zh 菜单文案', skip.skipLabel(false) === '跳过梦境整理记忆' && skip.skipLabel(true) === '取消跳过梦境整理记忆')
+check('zh 菜单文案（四态全命名）', skip.participationLabel({ dream: false, inject: false, write: false }) === '记忆参与 · 功能全开' && skip.participationLabel({ dream: true, inject: true, write: true }) === '记忆参与 · 只用工具')
 skip.setUiLocaleForTest('en')
-check('en 菜单文案', skip.skipLabel(false) === 'Skip dream memory consolidation' && skip.skipLabel(true) === 'Resume dream memory consolidation')
+check('en 菜单文案（不自动注入）', skip.participationLabel({ dream: false, inject: true, write: false }) === 'Memory participation · No auto-injection')
 skip.setUiLocaleForTest('pt-br')
-check('pt-br 菜单文案', skip.skipLabel(false) === 'Pular a consolidação de memória (dream)')
+check('pt-br 菜单文案（功能全开）', skip.participationLabel({ dream: false, inject: false, write: false }) === 'Participação de memória · Tudo ativo')
 
 notice.setUiLocaleForTest('zh')
 check('zh 气泡文案', notice.delegateNoticeLabelFor('dream', false) === '▸ 梦境记忆整理任务已完成。')

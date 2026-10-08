@@ -33,8 +33,16 @@ export const UI_KEYS = [
   'notice.dream.done',
   'notice.dream.interrupted',
   // session menu
-  'menu.skipDream',
-  'menu.unskipDream',
+  // memory participation gate (issue #38/#28): per-window two-gate panel
+  'part.menu',
+  'part.state.active',
+  'part.state.writeonly',
+  'part.state.readonly',
+  'part.state.exited',
+  'part.panel.inject',
+  'part.panel.consolidate',
+  'part.panel.on',
+  'part.panel.off',
   // settings tab
   'settings.title',
   'settings.summary',

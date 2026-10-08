@@ -35,7 +35,8 @@ import { subscribeDreamEvents } from './client-dream-events.ts'
 export const DREAM_ICON_ATTR = 'data-meow-dreamed'
 /** 呼吸灯月牙标记（dream 进行中）。 */
 export const DREAMING_ATTR = 'data-meow-dreaming'
-/** 灰调「月牙+斜杠」标记（已跳过梦境整理，v0.18.0）。 */
+/** 灰调「月牙+斜杠」标记（自动整理已关——反思与梦境都不跑，用户拍板 2026-10-07：
+ *  划线月 ⟺ 跳过整理，其余状态一律正常月亮）。 */
 export const SKIPPED_ATTR = 'data-meow-skip-dream'
 
 /** 图标三态：dreamed（淡黄月牙）/ dreaming（呼吸灯）/ skipped（月牙+斜杠）。 */
@@ -137,7 +138,7 @@ function attrForState(state: DreamIconState | undefined): string | null {
   return null
 }
 
-/** 图标三属性选择器（查询已有图标用）。 */
+/** 图标属性选择器（查询已有图标用）。 */
 const ANY_ICON_SEL = `[${DREAM_ICON_ATTR}], [${DREAMING_ATTR}], [${SKIPPED_ATTR}]`
 
 /** 会话行默认扫描选择器。必须子串匹配：行类按 clsx 顺序拼接（sessionRow,
@@ -145,9 +146,9 @@ const ANY_ICON_SEL = `[${DREAM_ICON_ATTR}], [${DREAMING_ATTR}], [${SKIPPED_ATTR}
 export const SESSION_ROWS_SEL = 'div[role="treeitem"][class*="_sessionRow"]'
 
 /**
- * 合并 dream 状态与跳过集合为展示态（纯函数，便于测试）：
+ * 合并 dream 状态与整理门控为展示态（纯函数，便于测试）：
  * dreaming > skipped > dreamed——进行中的 dream 不被打断，呼吸灯最优先；
- * 跳过压过已整理月牙；两者皆无 → undefined（移除图标）。
+ * 跳过整理（划线月）压过已整理月牙；皆无 → undefined（移除图标）。
  */
 export function mergeIconStates(
   dreamStates: ReadonlyMap<string, 'dreamed' | 'dreaming'>,
@@ -226,9 +227,15 @@ export function startDreamIconManager(): () => void {
     try {
       const response = await fetch('/meow-memory/skip-dreams', { cache: 'no-store' })
       if (!response.ok) return
-      const data = await response.json() as { sessionIds?: unknown }
+      const data = await response.json() as { sessionIds?: unknown; scopes?: unknown }
       skippedIds.clear()
-      if (Array.isArray(data.sessionIds)) {
+      if (Array.isArray(data.scopes)) {
+        // v0.30.0 门控明细：图标只关心整理档（用户拍板：划线月 ⟺ 跳过整理）
+        for (const sc of data.scopes as Array<{ sessionId?: unknown; dream?: unknown }>) {
+          if (typeof sc.sessionId !== 'string') continue
+          if (sc.dream === true) skippedIds.add(sc.sessionId)
+        }
+      } else if (Array.isArray(data.sessionIds)) {
         for (const id of data.sessionIds) {
           if (typeof id === 'string') skippedIds.add(id)
         }
@@ -266,6 +273,7 @@ export function startDreamIconManager(): () => void {
   // 修复，见 client-dream-events.ts 头注）。事件语义与旧 SSE 'dream' 帧一致。
   const unsubscribeDreamEvents = subscribeDreamEvents((event) => {
     const { sessionId, state } = event
+    if (state === 'scope') return // 门控明细与图标无关（整理档变化经旧 skip/unskip 到达）
     if (state === 'dreamed' || state === 'dreaming') dreamStates.set(sessionId, state)
     else if (state === 'skip') skippedIds.add(sessionId)
     else if (state === 'unskip') skippedIds.delete(sessionId)
