@@ -44,6 +44,8 @@ export const UI_KEYS = [
   'part.panel.read',
   'part.panel.consolidate',
   'part.panel.write',
+  'part.panel.on',
+  'part.panel.off',
   'part.panel.presets',
   'part.preset.full',
   'part.preset.readonly',

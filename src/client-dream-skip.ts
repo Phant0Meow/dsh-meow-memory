@@ -232,7 +232,7 @@ function buildScopePanel(sid: string, post: (field: keyof MemoryScope, value: bo
   panel.setAttribute('data-meow-scope-panel', 'true')
   panel.style.cssText =
     'position:fixed;z-index:2147483647;background:#0f172a;color:#e2e8f0;border:1px solid #334155;' +
-    'border-radius:8px;padding:8px 8px 6px;font-size:12px;line-height:1.6;min-width:236px;' +
+    'border-radius:8px;padding:8px 8px 6px;font-size:12px;line-height:1.6;min-width:276px;' +
     'box-shadow:0 8px 24px rgba(0,0,0,0.45);font-family:inherit;'
 
   const rerender = (): void => renderRows(sid)
@@ -272,6 +272,7 @@ function buildScopePanel(sid: string, post: (field: keyof MemoryScope, value: bo
     const label = document.createElement('span')
     label.textContent = t(key)
     const state = document.createElement('span')
+    state.style.cssText = 'white-space:nowrap;'
     row.append(label, state)
     panel.appendChild(row)
     rowEls.push({ el: row, field, state })
@@ -319,8 +320,9 @@ function buildScopePanel(sid: string, post: (field: keyof MemoryScope, value: bo
     const cur = readScope(sid2)
     for (const { field, state } of rowEls) {
       const on = cur[field]
-      state.textContent = on ? '✓' : '—'
-      state.style.cssText = on ? 'color:#7dd3fc;font-weight:600;' : 'opacity:0.45;'
+      // 状态列直陈「打开/关闭」：打开=该行能力在参与（非门控），关闭=已停用。
+      state.textContent = on ? t('part.panel.off') : t('part.panel.on')
+      state.style.cssText = on ? 'opacity:0.55;' : 'color:#93c5fd;'
     }
   }
   renderRows(sid)
