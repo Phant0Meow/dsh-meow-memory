@@ -1,7 +1,8 @@
 /**
  * meow-memory — 反思轮折叠：纯计算逻辑（与 DOM 无关，可单测）。
  *
- * 识别：会话快照 chat 节点里 kind='context' 且 source 由本插件生产
+ * 识别：会话快照 chat 节点里 kind='context'（或被改标成 'turn-trigger' 的同一条，
+ * 见 isMemoryPrompt 注释）且 source 由本插件生产
  * （{ kind: 'plugin:meow-memory' }；旧会话为 { kind: 'plugin', plugin: 'meow-memory' }）
  * 的节点 = 反思/dream 轮 prompt
  * （steer/followup 注入的 user/message 事件，非 append 改写，渲染为 context 行）。
@@ -98,9 +99,14 @@ function contextText(node: ChatNode): string {
   return blocksToText((node.data as ContextLike).content ?? [])
 }
 
-/** 判定节点是否 meow-memory 注入的反思/dream prompt。 */
+/** 判定节点是否 meow-memory 注入的反思/dream prompt。
+ *  宿主 dsh-client-ui-chat 的 messageDefinition：context 节点若被本轮领取/唤醒
+ *  （waking = nextTurn claim 或 idleSteer），buildViewNode 会改标成 'turn-trigger'
+ *  （界面即「收到执行请求」chip）。反思/dream prompt 正是靠 followup 触发新一轮的
+ *  那条消息，实测走这条路径 —— 只认 'context' 时折叠锚点永远找不到、横条不出现
+ *  （2026-10-08 本机复现）。'context' 仍保留：共享轮（宿主回退 steer、未领取）是原形状。 */
 function isMemoryPrompt(node: ChatNode): boolean {
-  if (node.kind !== 'context') return false
+  if (node.kind !== 'context' && node.kind !== 'turn-trigger') return false
   const source = (node.data as ContextLike).source
   if (!isMeowSource(source)) return false
   const text = contextText(node)
