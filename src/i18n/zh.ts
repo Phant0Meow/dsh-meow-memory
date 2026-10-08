@@ -39,21 +39,14 @@ export const zh: Record<UiKey, string> = {
 
   // ── 会话菜单 ──────────────────────────────────────────────────────────────
   'part.menu': '记忆参与',
-  'part.state.active': '参与中',
-  'part.state.readonly': '免打扰',
-  'part.state.exited': '已退出',
-  'part.state.noConsolidation': '跳过整理',
-  'part.state.noWrite': '停止写入',
-  'part.state.custom': '自定义',
-  'part.panel.read': '回忆（自动注入、读记忆工具）',
+  'part.state.active': '功能全开',
+  'part.state.writeonly': '不自动注入',
+  'part.state.readonly': '不自动整理',
+  'part.state.exited': '只用工具',
+  'part.panel.inject': '自动注入（首轮、每轮、压缩后重注入）',
   'part.panel.consolidate': '自动整理（反思、梦境）',
-  'part.panel.write': '主动写入（写记忆工具）',
   'part.panel.on': '打开',
   'part.panel.off': '关闭',
-  'part.panel.presets': '预设',
-  'part.preset.full': '参与',
-  'part.preset.readonly': '免打扰',
-  'part.preset.exit': '退出',
 
   // ── 设置页 ────────────────────────────────────────────────────────────────
   'settings.title': '喵记忆',

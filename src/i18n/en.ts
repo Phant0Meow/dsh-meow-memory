@@ -50,21 +50,14 @@ export const en: Record<UiKey, string> = {
 
   // ── session menu ──────────────────────────────────────────────────────────
   'part.menu': 'Memory participation',
-  'part.state.active': 'Active',
-  'part.state.readonly': 'Do not disturb',
-  'part.state.exited': 'Exited',
-  'part.state.noConsolidation': 'Consolidation off',
-  'part.state.noWrite': 'Writes off',
-  'part.state.custom': 'Custom',
-  'part.panel.read': 'Recall (auto-inject + read tools)',
+  'part.state.active': 'All on',
+  'part.state.writeonly': 'No auto-injection',
+  'part.state.readonly': 'No auto-consolidation',
+  'part.state.exited': 'Tools only',
+  'part.panel.inject': 'Auto injection (first-turn, per-turn, post-compaction)',
   'part.panel.consolidate': 'Auto consolidation (reflect + dream)',
-  'part.panel.write': 'Active writes (write tools)',
   'part.panel.on': 'On',
   'part.panel.off': 'Off',
-  'part.panel.presets': 'Presets',
-  'part.preset.full': 'Full',
-  'part.preset.readonly': 'Quiet',
-  'part.preset.exit': 'Exit',
 
   // ── settings tab ──────────────────────────────────────────────────────────
   'settings.title': 'Meow memory',

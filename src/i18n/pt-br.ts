@@ -41,21 +41,14 @@ export const ptBr: Record<UiKey, string> = {
 
   // ── menu da sessão ────────────────────────────────────────────────────────
   'part.menu': 'Participação de memória',
-  'part.state.active': 'Ativa',
-  'part.state.readonly': 'Não perturbe',
-  'part.state.exited': 'Encerrada',
-  'part.state.noConsolidation': 'Consolidação desligada',
-  'part.state.noWrite': 'Escrita desligada',
-  'part.state.custom': 'Personalizado',
-  'part.panel.read': 'Lembrete (injeção + ferramentas de leitura)',
+  'part.state.active': 'Tudo ativo',
+  'part.state.writeonly': 'Sem injeção automática',
+  'part.state.readonly': 'Sem consolidação automática',
+  'part.state.exited': 'Só ferramentas',
+  'part.panel.inject': 'Injeção automática (primeiro turno, por turno, pós-compactação)',
   'part.panel.consolidate': 'Consolidação automática (reflect + dream)',
-  'part.panel.write': 'Escrita ativa (ferramentas de escrita)',
   'part.panel.on': 'Ativa',
   'part.panel.off': 'Inativa',
-  'part.panel.presets': 'Predefinições',
-  'part.preset.full': 'Total',
-  'part.preset.readonly': 'Silencioso',
-  'part.preset.exit': 'Sair',
 
   // ── aba de configurações ──────────────────────────────────────────────────
   'settings.title': 'Meow memory',

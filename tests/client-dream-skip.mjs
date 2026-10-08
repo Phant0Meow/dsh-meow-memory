@@ -26,25 +26,25 @@ function check(name, cond, detail = '') {
   else { failed++; console.log(`FAIL  ${name} ${detail}`) }
 }
 
-// ── participationState（三档组合 → 状态名；预设给专名，混合给 custom） ──────────
+// ── participationState（两开关 4 组合全部命名，无 custom） ──────────────────────
 const OFF = { dream: false, inject: false, write: false }
-check('state: all off → active', participationState(OFF) === 'active')
-check('state: all on → exited', participationState({ dream: true, inject: true, write: true }) === 'exited')
-check('state: inject only → readonly', participationState({ dream: false, inject: true, write: false }) === 'readonly')
-check('state: dream only → noConsolidation', participationState({ dream: true, inject: false, write: false }) === 'noConsolidation')
-check('state: write only → noWrite', participationState({ dream: false, inject: false, write: true }) === 'noWrite')
-check('state: mixed → custom', participationState({ dream: true, inject: true, write: false }) === 'custom' &&
-  participationState({ dream: false, inject: true, write: true }) === 'custom')
+check('state: TT → active(功能全开)', participationState(OFF) === 'active')
+check('state: FF → exited(只用工具)', participationState({ dream: true, inject: true, write: false }) === 'exited' &&
+  participationState({ dream: true, inject: true, write: true }) === 'exited')
+check('state: FT → writeonly(不自动注入)', participationState({ dream: false, inject: true, write: false }) === 'writeonly')
+check('state: TF → readonly(不自动整理)', participationState({ dream: true, inject: false, write: false }) === 'readonly')
 
 // ── participationLabel（主文案 + 状态后缀；三语；active 无后缀） ───────────────
 setUiLocaleForTest('zh')
-check('label: zh active = main only', participationLabel(OFF) === '记忆参与')
-check('label: zh exited suffix', participationLabel({ dream: true, inject: true, write: true }) === '记忆参与 · 已退出')
+check('label: zh 功能全开', participationLabel(OFF) === '记忆参与 · 功能全开')
+check('label: zh 只用工具', participationLabel({ dream: true, inject: true, write: true }) === '记忆参与 · 只用工具')
+check('label: zh 不自动注入', participationLabel({ dream: false, inject: true, write: true }) === '记忆参与 · 不自动注入')
+check('label: zh 不自动整理', participationLabel({ dream: true, inject: false, write: false }) === '记忆参与 · 不自动整理')
 setUiLocaleForTest('en')
-check('label: en readonly suffix', participationLabel({ dream: false, inject: true, write: false }) === 'Memory participation · Do not disturb')
-check('label: en noWrite suffix', participationLabel({ dream: false, inject: false, write: true }) === 'Memory participation · Writes off')
+check('label: en tools only', participationLabel({ dream: true, inject: true, write: true }) === 'Memory participation · Tools only')
+check('label: en no auto-injection', participationLabel({ dream: false, inject: true, write: true }) === 'Memory participation · No auto-injection')
 setUiLocaleForTest('pt-br')
-check('label: pt-br exited suffix', participationLabel({ dream: true, inject: true, write: true }) === 'Participação de memória · Encerrada')
+check('label: pt-br só ferramentas', participationLabel({ dream: true, inject: true, write: true }) === 'Participação de memória · Só ferramentas')
 setUiLocaleForTest('zh')
 
 // ── captureSessionIdFromTarget（与 v0.18.0 协议一致） ────────────────────────
@@ -134,7 +134,7 @@ function asElement() {
   const opened = []
   const item = injectSkipItem(menu, 'A', { onOpen: (sid) => opened.push(sid) })
   check('inject: item appended with attr + bound sid', item !== null && item.attrs[SKIP_ITEM_ATTR] === 'true' && item.attrs['data-meow-session-id'] === 'A')
-  check('inject: label carries active state (no suffix)', item.children[0].textContent === '记忆参与')
+  check('inject: label carries active state (named)', item.children[0].textContent === '记忆参与 · 功能全开')
   const click = (item.listeners.click ?? [])[0]
   check('inject: click handler registered (capture)', typeof click === 'function')
   click({ stopPropagation() {}, preventDefault() {} })

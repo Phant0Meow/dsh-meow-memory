@@ -60,36 +60,28 @@ export interface MemoryScope {
   write: boolean
 }
 
-const SCOPE_OFF: MemoryScope = { dream: false, inject: false, write: false }
-const SCOPE_EXITED: MemoryScope = { dream: true, inject: true, write: true }
-
-/** 窗口门控汇总（菜单后缀用）：预设组合给专名，混合组合给「自定义」。 */
-export type ParticipationState = 'active' | 'readonly' | 'exited' | 'noConsolidation' | 'noWrite' | 'custom'
+/** 窗口门控汇总（菜单后缀用）：两开关（自动注入/自动整理）的 4 种组合全部命名。
+ *  写档（skip_write）不参与命名——面板不露出，仅工作区停用与存量数据仍生效。 */
+export type ParticipationState = 'active' | 'writeonly' | 'readonly' | 'exited'
 
 const PART_STATE_KEYS: Record<ParticipationState, UiKey> = {
   active: 'part.state.active',
+  writeonly: 'part.state.writeonly',
   readonly: 'part.state.readonly',
   exited: 'part.state.exited',
-  noConsolidation: 'part.state.noConsolidation',
-  noWrite: 'part.state.noWrite',
-  custom: 'part.state.custom',
 }
 
 export function participationState(scope: MemoryScope): ParticipationState {
-  const { dream, inject, write } = scope
-  if (!dream && !inject && !write) return 'active'
-  if (dream && inject && write) return 'exited'
-  if (inject && !dream && !write) return 'readonly'
-  if (dream && !inject && !write) return 'noConsolidation'
-  if (write && !dream && !inject) return 'noWrite'
-  return 'custom'
+  const { dream, inject } = scope
+  if (!inject && !dream) return 'active'
+  if (inject && !dream) return 'writeonly' // 停止读入 + 照常整理：只往库里写，不被记忆影响
+  if (!inject && dream) return 'readonly' // 照常读入 + 跳过整理：用记忆但不再整理
+  return 'exited'
 }
 
-/** 菜单项文案：主文案 + 状态后缀（active 无后缀）。 */
+/** 菜单项文案：主文案 + 状态后缀（四态全命名，含默认态「功能全开」）。 */
 export function participationLabel(scope: MemoryScope): string {
-  const state = participationState(scope)
-  const main = t('part.menu')
-  return state === 'active' ? main : `${main} · ${t(PART_STATE_KEYS[state])}`
+  return `${t('part.menu')} · ${t(PART_STATE_KEYS[participationState(scope)])}`
 }
 
 /**
@@ -250,11 +242,11 @@ function buildScopePanel(sid: string, post: (field: keyof MemoryScope, value: bo
   title.append(titleText, close)
   panel.appendChild(title)
 
-  // 三档开关行：整行可点，右侧 ✓/— 表达当前态。
+  // 两个开关行（用户拍板：记忆工具默认开着不关，想限制口头告诉 AI 即可）：
+  // 整行可点，右侧「打开/关闭」表达当前态（打开=该能力在参与记忆）。
   const rows: Array<{ field: keyof MemoryScope; key: UiKey }> = [
-    { field: 'inject', key: 'part.panel.read' },
+    { field: 'inject', key: 'part.panel.inject' },
     { field: 'dream', key: 'part.panel.consolidate' },
-    { field: 'write', key: 'part.panel.write' },
   ]
   const rowEls: Array<{ el: HTMLElement; field: keyof MemoryScope; state: HTMLElement }> = []
   for (const { field, key } of rows) {
@@ -277,44 +269,6 @@ function buildScopePanel(sid: string, post: (field: keyof MemoryScope, value: bo
     panel.appendChild(row)
     rowEls.push({ el: row, field, state })
   }
-
-  // 预设行：两个常用组合一键落位（自定义状态由单独切某档自然产生）。
-  const divider = document.createElement('div')
-  divider.style.cssText = 'height:1px;background:rgba(128,128,128,0.3);margin:6px 0 4px;'
-  panel.appendChild(divider)
-  const presetRow = document.createElement('div')
-  presetRow.style.cssText = 'display:flex;align-items:center;gap:4px;white-space:nowrap;'
-  const presetLabel = document.createElement('span')
-  presetLabel.textContent = t('part.panel.presets')
-  presetLabel.style.cssText = 'opacity:0.6;margin-right:2px;'
-  presetRow.appendChild(presetLabel)
-  const presets: Array<{ key: UiKey; scope: MemoryScope }> = [
-    { key: 'part.preset.full', scope: { ...SCOPE_OFF } },
-    { key: 'part.preset.readonly', scope: { dream: false, inject: true, write: false } },
-    { key: 'part.preset.exit', scope: { ...SCOPE_EXITED } },
-  ]
-  for (const { key, scope } of presets) {
-    const btn = document.createElement('button')
-    btn.type = 'button'
-    btn.textContent = t(key)
-    btn.style.cssText =
-      'cursor:pointer;background:transparent;color:inherit;border:1px solid rgba(128,128,128,0.45);' +
-      'border-radius:4px;padding:1px 7px;font-size:12px;font-family:inherit;'
-    btn.addEventListener('click', () => {
-      const cur = readScope(sid)
-      const fields: Array<keyof MemoryScope> = ['dream', 'inject', 'write']
-      for (const f of fields) {
-        if (cur[f] !== scope[f]) {
-          writeScopeField(sid, f, scope[f])
-          post(f, scope[f])
-        }
-      }
-      rerender()
-      syncOpenMenuLabels()
-    })
-    presetRow.appendChild(btn)
-  }
-  panel.appendChild(presetRow)
 
   function renderRows(sid2: string): void {
     const cur = readScope(sid2)

@@ -240,11 +240,11 @@ check('pt-br 时钟 今年', fold.formatInjectionClock(earlier, now) === '2/1 08
 check('pt-br 时钟 跨年', fold.formatInjectionClock(crossYear, now) === '31/12/2025 23:59')
 
 skip.setUiLocaleForTest('zh')
-check('zh 菜单文案（参与态无后缀 / 退出态带后缀）', skip.participationLabel({ dream: false, inject: false, write: false }) === '记忆参与' && skip.participationLabel({ dream: true, inject: true, write: true }) === '记忆参与 · 已退出')
+check('zh 菜单文案（四态全命名）', skip.participationLabel({ dream: false, inject: false, write: false }) === '记忆参与 · 功能全开' && skip.participationLabel({ dream: true, inject: true, write: true }) === '记忆参与 · 只用工具')
 skip.setUiLocaleForTest('en')
-check('en 菜单文案（只读态带后缀）', skip.participationLabel({ dream: false, inject: true, write: false }) === 'Memory participation · Do not disturb')
+check('en 菜单文案（不自动注入）', skip.participationLabel({ dream: false, inject: true, write: false }) === 'Memory participation · No auto-injection')
 skip.setUiLocaleForTest('pt-br')
-check('pt-br 菜单文案（参与态）', skip.participationLabel({ dream: false, inject: false, write: false }) === 'Participação de memória')
+check('pt-br 菜单文案（功能全开）', skip.participationLabel({ dream: false, inject: false, write: false }) === 'Participação de memória · Tudo ativo')
 
 notice.setUiLocaleForTest('zh')
 check('zh 气泡文案', notice.delegateNoticeLabelFor('dream', false) === '▸ 梦境记忆整理任务已完成。')
