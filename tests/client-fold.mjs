@@ -52,7 +52,7 @@ function snapshot(order, nodes, getTurn) {
   return {
     chat: {
       order,
-      nodes: { get: (k) => nodes.get(k) },
+      nodes: { get: (k) => nodes.get(k), values: () => nodes.values() },
       locations: { getTurn: (t) => getTurn(t) ?? [] },
     },
   }
@@ -100,13 +100,13 @@ console.log('=== 1. 反思轮识别/范围/计数 ===')
 console.log('=== 2. 排除 user/steering、只取起点之后 ===')
 {
   const nodes = new Map([
-    ['user-0', userNode('user-0', turnLoc(4))],
+    ['user-0', userNode('user-0', turnLoc(5))],
     ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(5))],
     ['asst-1', assistantNode('asst-1', turnLoc(5), 'settled')],
     ['steer-1', steeringNode('steer-1', turnLoc(5))],
     ['tail-1', { key: 'tail-1', kind: 'turn-tail', location: turnLoc(5), data: { turn: 5 } }],
   ])
-  // getTurn(5) 把 user-0 也算进去（异常数据），应被"起点之后"切片排除
+  // 共享轮：同一 turn 内用户消息在反思 prompt 之前；getTurn 另带无关键，验证不再依赖它
   const s = snapshot(
     ['user-0', 'ctx-1', 'asst-1', 'steer-1', 'tail-1'],
     nodes,
@@ -438,6 +438,42 @@ console.log('=== 12. turn-trigger 形态 ===')
   const other = mk('turn-trigger')
   other.chat.nodes.get('ctx-1').data = { ...other.chat.nodes.get('ctx-1').data, source: { kind: 'plugin', plugin: 'other' } }
   check('turn-trigger + 别的插件 source 不误判', computeFoldGroups(other).length === 0)
+}
+
+// ---- 6. dsh 0.2.x：order 漏节点 / getTurn 键形失配 ----
+console.log('=== 6. 0.2.x：order 缺节点、getTurn 失配 ===')
+{
+  const nodes = new Map([
+    ['user-0', userNode('user-0', turnLoc(3))],
+    ['asst-0', assistantNode('asst-0', turnLoc(3), 'settled')],
+    ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(4))],
+    ['tool-1', toolNode('tool-1', turnLoc(4), 'memory_remember')],
+    ['tail-1', { key: 'tail-1', kind: 'turn-tail', location: turnLoc(4), data: { turn: 4 } }],
+  ])
+  // 0.2.x 实况：注入的 context 节点不在 order 里；locations.getTurn 给出的键形
+  // 与 order/nodes 的 key 对不上（indexOf 必失配）。
+  const s = snapshot(['user-0', 'asst-0'], nodes, () => ['turn-4'])
+  const groups = computeFoldGroups(s)
+  check('order 缺节点时仍能找到反思轮锚点', groups.length === 1 && groups[0].variant === 'reflect')
+  check('getTurn 失配时范围仍覆盖本轮（含 memory_remember 计数）',
+    groups.length === 1 && groups[0].rememberCount === 1 && groups[0].keys.includes('ctx-1'))
+  const turns = memoryTurnNumbers(s)
+  check('memoryTurnNumbers 也认不在 order 里的节点', turns.size === 1 && turns.has(4))
+
+  const injNodes = new Map([
+    ['ctx-hit', {
+      key: 'ctx-hit', kind: 'context', location: turnLoc(2),
+      data: {
+        source: {
+          kind: 'plugin', plugin: 'meow-memory', form: 'snapshot',
+          sections: [{ name: '__meta__', text: JSON.stringify({ kind: 'hit', ids: [] }) }],
+        },
+        content: [{ type: 'text', text: '可能相关的记忆，仅供参考：\n- 一条事实' }],
+      },
+    }],
+  ])
+  const s2 = snapshot([], injNodes, () => [])
+  check('注入块不在 order 里也能成组', computeInjectionGroups(s2).length === 1)
 }
 
 console.log(failures === 0 ? '\nALL CLIENT-FOLD TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)
