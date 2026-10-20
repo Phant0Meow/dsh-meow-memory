@@ -306,6 +306,8 @@ export interface InjectionGroup {
   readonly userText?: string
   /** 消息事件时间（Unix epoch ms）；缺失时操作行不显示时钟。 */
   readonly time?: number
+  /** 该注入节点所属 turn；0.2.x 起注入块不再单独成行，DOM 侧按 turn 找落点。 */
+  readonly turn?: number
 }
 
 /**
@@ -332,7 +334,7 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
         continue
       }
       if (memKind === 'hit') {
-        groups.push({ id: key, kind: 'hit', injectedText: contextText(node) })
+        groups.push({ id: key, kind: 'hit', injectedText: contextText(node), turn: turnOf(node) })
         continue
       }
       // 已知机器元数据但非注入组（如 welcome / delegate 打点）→ 权威跳过，不做文本嗅探，
@@ -341,7 +343,7 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
       if (source.form === 'snapshot') {
         const injectedText = contextText(node)
         const isFirst = injectedText.startsWith(FIRST_INJECTION_MARKER) || injectedText.includes('LONG-TERM MEMORY')
-        groups.push({ id: key, kind: isFirst ? 'first' : 'hit', injectedText })
+        groups.push({ id: key, kind: isFirst ? 'first' : 'hit', injectedText, turn: turnOf(node) })
       }
       continue
     }

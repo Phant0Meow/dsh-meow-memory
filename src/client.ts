@@ -152,202 +152,24 @@ function flowRow(container: HTMLElement, key: string): HTMLElement | null {
   return container.querySelector<HTMLElement>(`[data-chat-flow-key="${CSS.escape(key)}"]`)
 }
 
-/** 匹配某折叠组的横条锚点。 */
-function anchorOf(container: HTMLElement, id: string): HTMLElement | null {
-  return container.querySelector<HTMLElement>(`[${ANCHOR_ATTR}="${CSS.escape(id)}"]`)
-}
-
-/** 构建/更新一个折叠组的锚点（细条 bar + 展开卡片 body）。
- *  幂等：元素只创建一次，文本仅在变化时写入——重建/反复写文本会触发
- *  MutationObserver → 自我循环（横条被反复替换，点击必然丢失）。 */
-function ensureAnchor(
+/** 注入横条的落点行。
+ *  旧宿主把注入块渲染成独立行 → 直接用节点自身的行；
+ *  dsh 0.2.x 起注入 context 不再单独成行（只在快照里，宿主把内容合进用户消息），
+ *  于是退化为「注入文本尾部那段用户 prompt 所在的输入行」—— 横条落在用户消息
+ *  上方，展开仍显示注入全文（全文来自快照，不依赖 DOM 行）。 */
+function injectionRow(
   container: HTMLElement,
-  group: FoldGroup,
-  expanded: boolean,
-  onToggle: (id: string) => void,
-): void {
-  let anchor = anchorOf(container, group.id)
-  if (anchor === null) {
-    const startRow = flowRow(container, group.id)
-    if (startRow === null || startRow.parentElement === null) return
-    anchor = document.createElement('div')
-    anchor.setAttribute(ANCHOR_ATTR, group.id)
-    startRow.parentElement.insertBefore(anchor, startRow)
+  group: { id: string; turn?: number },
+): { row: HTMLElement; exact: boolean } | null {
+  const exact = flowRow(container, group.id)
+  if (exact !== null) return { row: exact, exact: true }
+  // dsh 0.2.x：注入块不再单独成行（宿主把它合进用户消息），按 turn 找该轮第一行
+  if (typeof group.turn === 'number') {
+    const sameTurn = container.querySelector<HTMLElement>(`[data-chat-turn="${group.turn}"]`)
+    if (sameTurn !== null) return { row: sameTurn, exact: false }
   }
-  let bar = anchor.querySelector<HTMLButtonElement>(':scope > button')
-  if (bar === null) {
-    bar = document.createElement('button')
-    bar.type = 'button'
-    bar.style.cssText = [
-      'display:block;width:100%;margin:4px 0;padding:5px 12px;',
-      'font-size:12px;line-height:1.6;text-align:left;cursor:pointer;',
-      'color:var(--dsw-alias-label-secondary, rgba(127,127,127,.9));',
-      'background:rgba(127,127,127,.07);border:1px solid rgba(127,127,127,.14);',
-      'border-radius:999px;',
-    ].join('')
-    bar.addEventListener('click', () => onToggle(group.id))
-    anchor.appendChild(bar)
-  }
-  const label = foldLabel(group, expanded)
-  if (bar.textContent !== label) bar.textContent = label
-  // 语言切换后重放：tooltip 也跟着文案走（纯 DOM 属性，同样不随 React 更新）。
-  const hint = t(expanded ? 'inject.collapse' : 'inject.expand')
-  if (bar.title !== hint) bar.title = hint
-  let body = anchor.querySelector<HTMLElement>(`:scope > [${BODY_ATTR}]`)
-  if (body === null) {
-    body = document.createElement('div')
-    body.setAttribute(BODY_ATTR, 'true')
-    body.style.display = 'none'
-    body.style.cssText = [
-      'display:none;',
-      'background:rgba(127,127,127,.05);',
-      'border:1px solid rgba(127,127,127,.12);',
-      'border-radius:12px;',
-      'margin:2px 0 6px;',
-      'padding:6px 10px;',
-      'max-height:70vh;',
-      'overflow-y:auto;',
-    ].join('')
-    anchor.appendChild(body)
-  }
+  return null
 }
-
-/**
- * 给克隆的静态行补上折叠块（Think / tool call）的展开能力。
- * 背景：dsh UI 的 DisclosureRow 展开内容（think 全文 / tool 详情）是 React 条件渲染
- * （open && children），折叠时不在 DOM 里——纯 DOM 克隆会永久丢失，且 React 事件
- * 不复制导致"点不开"。这里用快照数据把详情补进克隆 DOM，并用原生 click 切换
- * data-open + 显示/隐藏（幂等：每行只增强一次，fillBody 每次重建克隆）。
- */
-function attachDisclosure(rowEl: HTMLElement, label: string, text: string): void {
-  const root = rowEl.parentElement
-  if (root === null) return
-  if (root.querySelector(':scope > [data-meow-detail-body]') !== null) return // 已增强
-  const body = document.createElement('div')
-  body.setAttribute('data-meow-detail-body', label)
-  body.textContent = text
-  body.style.display = 'none'
-  root.appendChild(body)
-  rowEl.addEventListener('click', () => {
-    const open = root.getAttribute('data-open') === 'true'
-    root.setAttribute('data-open', open ? '' : 'true')
-    body.style.display = open ? 'none' : 'block'
-  })
-}
-
-/** 增强一个克隆行：按快照数据补 Think/tool/context 详情（同类块按 DOM 顺序匹配源顺序）。 */
-function enhanceClone(clone: HTMLElement, node: ChatNode | undefined): void {
-  if (node === undefined) return
-  // 注意：assistant 节点在 ChatNodeDataMap 注册的 kind 是 'assistant-step'（dsh 源码
-  // conversation-nodes/assistant.ts），不是 'assistant'——写错则 think 增强永不生效。
-  if (node.kind === 'assistant-step') {
-    // issue #2：异常数据缺 blocks 时按空数组处理，不让增强路径抛错。
-    const blocks = (node.data as AssistantChatData).blocks ?? []
-    const reasoning = blocks.filter((b): b is Extract<typeof b, { kind: 'reasoning' }> => b.kind === 'reasoning')
-    const toolCalls = blocks.filter((b): b is Extract<typeof b, { kind: 'tool-call' }> => b.kind === 'tool-call')
-    const thinkRows = Array.from(clone.querySelectorAll<HTMLElement>('[data-variant="think"]'))
-    thinkRows.forEach((root, i) => {
-      const text = reasoning[i]?.text
-      const rowEl = root.querySelector<HTMLElement>('[data-disclosure-row]')
-      if (text !== undefined && rowEl !== null) attachDisclosure(rowEl, 'think', text)
-    })
-    const toolRows = Array.from(clone.querySelectorAll<HTMLElement>('[data-disclosure-row]'))
-      .filter((el) => el.closest('[data-variant="think"]') === null)
-    toolRows.forEach((rowEl, i) => {
-      const block = toolCalls[i]
-      if (block !== undefined) attachDisclosure(rowEl, 'tool', toolCallDetail(block))
-    })
-  } else if (node.kind === 'tool-call') {
-    const root = (node.data as ToolChatData).root
-    if (root === undefined) return // issue #2：异常数据无 root 时跳过增强（与 toolNameOf 同防护）
-    const rowEl = clone.querySelector<HTMLElement>('[data-disclosure-row]')
-    if (rowEl === null) return
-    const name = 'name' in root ? root.name : (root.call?.name ?? root.callId)
-    const argsRaw = 'name' in root ? root.argsRaw : (root.call?.argsRaw ?? '')
-    const detail = toolCallDetail({ name, argsRaw })
-    const resultText = 'content' in root ? blocksToText(root.content) : ''
-    attachDisclosure(rowEl, 'tool', resultText.length > 0 ? `${detail}\n\n${t('inject.result')}\n${resultText}` : detail)
-  } else if (node.kind === 'context') {
-    // 上下文注入行（反思/dream 指令 prompt）：补完整文本可展开查看。
-    const content = (node.data as { content?: readonly { type?: string; text?: string }[] }).content
-    const text = blocksToText(content ?? [])
-    const rowEl = clone.querySelector<HTMLElement>('[data-disclosure-row]')
-    if (rowEl !== null && text.length > 0) attachDisclosure(rowEl, 'context', text)
-  }
-}
-
-/** 填充/清空一个组的展开卡片（克隆原始行，静态快照；签名记录供自愈比对）。 */
-function fillBody(id: string, visible: boolean, keys: readonly string[], session: ConversationSnapshot): void {
-  for (const container of Array.from(document.querySelectorAll<HTMLElement>('[data-chat-flow]'))) {
-    const anchor = anchorOf(container, id)
-    if (anchor === null) continue
-    const body = anchor.querySelector<HTMLElement>(`:scope > [${BODY_ATTR}]`)
-    if (body === null) continue
-    body.replaceChildren()
-    if (!visible) {
-      body.style.display = 'none'
-      bodySigs.delete(id)
-      return
-    }
-    body.style.display = 'block'
-    for (const key of keys) {
-      const row = flowRow(container, key)
-      if (row === null) continue
-      const clone = row.cloneNode(true) as HTMLElement
-      // 克隆去掉折叠标记与流锚点：卡片内展示，且不再被当作原始行匹配。
-      clone.removeAttribute(FOLDED_ATTR)
-      clone.removeAttribute('data-chat-flow-key')
-      clone.removeAttribute('data-chat-anchor-key')
-      clone.removeAttribute('data-chat-flow-kind')
-      body.appendChild(clone)
-      enhanceClone(clone, session.chat?.nodes.get(key))
-    }
-    bodySigs.set(id, sigOf(container, keys))
-  }
-}
-
-/** 复制/已复制图标（与 dsh 本体 IconCopyOutline16 / IconCheckOutline16 同 path，
- *  ui-primitives src/icons/index.tsx；fill currentColor 跟随按钮颜色）。 */
-const COPY_ICON_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6.14929 4.02032C7.11197 4.02032 7.87983 4.02016 8.49597 4.07598C9.12128 4.13269 9.65792 4.25188 10.1415 4.53106C10.7202 4.8653 11.2008 5.3459 11.535 5.92462C11.8142 6.40818 11.9334 6.94481 11.9901 7.57012C12.0459 8.18625 12.0458 8.95419 12.0458 9.9168C12.0458 10.8795 12.0459 11.6473 11.9901 12.2635C11.9334 12.8888 11.8142 13.4254 11.535 13.909C11.2008 14.4877 10.7202 14.9683 10.1415 15.3025C9.65792 15.5817 9.12128 15.7009 8.49597 15.7576C7.87984 15.8134 7.11196 15.8133 6.14929 15.8133C5.18667 15.8133 4.41874 15.8134 3.80261 15.7576C3.1773 15.7009 2.64067 15.5817 2.1571 15.3025C1.5784 14.9683 1.09778 14.4877 0.76355 13.909C0.484366 13.4254 0.365184 12.8888 0.308472 12.2635C0.252649 11.6473 0.252808 10.8795 0.252808 9.9168C0.252808 8.95418 0.252664 8.18625 0.308472 7.57012C0.365184 6.94481 0.484366 6.40818 0.76355 5.92462C1.09777 5.34589 1.57839 4.86529 2.1571 4.53106C2.64067 4.25188 3.1773 4.13269 3.80261 4.07598C4.41874 4.02017 5.18666 4.02032 6.14929 4.02032ZM6.14929 5.37774C5.16181 5.37774 4.46634 5.37761 3.92566 5.42657C3.39434 5.47472 3.07859 5.56574 2.83582 5.70587C2.4632 5.92106 2.15354 6.2307 1.93835 6.60333C1.79823 6.8461 1.70721 7.16185 1.65906 7.69317C1.6101 8.23385 1.61023 8.92933 1.61023 9.9168C1.61023 10.9043 1.61009 11.5998 1.65906 12.1404C1.70721 12.6717 1.79823 12.9875 1.93835 13.2303C2.15356 13.6029 2.46321 13.9126 2.83582 14.1277C3.07859 14.2679 3.39434 14.3589 3.92566 14.407C4.46634 14.456 5.16182 14.4559 6.14929 14.4559C7.13682 14.4559 7.83224 14.456 8.37292 14.407C8.90425 14.3589 9.21999 14.2679 9.46277 14.1277C9.83535 13.9126 10.145 13.6029 10.3602 13.2303C10.5004 12.9875 10.5914 12.6717 10.6395 12.1404C10.6885 11.5998 10.6884 10.9043 10.6884 9.9168C10.6884 8.92934 10.6885 8.23384 10.6395 7.69317C10.5914 7.16185 10.5004 6.8461 10.3602 6.60333C10.1451 6.23071 9.83536 5.92107 9.46277 5.70587C9.21999 5.56574 8.90424 5.47472 8.37292 5.42657C7.83224 5.3776 7.13682 5.37774 6.14929 5.37774ZM9.80164 0.367975C10.7638 0.367975 11.5314 0.36788 12.1473 0.423639C12.7726 0.480307 13.3093 0.598759 13.7928 0.877741C14.3717 1.21192 14.8521 1.69355 15.1864 2.27227C15.4655 2.75574 15.5857 3.29164 15.6425 3.9168C15.6983 4.53301 15.6971 5.3016 15.6971 6.26446V7.82989C15.6971 8.29264 15.6989 8.58993 15.6649 8.84844C15.4668 10.3525 14.401 11.5738 12.9833 11.9988V10.5467C13.6973 10.1903 14.2105 9.49662 14.3192 8.67169C14.3387 8.52347 14.3407 8.3358 14.3407 7.82989V6.26446C14.3407 5.27706 14.3398 4.58149 14.2909 4.04083C14.2428 3.50968 14.1526 3.19372 14.0126 2.95098C13.7974 2.57849 13.4876 2.26869 13.1151 2.05352C12.8724 1.91347 12.5564 1.82237 12.0253 1.77423C11.4847 1.72528 10.7888 1.7254 9.80164 1.7254H7.71472C6.7562 1.72558 5.92665 2.27697 5.52332 3.07891H4.07019C4.54221 1.51132 5.9932 0.368186 7.71472 0.367975H9.80164Z" fill="currentColor"/></svg>'
-const CHECK_ICON_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M15.0498 3.92579L8.49512 12.3818C8.25774 12.6881 8.04517 12.9645 7.84668 13.1689C7.63957 13.3823 7.38732 13.5841 7.04492 13.6719C6.86373 13.7183 6.6757 13.7346 6.48926 13.7197C6.13666 13.6915 5.8528 13.5355 5.6123 13.3604C5.38201 13.1926 5.12573 12.9567 4.83984 12.6953L1.03125 9.21289L1.96875 8.1875L5.77734 11.6699C6.08684 11.9529 6.27773 12.1249 6.43066 12.2363C6.50183 12.2882 6.54699 12.3135 6.57324 12.3252C6.58525 12.3305 6.59269 12.3322 6.5957 12.333C6.59802 12.3336 6.59961 12.334 6.59961 12.334C6.63317 12.3367 6.66758 12.3335 6.7002 12.3252C6.7002 12.3252 6.70211 12.3251 6.7041 12.3242C6.70698 12.3229 6.71348 12.319 6.72461 12.3115C6.74849 12.2956 6.78843 12.2642 6.84961 12.2012C6.98138 12.0654 7.13957 11.8628 7.39648 11.5313L13.9502 3.07422L15.0498 3.92579Z" fill="currentColor"/></svg>'
-
-/** 写剪贴板并给出「已复制」反馈（图标切对勾 1s，对齐本体 MessageIconActions）。
- *  复制的是用户 prompt 原文——本体按钮的文本闭包含注入前缀，不能复用。
- *  clipboard API 失败（非安全上下文等）回退 execCommand。 */
-async function copyInjectionText(button: HTMLButtonElement, text: string): Promise<void> {
-  let ok = false
-  try {
-    await navigator.clipboard.writeText(text)
-    ok = true
-  } catch {
-    const textarea = document.createElement('textarea')
-    textarea.value = text
-    textarea.style.position = 'fixed'
-    textarea.style.opacity = '0'
-    document.body.appendChild(textarea)
-    textarea.select()
-    try {
-      ok = document.execCommand('copy')
-    } catch {
-      ok = false
-    }
-    textarea.remove()
-  }
-  if (!ok || button.dataset.meowInjState === 'copied') return
-  button.dataset.meowInjState = 'copied'
-  button.title = t('inject.copied')
-  button.innerHTML = CHECK_ICON_SVG
-  window.setTimeout(() => {
-    button.dataset.meowInjState = 'copy'
-    button.title = t('inject.copy')
-    button.innerHTML = COPY_ICON_SVG
-  }, 1000)
-}
-
-/** 应用一次注入折叠（首轮长期记忆/关键词命中）：原行隐藏，原位插入
- *  「已注入记忆」横条（点开显示注入全文）+ 用户 prompt 气泡 + 操作行
- *  （复制按钮写 userText 原文 + hover 显隐时钟），样式与本体 UserStyleBubble
- *  对齐（同 token 同尺寸）。幂等：只做元素存在性/文本写入；事件只挂一次。 */
 function applyInjectionFold(
   groups: readonly InjectionGroup[],
   expanded: ReadonlySet<string>,
@@ -361,7 +183,7 @@ function applyInjectionFold(
       if (!liveIds.has(stale.getAttribute(INJ_ANCHOR_ATTR) ?? '')) stale.remove()
     }
     for (const group of groups) {
-      const startRow = flowRow(container, group.id)
+      const startRow = injectionRow(container, group)
       if (startRow === null || startRow.parentElement === null) continue
       startRow.setAttribute(FOLDED_ATTR, 'true') // 原行隐藏
       let anchor = container.querySelector<HTMLElement>(`[${INJ_ANCHOR_ATTR}="${CSS.escape(group.id)}"]`)

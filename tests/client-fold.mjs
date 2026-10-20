@@ -474,6 +474,7 @@ console.log('=== 6. 0.2.x：order 缺节点、getTurn 失配 ===')
   ])
   const s2 = snapshot([], injNodes, () => [])
   check('注入块不在 order 里也能成组', computeInjectionGroups(s2).length === 1)
+  check('注入组带 turn（0.2.x DOM 侧按 turn 找落点）', computeInjectionGroups(s2)[0].turn === 2)
 }
 
 console.log(failures === 0 ? '\nALL CLIENT-FOLD TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)
