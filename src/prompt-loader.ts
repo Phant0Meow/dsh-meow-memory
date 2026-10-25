@@ -62,6 +62,8 @@ export const SLOTS = [
   'dream-topic',
   'dream-project-summary',
   'welcome-guide',
+  'first-create-notice',
+  'external-memory-notice',
   'labels',
   'tools',
 ] as const

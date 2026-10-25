@@ -485,7 +485,7 @@ export function abortDream(agent: unknown, dir = '.dsh-meow', onDreamState?: Dre
 
 // ── 工具：memory_dream（手动触发本窗口 dream） ─────────────────────────────
 
-export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number | (() => number) = DEFAULT_RULES_REVIEW_DAYS, workspaceDisabled?: (ws: string) => boolean): ToolDefinition {
+export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number | (() => number) = DEFAULT_RULES_REVIEW_DAYS, workspaceDisabled?: (ws: string) => boolean, memoryUntrusted?: (ws: string) => boolean): ToolDefinition {
   return {
     name: 'memory_dream',
     description: keyedValue('tools', 'memory_dream.description'),
@@ -524,6 +524,8 @@ export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamS
       //（注册期传入活读取 thunk，每次手动触发现读现用）。
       // 工作区停用（#28 硬开关）：手动触发也不放行（写了也进不去，白烧 token）。
       if (workspaceDisabled?.(workspace) === true) return { ok: false, note: '该工作区已停用记忆（disabledWorkspaces 名单）：dream 不可用。' }
+      // 外部记忆库信任门（#64）：预置库未信任不整理（不读不写）。
+      if (memoryUntrusted?.(workspace) === true) return { ok: false, note: '此工作区自带未信任的外部记忆库（.dsh-meow 非本机创建）：dream 不可用。确认这是自己的项目，请让用户执行 /meow-trust。' }
       const rrd = typeof rulesReviewDays === 'function' ? rulesReviewDays() : rulesReviewDays
       const ok = startWindowDream(ctx, exec.agent, workspace, dir, onDreamState, rrd)
       if (ok) return { ok, note: '整理任务已在后台启动，会话流中的任务气泡会显示进度与完成状态。' }
@@ -566,7 +568,7 @@ export interface DreamCommandDefinition {
  * command-error 明确提示未启动原因，不会把 /dream 发给模型）。
  * 注册由 index.ts 负责（ctx.get('commands') 可选服务 + 就绪重试 + ctx.effect 清理）。
  */
-export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number | (() => number) = DEFAULT_RULES_REVIEW_DAYS, workspaceDisabled?: (ws: string) => boolean): DreamCommandDefinition {
+export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number | (() => number) = DEFAULT_RULES_REVIEW_DAYS, workspaceDisabled?: (ws: string) => boolean, memoryUntrusted?: (ws: string) => boolean): DreamCommandDefinition {
   return {
     name: 'dream',
     description: '手动唤起一次记忆整理（dream）：逐轮回顾本窗口建立/提取过的跨会话记忆并封存。与 memory_dream 工具相同，手动触发不受峰时抑制。',
@@ -587,6 +589,10 @@ export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamS
       // rulesReviewDays 双模式（issue #26 活配置）：每次手动触发现读现用。
       if (workspaceDisabled?.(workspace) === true) {
         return { kind: 'error', text: '该工作区已停用记忆（disabledWorkspaces 名单）：/dream 不可用。' }
+      }
+      // 外部记忆库信任门（#64）：预置库未信任不整理（不读不写）。
+      if (memoryUntrusted?.(workspace) === true) {
+        return { kind: 'error', text: '此工作区自带未信任的外部记忆库（.dsh-meow 非本机创建）：/dream 不可用。确认这是自己的项目，请先执行 /meow-trust。' }
       }
       const rrd = typeof rulesReviewDays === 'function' ? rulesReviewDays() : rulesReviewDays
       const ok = startWindowDream(ctx, agent, workspace, dir, onDreamState, rrd)

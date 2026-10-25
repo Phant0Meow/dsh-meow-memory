@@ -53,8 +53,17 @@ import { migrateLegacy } from './migrate.js'
 import { buildReflectMessage, consecutiveToolSteps, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { isMeowSource } from './source.js'
 import { registerMemoryTools, setMemoryToolGate } from './tools.js'
-import { authGate, connectionAuthOf } from './auth-gate.js'
+import { authGateLazy } from './auth-gate.js'
 import { resolveSlotText, setPromptLang } from './prompt-loader.js'
+import {
+  enableWorkspaceTrust,
+  hasExternalNoticeShown,
+  isUntrustedMemoryWorkspace,
+  markExternalNoticeShown,
+  normalizeWorkspacePath,
+  seedTrustedWorkspaces,
+  trustCommandDefinition,
+} from './trust.js'
 
 /** 首次欢迎引导的 seen 记账 id（accessed 通道，非真实记忆 id；releaseSeen 不清除）。 */
 const WELCOME_GUIDE_SEEN_ID = '__welcomeGuide__'
@@ -659,12 +668,6 @@ const SETTINGS_SOURCE_WAIT_MS = 250
 const LIVE_CONFIG_KEYS = ['hitTopK', 'titleMax', 'reflect', 'reflectTurns', 'autoMigrate', 'promptLang', 'disabledWorkspaces'] as const
 const LIVE_DREAM_KEYS = ['enabled', 'idleMinutes', 'suppressWindows', 'suppressLeadMinutes', 'checkMinutes', 'timeZone', 'rulesReviewDays'] as const
 
-/** 工作区路径归一（#28 匹配口径）：斜杠统一、去尾斜杠、大小写不敏感（Windows 盘符
- *  友好）。导出供测试直调。 */
-export function normalizeWorkspacePath(p: string): string {
-  return p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
-}
-
 /** 工作区是否在停用名单（归一后精确匹配）。导出供测试直调。 */
 export function workspaceDisabledMatch(list: readonly string[], ws: string): boolean {
   const n = normalizeWorkspacePath(ws)
@@ -749,7 +752,14 @@ function hotSwitchHomeDir(ctx: Context, config: unknown, get: (() => unknown) | 
       try {
         const sw = switchHomeDir(target)
         logHomeDirSwitch(ctx, sw)
-        if (sw.changed) loadWindowIndex(resolved.projectDir ?? '.dsh-meow')
+        if (sw.changed) {
+          loadWindowIndex(resolved.projectDir ?? '.dsh-meow')
+          // 信任注册表跟着全局目录走（#64）：新目录重新启用 + 播种。新 home 里没有
+          // window-index.json 时播种为空——既有信任以新目录注册表为准（用户主动
+          // 迁目录 = 重新建立信任面，与 window-index 同语义）。
+          enableWorkspaceTrust()
+          seedTrustedWorkspaces()
+        }
       } catch {
         /* 热切换失败不影响配置保存 */
       }
@@ -1145,6 +1155,17 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   }
   loadWindowIndex(resolved.projectDir) // 恢复窗口索引（热重载/重启后旧窗口不失联）
 
+  // 工作区记忆库信任门（#64）：注册表住在全局目录（仓库作者碰不到）。先播种
+  // window-index.json 里出现过的工作区（升级前本机实际打开过 = 已知可信，老用户
+  // 零摩擦），再启用门——此后新遇到的「非本机创建 .dsh-meow」一律未信任（注入/
+  // 检索/整理/写入全停，判据与登记时机见 src/trust.ts），/meow-trust 恢复。建库
+  // 时刻的登记在 getDb（db.ts）；loadWindowIndex 只打开已存在的库、不会误建库。
+  enableWorkspaceTrust()
+  const seededTrust = seedTrustedWorkspaces()
+  if (seededTrust.listed > 0) {
+    ctx.logger.info(`meow-memory: workspace trust gate on (seeded ${seededTrust.trusted}/${seededTrust.listed} from window-index)`)
+  }
+
   // v0 会话一次性迁移（issue #13）：标记未迁移时体检全部会话并把 source.memory 搬进
   // sections.__meta__，完成后置位 .dsh-meow/migrate-v0-state.json，此后启动直接跳过。
   // fire-and-forget：绝不阻塞 dsh 启动；单文件失败只记日志（用户拍板 2026-09-10）。
@@ -1162,11 +1183,13 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   setMemoryToolGate({
     refuseRead: (ws, sid) => {
       if (workspaceDisabled(ws)) return '记忆对该工作区已停用（disabledWorkspaces 名单）：memory 工具不可用，请更换工作区或调整配置。'
+      if (isUntrustedMemoryWorkspace(ws)) return '此工作区自带未信任的外部记忆库（.dsh-meow 非本机创建，#64）：memory 工具已暂停。确认这是自己的项目，请让用户执行 /meow-trust 恢复。'
       if (sid === null || !existsSync(memoryDbPath(ws, resolved.projectDir))) return null
       return getDb(ws, resolved.projectDir).getMemoryScope(sid).inject ? '此窗口已停止读入记忆（记忆参与开关）：注入与检索均已关闭。' : null
     },
     refuseWrite: (ws, sid) => {
       if (workspaceDisabled(ws)) return '记忆对该工作区已停用（disabledWorkspaces 名单）：写入被拒绝。'
+      if (isUntrustedMemoryWorkspace(ws)) return '此工作区自带未信任的外部记忆库（.dsh-meow 非本机创建，#64）：写入被拒绝。确认这是自己的项目，请让用户执行 /meow-trust 恢复。'
       if (sid === null || !existsSync(memoryDbPath(ws, resolved.projectDir))) return null
       if (isPluginTurn.get(sid) === true) return null // 整理轮豁免：整理轮写入跟随整理档（#38 联动）
       return getDb(ws, resolved.projectDir).getMemoryScope(sid).write ? '此窗口已停止写入记忆（记忆参与开关）。' : null
@@ -1192,7 +1215,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       }
     }
   }
-  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays, workspaceDisabled))
+  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays, workspaceDisabled, isUntrustedMemoryWorkspace))
   if (typeof disposeDreamTool === 'function') toolDisposers.push(disposeDreamTool)
   ctx.logger.info('meow-memory: memory_remember/search/read/update + memory_dream registered')
 
@@ -1389,6 +1412,27 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     const userMsgs = decision.messages.filter((m: { source?: { kind?: string } }) => m.source?.kind === 'user')
     if (userMsgs.length === 0) return decision // 工具轮/纯插件消息：不注入
 
+    // 外部记忆库信任门（#64）：.dsh-meow 非本机创建且未信任 → 全部记忆路径暂停
+    //（下方重注入/首轮快照/命中链都不会走到）。首个用户消息前插一次性说明（不
+    // 读库、不算注入），给出 /meow-trust 恢复方式。信任是活检查：/meow-trust 后
+    // 下一轮即恢复正常注入，无需重启。提示记账在全局注册表（工作区文件可预置，
+    // 不能当标记）。
+    if (ws !== null && isUntrustedMemoryWorkspace(ws)) {
+      if (!hasExternalNoticeShown(ws)) {
+        markExternalNoticeShown(ws)
+        try {
+          const notice = resolveSlotText('external-memory-notice')
+          const rewritten = [...decision.messages]
+          rewritten.splice(rewritten.indexOf(userMsgs[0]), 0, createMemoryNoticeMessage(notice))
+          ctx.logger.info('meow-memory: external memory library detected — paused until /meow-trust')
+          return { ...decision, messages: rewritten }
+        } catch {
+          /* 提示失败不阻塞：按无提示停用处理 */
+        }
+      }
+      return decision
+    }
+
     // 记忆门控（issue #38/#28）：本窗口「停止读入」或工作区被配置停用 → 跳过全部
     // 注入路径（重注入/首轮快照/引导/命中链）。读的入口统一在此封口。
     if (ws !== null && memoryReadOff(ws, sid)) return decision
@@ -1582,9 +1626,10 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
 
     // 窗口/工作区整理门控（issue #38/#28）：「跳过整理」或工作区停用 → 自动反思一并
     // 挡下（手动 /dream 不受限，手动=明确意愿）。dream 轮推进在上方分支已处理，不受此守卫影响。
+    // 外部记忆库信任门（#64）：未信任的工作区连库都不该读——自动反思同挡。
     if (wsTs !== null) {
       try {
-        if (workspaceDisabled(wsTs) || (existsSync(memoryDbPath(wsTs, resolved.projectDir)) && getDb(wsTs, resolved.projectDir).getMemoryScope(sidTs).dream)) return
+        if (isUntrustedMemoryWorkspace(wsTs) || workspaceDisabled(wsTs) || (existsSync(memoryDbPath(wsTs, resolved.projectDir)) && getDb(wsTs, resolved.projectDir).getMemoryScope(sidTs).dream)) return
       } catch {
         /* 门控读失败：放行（fail-open 同风格） */
       }
@@ -1650,7 +1695,10 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   }
 
   // 3) 空闲整理（按窗口；windowIndex 记录 sessionId → workspace）。
-  const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex, signalDreamState, workspaceDisabled)
+  // dream 扫描的门控回调：停用名单 ∨ 未信任（#64）都不进 sweep（静默跳过，同
+  // disabledWorkspaces 待遇；用户可见的拦截文案在工具/命令层各自给出）。
+  const dreamSweepBlocked = (ws: string): boolean => workspaceDisabled(ws) || isUntrustedMemoryWorkspace(ws)
+  const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex, signalDreamState, dreamSweepBlocked)
   ctx.logger.info(
     `meow-memory: dream scheduled (idle ${resolved.dream.idleMinutes}m, suppress ${resolved.dream.suppressWindows.map((w) => `${w.start}-${w.end}`).join(' ')} lead ${resolved.dream.suppressLeadMinutes}m, every ${resolved.dream.checkMinutes}m, tz ${resolved.dream.timeZone}, rules review ${resolved.dream.rulesReviewDays}d)`,
   )
@@ -1671,12 +1719,16 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       | undefined
     if (ws !== undefined && typeof ws.register === 'function') {
       // #57：动态路由全部过鉴权闸（与官方 /api 同闸）——webServer.register 不经过
-      // dsh-client-connection 的鉴权层，裸注册曾跨站可读可写。连接服务整个缺失时
-      // 保守 503（鉴权不可用就宁可不可用）。静态资源型路由（本插件无）保持开放。
-      const connection = connectionAuthOf(ctx)
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const gated = (handler: (req: any, res: any) => void): ((req: unknown, res: unknown) => void) =>
-        authGate(connection, handler) as (req: unknown, res: unknown) => void
+      // dsh-client-connection 的鉴权层，裸注册曾跨站可读可写。#78 起 connection
+      // 改懒解析（0.2.x 宿主对插件 ctx 结构性不可见，注册时捕获一次=永久 503）：
+      // 每请求现取，取到走官方闸/旧版 fence，取不到降级环回 fence（跨站仍全挡），
+      // 并打一次 warn。静态资源型路由（本插件无）保持开放。
+      const gated = <R,>(handler: (req: unknown, res: R) => void): ((req: unknown, res: R) => void) =>
+        authGateLazy<R>(ctx, handler, {
+          onDegraded: () => {
+            ctx.logger.warn('meow-memory: connection 服务不可用，/meow-memory/* 路由降级为环回 fence（#78：无 cookie 认证，跨站读写仍全挡）')
+          },
+        })
       const registerOne = (route: { kind: 'exact'; path: string; handler: (req: unknown, res: unknown) => void }): void => {
         try {
           routeDisposers.push(ctx.effect(() => ws.register(route)))
@@ -1791,10 +1843,18 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       | undefined
     if (commands !== undefined && typeof commands.register === 'function') {
       try {
-        commandDisposers.push(ctx.effect(() => commands.register(dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays, workspaceDisabled))))
+        commandDisposers.push(ctx.effect(() => commands.register(dreamCommandDefinition(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays, workspaceDisabled, isUntrustedMemoryWorkspace))))
         ctx.logger.info('meow-memory: /dream user command registered')
       } catch (e) {
         ctx.logger.warn(`meow-memory: /dream 命令注册失败: ${e instanceof Error ? e.message : String(e)}`)
+      }
+      // /meow-trust（#64）：信任当前工作区自带的记忆库。与 /dream 同平面同注册
+      // 契约（commands 可选服务 + ctx.effect 清理）；定义在 trust.ts（无 ctx 依赖）。
+      try {
+        commandDisposers.push(ctx.effect(() => commands.register(trustCommandDefinition())))
+        ctx.logger.info('meow-memory: /meow-trust user command registered')
+      } catch (e) {
+        ctx.logger.warn(`meow-memory: /meow-trust 命令注册失败: ${e instanceof Error ? e.message : String(e)}`)
       }
       return
     }
@@ -1978,5 +2038,8 @@ export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
 export { setMemoryToolGate, registerMemoryTools } from './tools.js'
-export { authGate, connectionAuthOf } from './auth-gate.js'
+export { authGate, authGateLazy, connectionAuthOf } from './auth-gate.js'
+// 信任门（#64）：normalizeWorkspacePath 原定义在本文件（#28 口径），移入 trust.ts
+// 后在此 re-export 保持既有导出面不变；其余为信任注册表 API（测试直调）。
+export { normalizeWorkspacePath, isTrustedWorkspace, isUntrustedMemoryWorkspace, trustWorkspace, registerCreatedWorkspace, hasExternalNoticeShown, markExternalNoticeShown, enableWorkspaceTrust, disableWorkspaceTrust, seedTrustedWorkspaces, trustCommandDefinition } from './trust.js'
 export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'

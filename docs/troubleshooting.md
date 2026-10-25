@@ -107,6 +107,10 @@ Open the "…" menu on that session's sidebar row and click **"跳过梦境整�
 
 Priority: **breathing > skipped > crescent**. New activity removes the icon.
 
+### All moon icons disappeared / routes 403, a connection warning in the log
+
+The `/meow-memory/*` data routes (the source of the moon icons) sit behind an auth gate: the host's official `connection` service is preferred; on some 0.2.x hosts that service is not exposed to plugins, and the gate degrades to a **loopback fence** (loopback Host + `sec-fetch-site` + Origin triple check — cross-site requests are still fully blocked; one `connection service unavailable` warning is logged at startup). Everything keeps working, only the cookie-auth layer is absent (#78). If routes return 403 wholesale on older hosts (≤0.1.2), make sure the browser URL is loopback or the host's `trustedHosts` is configured.
+
 ### A throwaway-task workspace polluted the memory db
 
 List it in `disabledWorkspaces`: cwd is matched exactly (path normalisation: unified slashes + trailing slash removed + case-insensitive), and a matching workspace has memory **fully disabled** (reads, consolidation and writes all refused, **including a manual `/dream`**).
@@ -138,6 +142,16 @@ Set `backup.enabled: true`: at the end of each dream, `memory.db` is snapshotted
 ### Will a legacy `PROJECT.md` be lost?
 
 `autoMigrate` defaults to `true`: a legacy `PROJECT.md` is migrated when the db is first opened.
+
+### A cloned repo carries a `.dsh-meow`, memory is paused with an "external memory library" notice
+
+That is the **external memory trust gate** (#64): storing the memory db inside the workspace means anyone can pre-seed one — a malicious repo carrying a crafted `memory.db` (or `PROJECT.md`) would have its content injected as "your own long-term memory", zero-interaction and zero notice. Hence:
+
+- A `.dsh-meow` **not created on this machine** is paused by default (no injection, no retrieval, no consolidation, no writes; `memory_*` tools refuse), with a one-time notice on the first message;
+- If it is your own project (new machine / restored backup / copied directory), type **`/meow-trust`** in the composer to re-enable — takes effect immediately, no restart; if you do not recognize the library, keep it paused or add the workspace to `disabledWorkspaces`;
+- **Normal local use is unaffected**: libraries the plugin itself creates are trusted at creation; on upgrade, every workspace listed in `window-index.json` (= actually opened on this machine before the upgrade) is auto-seeded as trusted.
+
+The trust registry lives in `trusted-workspaces/` under the global home (one marker file per workspace, named by the hash of the normalised path) — outside the workspace, out of reach for repo authors, not forgeable.
 
 ---
 

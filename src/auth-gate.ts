@@ -12,8 +12,11 @@
  *   字面量/声明 trustedHosts 之外 403；sec-fetch-site: cross-site 403；Origin 与
  *   Host 不同源 403）。这里逐语义复刻同一把 fence，trustedHosts 从 connection
  *   服务读取；回退后旧宿主的防护与官方 /api 恰好等价，绝不比官方更松。
- * - connection 服务整个缺失（异常装配）：保守拒绝（503）——鉴权能力不可用时
- *   静默放行等于退回"无鉴权"形态，宁可不可用。
+ * - connection 服务整个缺失：authGate（显式传入 undefined）保守 503；生产注册
+ *   走 authGateLazy（#78）——0.2.x 宿主上 connection 对插件 ctx 根本不可见
+ *   （dsh-client-connection 只在浏览器侧入口 ctx.provide；宿主侧的
+ *   HostConnectionService 是局部变量不进 DI，0.2.0-rc.1 包源码实证），"缺失即
+ *   503"会把三条路由永久打死。懒解析版在缺失时降级为环回 fence，详见其注释。
  */
 
 /** connection 服务最小面：0.1.5+ 的 requestRejection 与旧版的 trustedHosts。 */
@@ -137,5 +140,49 @@ export function authGate<R extends { writeHead: (...args: any[]) => void; end: (
     }
     res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' })
     res.end('meow-memory: authentication service unavailable')
+  }
+}
+
+/**
+ * 懒解析版鉴权闸（#78）：connection 不在注册时刻捕获，每请求现取。
+ *
+ * 三个理由：
+ * 1. 0.2.x 宿主上 connection 服务对插件 ctx **结构性不可见**（不是晚到）——注册时
+ *    捕获一次（0.31.1 的做法）在 webServer 就绪那一刻就永远定格成 undefined，
+ *    轮询重试也救不回来；
+ * 2. 若宿主确属晚注册（fiber 竞态），逐请求现取会在服务出现的那一请求起自动
+ *    升级到官方闸，无需定时器；
+ * 3. 拿不到时不再 503（#78：三条路由全灭、dream 小月亮消失），降级为环回 fence
+ *    ——Host fence + sec-fetch-site: cross-site + Origin 同源三重校验照做，#57 的
+ *    跨站读写向量仍然全挡；相对官方闸损失仅 cookie 认证（本机非浏览器进程可直连，
+ *    与任何无认证 localhost 服务同级，残留面见 onDegraded 日志）。降级只发生一次
+ *    提示（onDegraded 节流），不刷屏。
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function authGateLazy<R extends { writeHead: (...args: any[]) => void; end: (...args: any[]) => void }>(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ctx: any,
+  handler: (req: unknown, res: R) => void,
+  opts: { onDegraded?: () => void } = {},
+): (req: unknown, res: R) => void {
+  let degradedWarned = false
+  return (req, res) => {
+    const connection = connectionAuthOf(ctx)
+    if (connection === undefined) {
+      if (!degradedWarned) {
+        degradedWarned = true
+        opts.onDegraded?.()
+      }
+      // 环回 fence：trustedHosts 空表 = 只认 loopback Host（无 LAN 配置可达——
+      // 降级路径拿不到宿主 trustedHosts；LAN 场景下官方闸可用时走不到这里）。
+      if (!legacyHostFence(req, [])) {
+        res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('forbidden')
+        return
+      }
+      handler(req, res)
+      return
+    }
+    authGate(connection, handler)(req, res)
   }
 }

@@ -398,7 +398,7 @@ function searchTool(dir: string): ToolDefinition {
         },
       },
       render: (_args, value) => {
-        const v = value as { note?: string; hits?: Array<{ id?: string; level?: string; content?: string; keywords?: unknown; project?: string | null; updated_at?: number | null }> }
+        const v = value as { note?: string; hits?: Array<{ id?: string; level?: string; content?: string; keywords?: unknown; project?: string | null; updated_at?: number | null; score?: number; explain?: { bm25?: number; importance?: number; recencyWeight?: number; status?: string } }> }
         const lines = [String(v.note ?? '')]
         for (const h of v.hits ?? []) {
           // 检索元数据视图：归属 + id + 相对时间 + 关键词（无关键词回退原文开头）；原文内容不显示。
@@ -408,6 +408,13 @@ function searchTool(dir: string): ToolDefinition {
           const proj = `${projectLabel(h.project)} : ${String(h.level ?? '')}`
           const rel = relativeTime(h.updated_at ?? null)
           lines.push(`[${proj}] [${String(h.id ?? '')}] [${rel}] 关于：${about}`)
+          // explain=true（#51/#79）：分项得分追加一行。宿主把 render 产物作为工具结果
+          // content 喂给模型（dsh-tools createSuccessResult）——只进结构化字段不渲染
+          // 等于对模型不可见（#79 的报告即因此误判功能缺失）。
+          const ex = h.explain
+          if (ex !== undefined) {
+            lines.push(`  bm25=${String(ex.bm25 ?? 0)} importance=${String(ex.importance ?? 0)} recencyWeight=${String(ex.recencyWeight ?? 1)} status=${String(ex.status ?? 'active')} score=${String(h.score ?? 0)}`)
+          }
         }
         return lines.map((t) => ({ type: 'text' as const, text: t }))
       },
@@ -483,8 +490,15 @@ function searchTool(dir: string): ToolDefinition {
       markSearched(workspace, sessionId ?? 'unknown', hits.map((h) => h.id), dir)
       // 按记忆时间戳（updated_at）重排：旧→新；null 视为最旧（从未封存/更新）。
       const reordered = [...hits].sort((a, b) => (a.updated_at ?? 0) - (b.updated_at ?? 0))
+      const BASE_NOTE = '如果冲突，以最新的为准。时间戳较旧的条目可作为事情发展过程的参考。如果你确实需要更多细节，可以直接去聊天记录里搜索相关关键词。'
+      // 零命中 + 未显式传 level（#79 顺带）：默认范围不含 soul/user（它们每会话首轮
+      // 全量注入、不参与关键词检索）——现场极易误判成"库是空的"，补一句排查指引。
+      const explicitLevels = typeof parsed.level === 'string' && parsed.level.trim().length > 0
+      const note = hits.length === 0 && !explicitLevels
+        ? `${BASE_NOTE}本次零命中：默认检索范围是 fact/lesson/topic/rules，soul 与 user 层不参与关键词检索（要查它们请显式传 level，如 {"level":"soul,user"}）；若记忆库刚启用，也可能确实还没有可检索的记忆。`
+        : BASE_NOTE
       return {
-        note: '如果冲突，以最新的为准。时间戳较旧的条目可作为事情发展过程的参考。如果你确实需要更多细节，可以直接去聊天记录里搜索相关关键词。',
+        note,
         hits: reordered.map((h) => {
           const row = byId.get(h.id)
           return {

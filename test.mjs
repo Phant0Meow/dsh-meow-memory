@@ -83,8 +83,36 @@ import {
   resolveHomeDir,
   switchHomeDir,
   authGate,
+  authGateLazy,
   connectionAuthOf,
+  disableWorkspaceTrust,
+  enableWorkspaceTrust,
+  trustWorkspace,
 } from './lib/index.js'
+
+// ── 信任门测试隔离（#64）─────────────────────────────────────────────────────
+// apply() 会启用工作区信任门并在 activeHomeDir 写注册表；applyInner 无 homeDir 配置
+// 时 switchHomeDir 的回落链读 MEOW_MEMORY_HOME / DSH_HOME——全部指向临时目录，测试
+// 绝不触真实 ~/.dsh-meow（历史教训：首次接入时 apply 用例把 seed 标记写进了真实
+// 全局目录）。memory_home 的两块用例自行管理 env 并断言「env 缺席时回落平台默认」，
+// 进出那些块时由块内暂存/恢复（见各块注释）。
+const savedTestEnvHome = process.env.MEOW_MEMORY_HOME
+const savedTestDshHome = process.env.DSH_HOME
+const meowTestHome = mkdtempSync(join(tmpdir(), 'meow-test-home-'))
+process.env.MEOW_MEMORY_HOME = meowTestHome
+process.env.DSH_HOME = join(meowTestHome, 'dsh-home')
+mkdirSync(process.env.DSH_HOME, { recursive: true })
+
+// test.mjs 的既有用例都在临时工作区上直接建库（不经 getDb 的创建登记），信任门一开
+// 全被拦。信任门自身的行为由 tests/trust.mjs 专测；这里每次 apply 后即关掉，
+// 互不干扰（finally：apply 半途抛错也不把门留在开的状态）。
+const applyGateOff = async (c, cfg) => {
+  try {
+    await apply(c, cfg)
+  } finally {
+    disableWorkspaceTrust()
+  }
+}
 
 let passed = 0
 let failed = 0
@@ -1139,7 +1167,7 @@ function makeCtx(subagents) {
 }
 
 const { ctx, tools, handlers } = makeCtx()
-await apply(ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+await applyGateOff(ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
 check('eight tools registered', tools.length === 8 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project', 'memory_home']
   .every((name) => tools.some((t) => t.name === name)), `got ${tools.map((t) => t.name).join(',')}`)
 
@@ -1151,6 +1179,10 @@ check('eight tools registered', tools.length === 8 && ['memory_remember', 'memor
   const tmpH = mkdtempSync(join(tmpdir(), 'meow-home-tool-'))
   const savedReal = activeHomeDir()
   const savedDshHome = process.env.DSH_HOME
+  // 本块断言「无 env/配置时回落链读指针/平台默认」——文件顶部的信任门隔离 env
+  //（MEOW_MEMORY_HOME）在这块内必须缺席，块末装回（#64 测试隔离）。
+  const savedMmEnvHome = process.env.MEOW_MEMORY_HOME
+  delete process.env.MEOW_MEMORY_HOME
   process.env.DSH_HOME = join(tmpH, 'dsh-home')
   mkdirSync(process.env.DSH_HOME, { recursive: true })
 
@@ -1184,6 +1216,8 @@ check('eight tools registered', tools.length === 8 && ['memory_remember', 'memor
 
   if (savedDshHome === undefined) delete process.env.DSH_HOME
   else process.env.DSH_HOME = savedDshHome
+  if (savedMmEnvHome === undefined) delete process.env.MEOW_MEMORY_HOME
+  else process.env.MEOW_MEMORY_HOME = savedMmEnvHome // 信任门隔离值装回（#64）
   setActiveHomeDir(savedReal)
   rmSync(tmpH, { recursive: true, force: true })
 }
@@ -1247,6 +1281,19 @@ check('search status=archived single filter (#68)', sArch.hits.length >= 1 && sA
     JSON.stringify({ bm25: hitE.explain.bm25, rw: hitE.explain.recencyWeight, score: hitE.score }))
   const noE = await searchTool.execute({ query: '解释检索测试' }, execE)
   check('search default: no explain field (#51)', noE.hits[0] !== undefined && noE.hits[0].explain === undefined)
+  // #79：render 文本必须消费 explain——宿主把 render 产物作为工具结果 content 喂给
+  // 模型,只进结构化字段=模型不可见（0.31.1 的缺陷）。
+  const renderedE = searchTool.output.render({}, withE).map((p) => p.text).join('\n')
+  check('search render text carries explain breakdown (#79)',
+    renderedE.includes('bm25=') && renderedE.includes(`importance=${String(hitE.explain.importance)}`) &&
+    renderedE.includes(`status=${hitE.explain.status}`), renderedE.split('\n').slice(-2).join(' | '))
+  const renderedNo = searchTool.output.render({}, noE).map((p) => p.text).join('\n')
+  check('search render text: explain 关时不追加 (#79)', !renderedNo.includes('bm25='))
+  // #79 顺带：零命中 + 未显式传 level → note 给 soul/user 排查指引；显式传 level 不给。
+  const zeroImplicit = await searchTool.execute({ query: '零命中探针词xyzq' }, execE)
+  check('search zero-hit note hints soul/user scope (#79)', zeroImplicit.hits.length === 0 && zeroImplicit.note.includes('soul') && zeroImplicit.note.includes('level'))
+  const zeroExplicit = await searchTool.execute({ query: '零命中探针词xyzq', level: 'fact' }, execE)
+  check('search zero-hit note: explicit level keeps base note (#79)', zeroExplicit.hits.length === 0 && !zeroExplicit.note.includes('soul'))
   dbE.close()
   rmSync(wsE, { recursive: true, force: true })
 }
@@ -1653,7 +1700,7 @@ check('project rules injected in paragraph', pjRules.text.includes('设计原则
 const guideCtx = makeCtx()
 const sections = []
 guideCtx.ctx.get = (name) => (name === 'systemPrompt' ? { section: (s) => sections.push(s) } : undefined)
-await apply(guideCtx.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+await applyGateOff(guideCtx.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
 check('guide section registered', sections.length === 1 && sections[0].name === 'meow-memory:guide' &&
   sections[0].order === 130 && sections[0].text === getMemoryGuide(), `got ${JSON.stringify(sections)}`)
 check('guide covers all seven tools', ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project']
@@ -1748,6 +1795,36 @@ check('pre-step inserts independent snapshot', decisionA.kind === 'enter' && dec
 check('first user message remains pristine', decisionA.messages[1].source.kind === 'user' &&
   decisionA.messages[1].content.length === 1 && decisionA.messages[1].content[0].text === '你好')
 check('snapshot has no legacy prompt separator', !decisionA.messages[0].content[0].text.includes('本轮用户prompt：'))
+
+// ── #64 外部记忆库信任门：pre-step 分支（未信任 → 一次性提示 + 全部注入暂停）──
+{
+  // 预置库形态：.dsh-meow/ 里带一个不是本机建的 memory.db（空文件即可——判定只看
+  // 注册表，不看库内容）。门指向临时注册表（applyGateOff 已把 apply 期的门关掉，
+  // 这里显式重开，测完即关，不泄漏给后续用例）。
+  const wsExt = mkdtempSync(join(tmpdir(), 'mm-external-'))
+  mkdirSync(join(wsExt, '.dsh-meow'))
+  writeFileSync(join(wsExt, '.dsh-meow', 'memory.db'), Buffer.alloc(0))
+  const extHome = mkdtempSync(join(tmpdir(), 'mm-external-home-'))
+  enableWorkspaceTrust(extHome)
+  const extAgent = { session: { header: { cwd: wsExt, id: 'apply-session-ext' }, events: [] }, steer: () => {} }
+  const extDecision = async () => preStep(
+    { agent: extAgent, messages: [{ content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }], turn: 1, step: 1, signal: new AbortController().signal },
+    async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }] }),
+  )
+  const d1 = await extDecision()
+  check('#64 未信任：首轮插外部库提示、不插长期记忆', d1.messages.length === 2 &&
+    d1.messages[0].content[0].text.includes('外部记忆库') && d1.messages[0].content[0].text.includes('/meow-trust') &&
+    !JSON.stringify(d1.messages).includes('===== 长期记忆 ====='))
+  const d2 = await extDecision()
+  check('#64 未信任：提示只发一次，第二轮静默停用', d2.messages.length === 1 && !JSON.stringify(d2.messages).includes('外部记忆库'))
+  trustWorkspace(wsExt, 'meow-trust')
+  const d3 = await extDecision()
+  check('#64 信任后：外部提示不再出现，注入路径恢复通行', !JSON.stringify(d3.messages).includes('外部记忆库'))
+  disableWorkspaceTrust()
+  closeAllDbs() // pre-step 注入路径打开的缓存连接一并关掉（Windows 文件锁）
+  try { rmSync(extHome, { recursive: true, force: true }) } catch { /* 占用则留给系统清理 */ }
+  try { rmSync(wsExt, { recursive: true, force: true }) } catch { /* 同上 */ }
+}
 
 // 回归（真机 2026-08-16）：首条用户消息与插件通知同批到达（messages[0].source.kind='plugin'，
 // 如 user-approval 的 policy 变更通知）→ 快照必须仍注入到真实用户消息上，且命中链路不得在首轮触发。
@@ -1898,7 +1975,7 @@ dbReinj.close()
 // 设置任务；seen（accessed '__welcomeGuide__'）记账 → 同会话不重复；显式配置 → 永久短路。
 const wsGuide = mkdtempSync(join(tmpdir(), 'mm-guide-'))
 const { ctx: guideApplyCtx, handlers: guideHandlers } = makeCtx()
-await apply(guideApplyCtx, { enabled: true, projectDir: '.dsh-meow' }) // 不传 promptLang = 未配置
+await applyGateOff(guideApplyCtx, { enabled: true, projectDir: '.dsh-meow' }) // 不传 promptLang = 未配置
 const guidePreStep = guideHandlers['agent/pre-step']
 const guideAgent = { session: { header: { cwd: wsGuide, id: 'guide-session-1' }, events: [events.userMsg('更早的话')] }, steer: () => {} }
 const guideMsg = { content: [{ type: 'text', text: '继续' }], source: { kind: 'user' } }
@@ -1924,7 +2001,7 @@ const dGuide2 = await guidePreStep(
 )
 check('welcome guide not re-injected same session', dGuide2.messages[0].content.length === 1)
 const { ctx: zhSetCtx, handlers: zhSetHandlers } = makeCtx()
-await apply(zhSetCtx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+await applyGateOff(zhSetCtx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
 const zhAgent = { session: { header: { cwd: wsGuide, id: 'zh-set-session' }, events: [events.userMsg('x')] }, steer: () => {} }
 const zhMsg = { content: [{ type: 'text', text: 'y' }], source: { kind: 'user' } }
 const dZhSet = await zhSetHandlers['agent/pre-step'](
@@ -2094,7 +2171,7 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
 {
   const calls = []
   const d = makeCtx({ start: (name, req) => { calls.push({ name, req }); return { id: 'c', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} } } })
-  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
+  await applyGateOff(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
   const dSteered = []
   d.handlers['agent/turn-stopping']({ agent: { session: { header: { cwd: ws, id: 's-steer-always' }, events: sevenSteps }, steer: (m) => dSteered.push(m) } }, { turn: 1, signal: new AbortController().signal })
   check('reflect: always steered even with model configured', dSteered.length === 1 && dSteered[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
@@ -2104,7 +2181,7 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
 // 换模型（v0.24）：agent/request waterfall 在反思/梦境轮覆盖 provider/model，其余请求放行
 {
   const d = makeCtx()
-  await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
+  await applyGateOff(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
   const reqHandler = d.handlers['agent/request']
   check('model override: agent/request waterfall registered when model set', typeof reqHandler === 'function')
   const seed = async () => ({ provider: 'base', model: 'base-model' })
@@ -2127,7 +2204,7 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   check('model override: subagent request untouched', out5.provider === 'base' && out5.model === 'base-model')
   // 未配置模型 → 完全不注册 waterfall（零开销路径）
   const d2 = makeCtx()
-  await apply(d2.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+  await applyGateOff(d2.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
   check('model override: no model → no waterfall registered', d2.handlers['agent/request'] === undefined)
 }
 
@@ -2204,8 +2281,9 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
     if (typeof d === 'function') disposers.push(d)
     return d
   }
-  await apply(ctxCmd, { enabled: true })
-  check('/dream auto-registered via commands service', registeredC.length === 1 && registeredC[0].name === 'dream',
+  await applyGateOff(ctxCmd, { enabled: true })
+  // #64 起同一注册点还挂 /meow-trust（信任门恢复命令）——两条都该在。
+  check('/dream + /meow-trust auto-registered via commands service', registeredC.length === 2 && registeredC[0].name === 'dream' && registeredC[1].name === 'meow-trust',
     JSON.stringify(registeredC.map((d) => d.name)))
 }
 
@@ -2238,16 +2316,16 @@ function makeSettingsCtx(userLayer) {
 
 // ① user 层 enabled:false 必须真的关掉（旧代码忽略它 → 照常注册 7 个工具）
 const sc1 = makeSettingsCtx({ enabled: false })
-await apply(sc1.ctx, { enabled: true, projectDir: '.dsh-meow' })
+await applyGateOff(sc1.ctx, { enabled: true, projectDir: '.dsh-meow' })
 check('issue#21 user 层 enabled:false 生效（不注册工具）', sc1.tools.length === 0, `got ${sc1.tools.length}`)
 // ② user 层 promptLang 必须真的写进 prompt-loader
 const sc2 = makeSettingsCtx({ promptLang: 'en' })
-await apply(sc2.ctx, { enabled: true, projectDir: '.dsh-meow' })
+await applyGateOff(sc2.ctx, { enabled: true, projectDir: '.dsh-meow' })
 check('issue#21 user 层 promptLang 生效', getPromptLang() === 'en', `got ${getPromptLang()}`)
 setPromptLang('zh')
 // ③ 未被 user 层覆盖的字段仍按 patch 层跑（user 层是字段级覆盖、不是整层替换）
 const sc3 = makeSettingsCtx({ promptLang: 'zh' })
-await apply(sc3.ctx, { enabled: true, projectDir: '.dsh-meow', hitTopK: 9 })
+await applyGateOff(sc3.ctx, { enabled: true, projectDir: '.dsh-meow', hitTopK: 9 })
 check('issue#21 未被 user 层覆盖的字段仍走 patch（工具照常注册）', sc3.tools.length === 8, `got ${sc3.tools.length}`)
 
 // ── 0.1.7 宿主盲区补丁：describe 值冻结修正 + homeDirPresets 注入 + write 热切换 ──
@@ -2278,7 +2356,7 @@ check('issue#21 未被 user 层覆盖的字段仍走 patch（工具照常注册�
     // 裸 mock 不吞会炸测试进程——补齐同款语义。
     inject: (_deps, cb) => { queueMicrotask(() => { try { cb({ settings: svc017, effect: ctx017.effect }) } catch { /* cordis 静默吞 */ } }) },
   }
-  await apply(ctx017, { enabled: true, projectDir: '.dsh-meow' })
+  await applyGateOff(ctx017, { enabled: true, projectDir: '.dsh-meow' })
   const proto017 = Object.getPrototypeOf(svc017)
   check('0.1.7 describe/write 壳已装配', proto017.__meowValueRefresh === true && proto017.__meowWriteHook === true,
     JSON.stringify({ v: proto017.__meowValueRefresh, w: proto017.__meowWriteHook }))
@@ -2301,14 +2379,14 @@ check('issue#21 未被 user 层覆盖的字段仍走 patch（工具照常注册�
     get: (n) => (n === 'settings' ? svcLegacy : undefined),
     inject: (_deps, cb) => { queueMicrotask(() => cb({ settings: svcLegacy, effect: ctxLegacy.effect })) },
   }
-  await apply(ctxLegacy, { enabled: true, projectDir: '.dsh-meow' })
+  await applyGateOff(ctxLegacy, { enabled: true, projectDir: '.dsh-meow' })
   check('0.1.6 原生链路不装壳（Object.prototype 不被污染）',
     Object.getPrototypeOf(svcLegacy).__meowValueRefresh === undefined && Object.getPrototypeOf(svcLegacy).__meowWriteHook === undefined, '')
 }
 
 // disabled
 const { ctx: ctxOff, tools: toolsOff, handlers: handlersOff } = makeCtx()
-await apply(ctxOff, { enabled: false })
+await applyGateOff(ctxOff, { enabled: false })
 check('disabled registers nothing', toolsOff.length === 0 && Object.keys(handlersOff).length === 0)
 
 db.close(); db2.close(); db3.close(); db4.close()
@@ -2390,6 +2468,10 @@ rmSync(wsNoDb, { recursive: true, force: true })
 {
   const savedReal = activeHomeDir()
   const tmp = mkdtempSync(join(tmpdir(), 'meow-homedir-'))
+  // 本块整段断言「无 env 时的回落语义」——文件顶部的信任门隔离 env
+  //（MEOW_MEMORY_HOME，#64）块内缺席，块末装回。
+  const savedMmEnvHomeHd = process.env.MEOW_MEMORY_HOME
+  delete process.env.MEOW_MEMORY_HOME
 
   // resolveHomeDir：预设/缺省/非法输入
   check('resolveHomeDir: default 标记=平台默认目录', resolveHomeDir('default') === DEFAULT_HOME_DIR)
@@ -2459,6 +2541,8 @@ rmSync(wsNoDb, { recursive: true, force: true })
   check('switch: 目标是文件→失败留原地', !sw.changed && sw.mode === 'failed' && sw.error !== undefined && activeHomeDir() === copyTo)
 
   setActiveHomeDir(savedReal)
+  if (savedMmEnvHomeHd === undefined) delete process.env.MEOW_MEMORY_HOME
+  else process.env.MEOW_MEMORY_HOME = savedMmEnvHomeHd // 信任门隔离值装回（#64）
   rmSync(tmp, { recursive: true, force: true })
 }
 
@@ -2505,7 +2589,49 @@ rmSync(wsNoDb, { recursive: true, force: true })
   // connectionAuthOf：属性访问优先，ctx.get 回退
   check('connectionAuthOf: property access (#57)', connectionAuthOf({ connection: { requestRejection: () => undefined } }) !== undefined)
   check('connectionAuthOf: ctx.get fallback (#57)', connectionAuthOf({ get: (n) => (n === 'connection' ? { requestRejection: () => 403 } : undefined) }) !== undefined)
+
+  // ── #78 authGateLazy：懒解析 + connection 缺失降级环回 fence（替换永久 503）──
+  const lazyRes = () => makeRes()
+  let degradedCount = 0
+  const lazyNoConn = authGateLazy({}, () => {}, { onDegraded: () => { degradedCount++ } })
+  const p1 = lazyRes(); let pass1 = false
+  lazyNoConn({ headers: { host: '127.0.0.1:19387' } }, p1); pass1 = p1.statusCode === null
+  const p2 = lazyRes()
+  lazyNoConn({ headers: { host: '127.0.0.1:19387' } }, p2)
+  check('#78 lazy: connection 缺失 + 环回 Host → 放行（不再 503）', pass1 && p2.statusCode === null)
+  check('#78 lazy: 降级提示只发一次', degradedCount === 1)
+  const c1 = lazyRes()
+  lazyNoConn({ headers: { host: '127.0.0.1:19387', 'sec-fetch-site': 'cross-site', origin: 'https://evil.example' } }, c1)
+  check('#78 lazy: 降级 fence 挡跨站（sec-fetch-site）', c1.statusCode === 403)
+  const c2 = lazyRes()
+  lazyNoConn({ headers: { host: 'evil.example:80' } }, c2)
+  check('#78 lazy: 降级 fence 挡非环回 Host', c2.statusCode === 403)
+  const c3 = lazyRes()
+  lazyNoConn({ headers: { host: '127.0.0.1:19387', origin: 'https://evil.example' } }, c3)
+  check('#78 lazy: 降级 fence 挡异源 Origin', c3.statusCode === 403)
+  // connection 可见 → 官方闸语义（401 短路）
+  const lazyConn = authGateLazy({ connection: { requestRejection: () => 401 } }, mustNotRun)
+  const g1 = lazyRes()
+  lazyConn({ headers: { host: '127.0.0.1:19387' } }, g1)
+  check('#78 lazy: connection 可见 → requestRejection 官方闸', g1.statusCode === 401)
+  // 晚注册升级：第一次取不到（降级放行），第二次取到（官方闸 403）——懒解析自动升级
+  let lateConnection = false
+  const lazyLate = authGateLazy({ get: (n) => (n === 'connection' && lateConnection ? { requestRejection: () => 403 } : undefined) }, () => {})
+  const l1 = lazyRes()
+  lazyLate({ headers: { host: '127.0.0.1:19387' } }, l1)
+  lateConnection = true
+  const l2 = lazyRes()
+  lazyLate({ headers: { host: '127.0.0.1:19387' } }, l2)
+  check('#78 lazy: 服务晚到 → 该请求起自动升级官方闸', l1.statusCode === null && l2.statusCode === 403)
 }
+
+// 信任门隔离收尾（#64）：env 装回、临时 home 清掉。
+if (savedTestEnvHome === undefined) delete process.env.MEOW_MEMORY_HOME
+else process.env.MEOW_MEMORY_HOME = savedTestEnvHome
+if (savedTestDshHome === undefined) delete process.env.DSH_HOME
+else process.env.DSH_HOME = savedTestDshHome
+disableWorkspaceTrust()
+rmSync(meowTestHome, { recursive: true, force: true })
 
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

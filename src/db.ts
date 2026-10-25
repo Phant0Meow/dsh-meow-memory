@@ -18,6 +18,7 @@ import { existsSync, mkdirSync, renameSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fillTemplate, getPromptLang, keyedValue } from './prompt-loader.js'
+import { registerCreatedWorkspace } from './trust.js'
 
 export type Level = 'soul' | 'user' | 'project' | 'fact' | 'lesson' | 'topic' | 'rules'
 export type Status = 'active' | 'archived' | 'stale'
@@ -805,7 +806,13 @@ export function getDb(workspace: string, dir = '.dsh-meow'): MemoryDb {
   const key = `${workspace}\u0000${dir}`
   let db = dbCache.get(key)
   if (!db) {
-    db = new MemoryDb(memoryDbPath(workspace, dir))
+    const path = memoryDbPath(workspace, dir)
+    // 信任门（#64）：memory.db 不存在 = 即将由本插件创建的空库。当时 .dsh-meow
+    // 目录为空/不存在 → 登记为「本机创建」（信任）；目录已有预置文件（PROJECT.md /
+    // sessions/ / memory.db.bak 等）→ 不登记，保持未信任等 /meow-trust。
+    const creating = !existsSync(path)
+    db = new MemoryDb(path)
+    if (creating) registerCreatedWorkspace(workspace, dir)
     dbCache.set(key, db)
   }
   return db

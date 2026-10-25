@@ -158,6 +158,20 @@ When it cannot be resolved (the instance override layer's `labels.md` is an olde
 
 `node:sqlite` (default-enabled on Node ≥22.13; 22.5–22.12 needs `--experimental-sqlite`) plus a self-contained esbuild bundle (`lib/index.js`). **No native modules.**
 
+## 15. Why external memory libraries require a trust gate (#64)
+
+Housing the memory db inside the workspace is the product's core design (the workspace carries its memory); the corollary is that **anyone can pre-seed a `.dsh-meow`**. A malicious repo carrying a crafted `memory.db` (or a `PROJECT.md`, which autoMigrate would import) gets its content spliced into the `===== Long-term memory ===== / About the user` block on the victim's first message — the **highest-trust framing in the whole plugin**. Attacker text is laundered into "words the user actually said", with zero interaction (it fires automatically on the first message) and zero notice (a pre-seeded db is not `isFresh`, so the first-create notice never fires). The host does not gate AGENTS.md-style project files either, but the model knows those are third-party project content; this channel carries a far stronger disguise, and it is one we built and can close.
+
+**The criterion: a machine-local registry, and nothing else.** `<global home>/trusted-workspaces/<hash-of-normalised-path>.json` — outside the workspace, out of reach for repo authors, not forgeable. Any marker inside the workspace (seen files, db fields) can be pre-seeded along with the malicious library and is therefore unusable.
+
+**Three registration points cover every legitimate flow:**
+
+1. **Trust at creation** (getDb sees no memory.db → the plugin is about to create an empty one): but only if the `.dsh-meow` directory was empty or absent at that moment — the "PROJECT.md only, no db" attack would otherwise slip through creation-trust plus autoMigrate; a non-empty directory (the ignore set covers only runtime residue like memory.db*/dream-debug.log) is not registered;
+2. **Upgrade seeding** (at apply, read `window-index.json` and register every workspace listed): that file also lives in the global home — unforgeable — and its semantics are exact: "actually opened on this machine before the upgrade" = a library from the trusted era; existing users never notice;
+3. **The `/meow-trust` command** (human confirmation): the single interaction point for new machines / restored backups / hand-copied directories; writes the registry and takes effect immediately (every gate is a live check, no restart).
+
+**Untrusted = everything paused** (same short-circuit points as disabledWorkspaces: no injection, no hit chain, no dream, no reflection, all tools refused, no PROJECT.md migration), plus a one-time notice on the first round (bookkeeping likewise in the registry). The failure directions are deliberately asymmetric: gate disabled / registry IO failure → **fail-open** (identical to 0.31.x behaviour; the trust machinery must never kill memory); corrupt registry file → **fail-closed** (back to untrusted, re-run `/meow-trust`; the cost is one repeated notice, not a silent bypass).
+
 ---
 
 ## See also
