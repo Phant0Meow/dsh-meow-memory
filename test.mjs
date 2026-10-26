@@ -2208,6 +2208,64 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   check('model override: no model → no waterfall registered', d2.handlers['agent/request'] === undefined)
 }
 
+// #71：反思/dream 轮结束后的普通请求不得继承 delegate 路由。宿主把每次请求的实际路由写进
+// request/header，modelSelection 投影的 lastUsed 随之变成 delegate；插件必须还原被覆盖的主模型，
+// 且绝不覆盖用户在 dream 期间的选择（用日志里的 model/selection 事件识别）。
+{
+  const sig = new AbortController().signal
+  const header = (provider, model) => ({ type: 'request/header', data: { header: { config: { provider, model } } } })
+  const reflectTurn = () => [events.turnStart(), { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-reflect] 反思任务' }] } }]
+  const setup = async () => {
+    const d = makeCtx()
+    await apply(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
+    return d.handlers['agent/request']
+  }
+  const call = (reqHandler, log, sid, turn, seed) => reqHandler({ agent: { session: { header: { cwd: ws, id: sid }, events: log } }, turn, step: 1, signal: sig }, async () => seed)
+
+  // 场景 1：主模型 header 已消费（pending=null）→ 反思轮覆盖 → 普通轮必须还原
+  const req1 = await setup()
+  const log1 = reflectTurn()
+  log1.push(header('base', 'base-model')) // 历史：主模型请求已落 header，pending 已被消费
+  const ovr1 = await call(req1, log1, 's-71a', 6, { provider: 'base', model: 'base-model' })
+  check('#71 reflect turn still overrides to delegate', ovr1.provider === 'prov' && ovr1.model === 'main', JSON.stringify(ovr1))
+  log1.push(header(ovr1.provider, ovr1.model)) // 宿主把 delegate 请求写进 header → lastUsed=delegate
+  // 同一反思轮第 2 个请求：seed 已是 delegate header 回落，不得把 delegate 记成主模型
+  const ovr1b = await call(req1, log1, 's-71a', 6, { provider: 'prov', model: 'main' })
+  check('#71 repeated delegate step keeps the first main route', ovr1b.provider === 'prov' && ovr1b.model === 'main')
+  log1.push(events.turnStart())
+  const ord1 = await call(req1, log1, 's-71a', 7, { provider: 'prov', model: 'main', reasoningEffort: 'max' })
+  check('#71 ordinary turn after delegate restores the main model', ord1.provider === 'base' && ord1.model === 'base-model', JSON.stringify(ord1))
+  check('#71 restore clears inherited reasoning effort', ord1.reasoningEffort === undefined, JSON.stringify(ord1))
+  const ord1b = await call(req1, log1, 's-71a', 8, { provider: 'base', model: 'base-model' })
+  check('#71 restore is one-shot (no stale state)', ord1b.provider === 'base' && ord1b.model === 'base-model')
+
+  // 场景 2：用户在 dream 期间亲手选中 delegate 模型本身 → 放行（不还原）
+  const req2 = await setup()
+  const log2 = reflectTurn()
+  log2.push(header('base', 'base-model'))
+  const ovr2 = await call(req2, log2, 's-71b', 6, { provider: 'base', model: 'base-model' })
+  log2.push(header(ovr2.provider, ovr2.model))
+  log2.push({ type: 'model/selection', data: { provider: 'prov', model: 'main' } }) // 用户手动选回 delegate
+  log2.push(events.turnStart())
+  const ord2 = await call(req2, log2, 's-71b', 7, { provider: 'prov', model: 'main' })
+  check('#71 user-selected delegate model is never overridden', ord2.provider === 'prov' && ord2.model === 'main', JSON.stringify(ord2))
+
+  // 场景 3：用户在 dream 期间选了别的模型 → 放行（路由不同即清账）
+  const req3 = await setup()
+  const log3 = reflectTurn()
+  log3.push(header('base', 'base-model'))
+  await call(req3, log3, 's-71c', 6, { provider: 'base', model: 'base-model' })
+  log3.push(events.turnStart())
+  const ord3 = await call(req3, log3, 's-71c', 7, { provider: 'other', model: 'picked' })
+  check('#71 user-picked different model wins', ord3.provider === 'other' && ord3.model === 'picked')
+
+  // 场景 4：子代理请求 → 既不覆盖也不还原
+  const req4 = await setup()
+  const log4 = reflectTurn()
+  const out4 = await req4({ agent: { session: { header: { cwd: ws, id: 's-71d', origin: 'subagent' }, events: log4 } }, turn: 1, step: 1, signal: sig }, async () => ({ provider: 'base', model: 'base-model' }))
+  check('#71 subagent request untouched by restore', out4.provider === 'base' && out4.model === 'base-model')
+}
+
 // isMemoryTaskTurn 单元：跨 turn 边界（marker 只认当前 turn，上一轮的 marker 不残留）
 {
   const { isMemoryTaskTurn } = await import('./lib/index.js')

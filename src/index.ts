@@ -475,6 +475,13 @@ interface SessionHeaderLike {
   origin?: unknown
 }
 
+// #71：agent/request 解析结果与要还原的模型路由（effort 只保留显式值）。
+interface ModelRoute {
+  provider?: string
+  model?: string
+  reasoningEffort?: string
+}
+
 /** 工作区 = 会话 cwd（项目根）；目录名 projectDir 单独下传给各模块（防双拼）。 */
 function workspaceOfAgent(agent: { session?: { header?: SessionHeaderLike } }): string | null {
   const cwd = agent?.session?.header?.cwd
@@ -540,6 +547,27 @@ export function isMemoryTaskTurn(events: readonly unknown[]): boolean {
       .map((b) => b.text ?? '')
       .join(' ')
     if (text.includes(REFLECT_MARKER) || text.includes(DREAM_MARKER)) return true
+  }
+  return false
+}
+
+/** 请求解析结果 → 主模型路由（#71 还原用）。 */
+function mainRouteOf(config: ModelRoute): ModelRoute {
+  return { provider: config.provider, model: config.model, ...(config.reasoningEffort === undefined ? {} : { reasoningEffort: String(config.reasoningEffort) }) }
+}
+
+// #71：覆盖之后用户是否亲手选过模型？宿主 selectForNextRequest 会 append model/selection。
+// 反向扫描：先撞到 model/selection = 用户选择（含选中 delegate 本身）；先撞到路由不等于
+// delegate 的 request/header = 覆盖之前的历史，结束（覆盖前后的 header 都是 delegate/主模型，
+// 不会误判）。零分配，O(尾部事件)。
+function userSelectedAfterOverride(events: readonly unknown[], route: ModelRoute): boolean {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i] as { type?: string; data?: { header?: { config?: ModelRoute } } } | undefined
+    if (e?.type === 'model/selection') return true
+    if (e?.type === 'request/header') {
+      const c = e.data?.header?.config
+      if (c?.provider !== route.provider || c?.model !== route.model) return false
+    }
   }
   return false
 }
@@ -1673,23 +1701,56 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   //   配置值，其余请求（正常对话/工具轮）原样放行——触发前换上、轮次结束自动换回，
   //   无状态：判定=当前 turn 的指令消息是否带 [meow-memory-reflect]/[meow-memory-dream]
   //   文本标记（steer 指令消息在请求前已落 log，agent-loop L554 实证；与 wasDreamTurn/
-  //   isPluginTurn 同口径），不存在需要清理的"覆盖中"状态——用户中止/崩溃/热重载
-  //   都不留脏覆盖。
+  //   isPluginTurn 同口径）。
+  // #71：覆盖只作用于单个请求，但宿主把「本次请求实际路由」写进 request/header，其
+  //   modelSelection 投影的 lastUsed 因此变成 delegate 模型；反思轮结束后的下一条普通
+  //   请求没有 pending 可回落，就沿用 delegate 并自我固化（真机复现）。插件侧不 append
+  //   model/selection（那是用户选择语义），改为记住「被覆盖掉的主模型」：下一条普通请求
+  //   若仍解析到我们写下的 delegate 路由（= 纯 request/header 回落）就还原主模型并清账；
+  //   解析结果不同 = 用户在 dream 期间自己选了模型 → 原样放行并清账（绝不覆盖用户选择）。
+  //   用户恰好选中 delegate 模型本身：宿主会 append model/selection，日志里能看见 → 放行。
+  //   内存态仅进程内（宿主重启丢一次还原，已知限制）。
   // waterfall 契约：listener 必须 return 最终 config（不改也要透传 next() 结果）。
   if (resolved.delegate.modelSpec !== undefined) {
     const spec = resolved.delegate.modelSpec
+    // #71：sid → 主模型路由 + 我们写下的 delegate 路由（配对保存，避免把 delegate 当主模型）
+    const delegateRestore = new Map<string, { main: ModelRoute; route: ModelRoute }>()
+    const MAX_DELEGATE_TRACKED = 512
     ctx.on('agent/request', async (payload: { agent?: { session?: { header?: SessionHeaderLike } } }, next: () => Promise<unknown>) => {
-      const config = await next() as { provider?: string; model?: string }
+      const config = await next() as ModelRoute
       const agent = payload?.agent
-      // 子代理请求不覆盖（fork 子代理已不再由本插件产生；GUI 手动 fork 的照常放行）
+      // 子代理请求不覆盖也不还原（fork 子代理已不再由本插件产生；GUI 手动 fork 的照常放行）
       if (agent === undefined || agent.session?.header?.origin === 'subagent') return config
-      if (!isMemoryTaskTurn(sessionEventsOf(agent.session as never))) return config
-      ctx.logger.info(`meow-memory: memory task turn → model override ${spec.provider ?? '(inherit)'}/${spec.model ?? ''}`)
-      return {
-        ...config,
-        ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
-        ...(spec.model !== undefined ? { model: spec.model } : {}),
+      const sid = sessionIdOfAgent(agent)
+      const events = sessionEventsOf(agent.session as never)
+      if (isMemoryTaskTurn(events)) {
+        // 只在本会话还没记过时记：同一反思轮第 2 步起解析出的是我们写下的 delegate 路由，
+        // 记错会把 delegate 存成主模型（真机日志一次反思有 2 个 header）。无会话 id 不记（防串会话）。
+        const route: ModelRoute = { provider: spec.provider ?? config.provider, model: spec.model ?? config.model }
+        if (sid !== 'unknown' && !delegateRestore.has(sid)) {
+          delegateRestore.set(sid, { main: mainRouteOf(config), route })
+          // 进程级 Map 兜底上限（Map 保留插入序）：只保最近 MAX_DELEGATE_TRACKED 个会话
+          while (delegateRestore.size > MAX_DELEGATE_TRACKED) {
+            const oldest = delegateRestore.keys().next().value
+            if (oldest === undefined) break
+            delegateRestore.delete(oldest)
+          }
+        }
+        ctx.logger.info(`meow-memory: memory task turn → model override ${spec.provider ?? '(inherit)'}/${spec.model ?? ''}`)
+        return {
+          ...config,
+          ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
+          ...(spec.model !== undefined ? { model: spec.model } : {}),
+        }
       }
+      const remembered = delegateRestore.get(sid)
+      if (remembered === undefined) return config // 没覆盖过 / 已还原：零开销放行
+      delegateRestore.delete(sid)
+      if (userSelectedAfterOverride(events, remembered.route)) return config
+      if (config.provider !== remembered.route.provider || config.model !== remembered.route.model) return config // 用户换了别的模型：放行
+      ctx.logger.info(`meow-memory: restore main model ${remembered.main.provider}/${remembered.main.model} after memory task turn`)
+      const { reasoningEffort: _inherited, ...rest } = config
+      return { ...rest, provider: remembered.main.provider, model: remembered.main.model, ...(remembered.main.reasoningEffort === undefined ? {} : { reasoningEffort: remembered.main.reasoningEffort }) }
     })
     ctx.logger.info(`meow-memory: model override armed for reflect/dream turns (${spec.provider ?? '(inherit)'}/${spec.model ?? ''})`)
   }
