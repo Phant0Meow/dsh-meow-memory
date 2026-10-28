@@ -20,7 +20,7 @@ Versão **0.31.0** ｜ Histórico: [CHANGELOG.md](CHANGELOG.md) ｜ Suporta **ds
 - **Reflexão**: depois de ≥7 passos de ferramenta seguidos dentro de uma mesma tarefa, o plugin pergunta ao modelo se há algo que valha memorizar desde a última consolidação. Se a última ferramenta for `memory_*`, considera que já houve memorização ativa e não reflete de novo.
 - **Portão de confiança de memória externa**: um `.dsh-meow` trazido pelo workspace que não foi criado nesta máquina (ex.: repositório externo clonado) fica pausado por padrão — um aviso na primeira rodada, e `/meow-trust` reativa na hora; bibliotecas criadas localmente e workspaces abertos antes do upgrade são confiados automaticamente, sem nenhum atrito no uso normal.
 - **UI do cliente**: o texto injetado é recolhido em uma barra, as rodadas de reflexão/dream em um card expansível, e a lista de sessões mostra ícones de estado do dream (🌙 consolidado / lua em respiração em andamento / lua cinza com barra pulado).
-- **Zero dependências de runtime**: `node:sqlite` + artefato esbuild autocontido (`lib/index.js`). **Nenhum módulo nativo.**
+- **Sem dependências de runtime instaladas separadamente**: `node:sqlite` + artefato esbuild (`lib/index.js`); o host DSH resolve os peers `schemastery` e `dsh-llm`. **Nenhum módulo nativo.**
 
 ## 📦 Instalação
 
@@ -136,14 +136,23 @@ Há também o comando `/dream`: digite `/dream` no input para consolidar esta ja
 
 ```sh
 npm install
-npm run build          # empacota com esbuild → lib/index.js (autocontido)
+npm run build          # empacota com esbuild → lib/index.js (peers do host externos)
 npm run test           # 228 testes de lógica: db / bm25 / migrate / inject / reflect / dream / tools / apply
 ```
 
 Os pacotes `@deepseek-ai/*` ficam no pnpm workspace do dsh-meow, não no `node_modules` deste pacote.
 No Windows, `npm run link-workspace` (ou `scripts/link-workspace.ps1`) cria os junctions espelhando os
 pacotes do workspace para o esbuild resolvê-los; o `build.mjs` os referencia via `nodePaths`.
-Esses links só são necessários em tempo de build.
+O build não precisa do peer opcional `dsh-llm`. Para executar os testes diretamente
+com Node, vincule `@deepseek-ai/dsh-llm` de um workspace DSH compatível; o loader do
+profile DSH resolve esse peer durante o uso normal. Não o adicione novamente a
+`devDependencies`: instalações `file:` / `link:` podem introduzir outra cópia de
+um pacote central do host no profile (#84).
+
+`node tests/build-host-peers.mjs` verifica o build limpo sem peers do host (#87).
+`node tests/host-peers.mjs /path/to/node_modules/@deepseek-ai/dsh` usa uma instalação
+oficial independente do DSH para verificar o carregamento real pelo host e os
+contratos de mensagem em um profile isolado, sem chamadas a modelos.
 
 ## 📚 Documentação
 

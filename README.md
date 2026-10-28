@@ -20,7 +20,7 @@
 - **反思**：单次任务内连续 ≥7 个工具 step 后，插件询问模型自上次整理以来是否有值得记忆的内容。最后工具是 `memory_*` 视为已主动记忆、不重复反思。
 - **外部记忆库信任门**：工作区自带的 `.dsh-meow` 若非本机创建（如 clone 的外部仓库），默认暂停注入/检索/整理——首轮提示一次，`/meow-trust` 一键信任、即刻生效；本机创建与升级前打开过的工作区自动信任，正常使用零感知。
 - **客户端 UI**：注入文本折叠成横条、反思/dream 轮折叠成一条可展开的卡片、会话列表显示 dream 状态图标（🌙 已整理 / 呼吸灯 进行中 / 灰月牙斜杠 已跳过）。
-- **零运行时依赖**：`node:sqlite` + 自包含 esbuild 产物（`lib/index.js`）。**无原生模块。**
+- **无需另装运行时依赖**：`node:sqlite` + esbuild 产物（`lib/index.js`）；`schemastery` 和 `dsh-llm` 由 DSH 宿主解析提供。**无原生模块。**
 
 ## 📦 安装
 
@@ -132,14 +132,21 @@ dsh plugin --profile web add github:coutogilson/dsh-meow-memory
 
 ```sh
 npm install
-npm run build          # esbuild 打包 → lib/index.js（自包含）
+npm run build          # esbuild 打包 → lib/index.js（宿主 peer 保持 external）
 npm run test           # 228 项逻辑测试：db / bm25 / migrate / inject / reflect / dream / tools / apply
 ```
 
 `@deepseek-ai/*` 包位于 dsh-meow pnpm workspace 中，不在本包的 `node_modules` 里。
 在 Windows 上，`npm run link-workspace`（或 `scripts/link-workspace.ps1`）创建 workspace
 包的 junction 镜像，使 esbuild 能解析它们；`build.mjs` 通过 `nodePaths` 引用。
-这些链接仅构建期需要。
+构建不需要安装可选的 `dsh-llm` peer。直接用 Node 运行测试时，仍需从匹配的 DSH
+workspace 链接 `@deepseek-ai/dsh-llm`；正常插件运行由 DSH 的 profile loader
+解析宿主提供的 peer。不要把它加回 devDependencies，否则 `file:` / `link:`
+安装可能再次向 profile 引入宿主核心包的另一份副本（#84）。
+
+`node tests/build-host-peers.mjs` 单独验证无宿主 peer 的干净构建（#87）。
+`node tests/host-peers.mjs /path/to/node_modules/@deepseek-ai/dsh` 使用另行安装的
+官方 DSH，验证隔离 profile 的真实 Host 装载和消息契约，不调用模型。
 
 ## 📚 文档
 
