@@ -30,7 +30,7 @@
 
 import type { ConversationSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
 import { subscribeDreamEvents } from './client-dream-events.ts'
-import { registerUiReplayer } from './client-i18n-replay.ts'
+import { flowElements } from './client-conversation-dom.ts'
 import { t } from './i18n/index.js'
 import { isMeowSource } from './source.js'
 
@@ -159,8 +159,12 @@ export function setDreamStatesForTest(entries: ReadonlyArray<readonly [string, D
   dreamStateBySession.clear()
   for (const [id, state] of entries) dreamStateBySession.set(id, state)
 }
-/** 最近一次 apply 的气泡集合：SSE 状态变化时重放它（文本随状态翻转）。 */
-let lastApplied: readonly DelegateNotice[] = []
+/** 每个会话视图独立重算/重放；不保存单个全局 lastApplied。 */
+const stateListeners = new Set<() => void>()
+export function onDelegateStateChange(listener: () => void): () => void {
+  stateListeners.add(listener)
+  return () => { stateListeners.delete(listener) }
+}
 
 /** dream 是否仍在进行（仅状态表查询；compute 的 dream 三态判定内联于 computeDelegateNotices）：
  *  所属会话精确判定；无 sessionId 的历史打点全局退化
@@ -268,28 +272,26 @@ function ensureCss(): void {
  * 气泡锚点是原始行的**前兄弟节点**（行整体 display:none，挂在行内会一起消失）。
  * reflect-done 打点只隐藏（它是状态信号，不出气泡）。
  */
-export function applyDelegateNotices(groups: readonly DelegateNotice[]): void {
+export function applyDelegateNotices(containers: readonly HTMLElement[], groups: readonly DelegateNotice[]): void {
   if (typeof document === 'undefined') return
-  lastApplied = groups
   ensureCss()
-  const containers = Array.from(document.querySelectorAll<HTMLElement>('[data-chat-flow]'))
   if (containers.length === 0) return
   const liveIds = new Set(groups.map((group) => group.id))
   for (const container of containers) {
     // 清理已不存在的组的锚点。
-    for (const stale of Array.from(container.querySelectorAll<HTMLElement>(`[${ANCHOR_ATTR}]`))) {
+    for (const stale of flowElements(container, `[${ANCHOR_ATTR}]`)) {
       if (!liveIds.has(stale.getAttribute(ANCHOR_ATTR) ?? '')) stale.remove()
     }
     // 摘掉失效的隐藏标记：原始行 key 不在识别结果里 = 保持可见（fail-open）。
-    for (const row of Array.from(container.querySelectorAll<HTMLElement>(`[${HIDDEN_ATTR}]`))) {
+    for (const row of flowElements(container, `[${HIDDEN_ATTR}]`)) {
       if (!liveIds.has(row.getAttribute('data-chat-flow-key') ?? '')) row.removeAttribute(HIDDEN_ATTR)
     }
     for (const group of groups) {
-      const row = container.querySelector<HTMLElement>(`[data-chat-flow-key="${CSS.escape(group.id)}"]`)
+      const row = flowElements(container, `[data-chat-flow-key="${CSS.escape(group.id)}"]`)[0] ?? null
       if (row === null || row.parentElement === null) continue
       row.setAttribute(HIDDEN_ATTR, 'true')
       if (group.variant === 'reflect-done') continue // 完成信号行：只隐藏，不出气泡
-      let anchor = container.querySelector<HTMLElement>(`[${ANCHOR_ATTR}="${CSS.escape(group.id)}"]`)
+      let anchor = flowElements(container, `[${ANCHOR_ATTR}="${CSS.escape(group.id)}"]`)[0] ?? null
       if (anchor === null) {
         anchor = document.createElement('div')
         anchor.setAttribute(ANCHOR_ATTR, group.id)
@@ -320,16 +322,17 @@ export function applyDelegateNotices(groups: readonly DelegateNotice[]): void {
  * 启动 dream 状态同步（气泡文案的状态源）：
  * 挂载时全量对账 /meow-memory/dreamed-sessions，增量走共享轮询
  * subscribeDreamEvents（client-dream-events.ts，2026-09-05 连接池修复：替代原
- * 每管理器一条的 dream-events SSE 长连接）。状态变化时自动重放最近一次
- * applyDelegateNotices（气泡文本随状态翻转，如「进行中……」→「已完成。」）。
+ * 每管理器一条的 dream-events SSE 长连接）。状态变化时通知各个已挂载视图重新计算
+ * 并调用 applyDelegateNotices（气泡文本随状态翻转，如「进行中……」→「已完成。」）。
  * 路由不可用（旧版本 host）静默降级：气泡退化为静态文案，不报错。
  * @returns 清理函数（移除订阅）。
  */
 export function startDelegateStateSync(): () => void {
   if (typeof window === 'undefined') return () => {}
 
+  let disposed = false
   const notify = (): void => {
-    if (lastApplied.length > 0) applyDelegateNotices(lastApplied)
+    for (const listener of stateListeners) listener()
   }
 
   const refresh = async (): Promise<void> => {
@@ -337,6 +340,7 @@ export function startDelegateStateSync(): () => void {
       const response = await fetch('/meow-memory/dreamed-sessions', { cache: 'no-store' })
       if (!response.ok) return
       const data = await response.json() as { sessionIds?: unknown; dreamingIds?: unknown }
+      if (disposed) return
       dreamStateBySession.clear()
       if (Array.isArray(data.sessionIds)) {
         for (const id of data.sessionIds) if (typeof id === 'string') dreamStateBySession.set(id, 'dreamed')
@@ -361,13 +365,9 @@ export function startDelegateStateSync(): () => void {
 
   void refresh()
 
-  // UI 语言切换后重放气泡文本（纯 DOM 写入，不随 React 重渲染更新）。
-  const unregisterReplay = registerUiReplayer(notify)
-
   return () => {
-    unregisterReplay()
+    disposed = true
     unsubscribeDreamEvents()
     dreamStateBySession.clear()
-    lastApplied = []
   }
 }
