@@ -28,7 +28,8 @@ import {
   startVanishObserver,
   type VanishDecision,
 } from './client-delegate-vanish.ts'
-import { applyDelegateNotices, computeDelegateNotices, startDelegateStateSync, type DelegateNotice } from './client-delegate-notice.ts'
+import { applyDelegateNotices, computeDelegateNotices, startDelegateStateSync, onDelegateStateChange } from './client-delegate-notice.ts'
+import { chatFlows, flowElements } from './client-conversation-dom.ts'
 import { startDreamIconManager } from './client-dream-icon.ts'
 import { startDreamSkipManager } from './client-dream-skip.ts'
 import { startMenuDreamFace } from './client-menu-dream.ts'
@@ -139,8 +140,8 @@ const FOLD_CSS = `[${FOLDED_ATTR}="true"] { display: none !important; }
   color: var(--dsw-alias-label-secondary);
 }`
 
-/** 卡片克隆签名缓存（groupId → 原始行文本签名）：展开时行内容更新/不完整则自愈重克隆。 */
-const bodySigs = new Map<string, string>()
+/** 签名属于展开卡片 DOM；不同会话/同会话的不同视图不能共享，重建后重新填充。 */
+const bodySigs = new WeakMap<HTMLElement, string>()
 
 /** 原始行当前文本签名（全文：流式补全是尾部追加，截断会漏检）。 */
 function sigOf(container: HTMLElement, keys: readonly string[]): string {
@@ -149,12 +150,13 @@ function sigOf(container: HTMLElement, keys: readonly string[]): string {
 
 /** 匹配某 key 的原始节点行（key 含特殊字符时 CSS.escape）。 */
 function flowRow(container: HTMLElement, key: string): HTMLElement | null {
-  return container.querySelector<HTMLElement>(`[data-chat-flow-key="${CSS.escape(key)}"]`)
+  return flowElements(container, `[data-chat-flow-key="${CSS.escape(key)}"]`)
+    .find((row) => row.closest(`[${BODY_ATTR}]`) === null) ?? null
 }
 
 /** 匹配某折叠组的横条锚点。 */
 function anchorOf(container: HTMLElement, id: string): HTMLElement | null {
-  return container.querySelector<HTMLElement>(`[${ANCHOR_ATTR}="${CSS.escape(id)}"]`)
+  return flowElements(container, `[${ANCHOR_ATTR}="${CSS.escape(id)}"]`)[0] ?? null
 }
 
 /** 折叠横条的落点行（#53/#58/#72）：锚点节点在 0.2.x 上可能不渲染——旧格式
@@ -169,7 +171,7 @@ function foldAnchorRow(container: HTMLElement, group: FoldGroup): HTMLElement | 
     if (row !== null) return row
   }
   if (typeof group.turn === 'number') {
-    const turnRow = container.querySelector<HTMLElement>(`[data-chat-turn="${group.turn}"]`)
+    const turnRow = flowElements(container, `[data-chat-turn="${group.turn}"]`).find((row) => row.closest(`[${BODY_ATTR}]`) === null) ?? null
     if (turnRow !== null) return turnRow
   }
   return null
@@ -296,40 +298,38 @@ function enhanceClone(clone: HTMLElement, node: ChatNode | undefined): void {
 }
 
 /** 填充/清空一个组的展开卡片（克隆原始行，静态快照；签名记录供自愈比对）。 */
-function fillBody(id: string, visible: boolean, keys: readonly string[], session: ConversationSnapshot): void {
-  for (const container of Array.from(document.querySelectorAll<HTMLElement>('[data-chat-flow]'))) {
-    const anchor = anchorOf(container, id)
-    if (anchor === null) continue
-    const body = anchor.querySelector<HTMLElement>(`:scope > [${BODY_ATTR}]`)
-    if (body === null) continue
-    body.replaceChildren()
-    if (!visible) {
-      body.style.display = 'none'
-      bodySigs.delete(id)
-      return
-    }
-    body.style.display = 'block'
-    for (const key of keys) {
-      const row = flowRow(container, key)
-      if (row === null) continue
-      const clone = row.cloneNode(true) as HTMLElement
-      // 克隆去掉折叠标记与流锚点：卡片内展示，且不再被当作原始行匹配。
-      clone.removeAttribute(FOLDED_ATTR)
-      clone.removeAttribute('data-chat-flow-key')
-      clone.removeAttribute('data-chat-anchor-key')
-      clone.removeAttribute('data-chat-flow-kind')
-      body.appendChild(clone)
-      // #86-②：单行增强失败降级为未增强行——enhanceClone 链上一处抛错会沿
-      // applyFoldState 传进 useLayoutEffect，被外壳按 slot 崩溃处理拆掉整个 dock
-      // （#92 症状：折叠条整块消失），这里兜住。
-      try {
-        enhanceClone(clone, session.chat?.nodes.get(key))
-      } catch {
-        /* 该行详情缺失可接受，其余行继续 */
-      }
-    }
-    bodySigs.set(id, sigOf(container, keys))
+function fillBody(container: HTMLElement, id: string, visible: boolean, keys: readonly string[], session: ConversationSnapshot): void {
+  const anchor = anchorOf(container, id)
+  if (anchor === null) return
+  const body = anchor.querySelector<HTMLElement>(`:scope > [${BODY_ATTR}]`)
+  if (body === null) return
+  body.replaceChildren()
+  if (!visible) {
+    body.style.display = 'none'
+    bodySigs.delete(body)
+    return
   }
+  body.style.display = 'block'
+  for (const key of keys) {
+    const row = flowRow(container, key)
+    if (row === null) continue
+    const clone = row.cloneNode(true) as HTMLElement
+    // 克隆去掉折叠标记与流锚点：卡片内展示，且不再被当作原始行匹配。
+    clone.removeAttribute(FOLDED_ATTR)
+    clone.removeAttribute('data-chat-flow-key')
+    clone.removeAttribute('data-chat-anchor-key')
+    clone.removeAttribute('data-chat-flow-kind')
+    body.appendChild(clone)
+    // #86-②：单行增强失败降级为未增强行——enhanceClone 链上一处抛错会沿
+    // applyFoldState 传进 useLayoutEffect，被外壳按 slot 崩溃处理拆掉整个 dock
+    // （#92 症状：折叠条整块消失），这里兜住。
+    try {
+      enhanceClone(clone, session.chat?.nodes.get(key))
+    } catch {
+      /* 该行详情缺失可接受，其余行继续 */
+    }
+  }
+  bodySigs.set(body, sigOf(container, keys))
 }
 
 /** 复制/已复制图标（与 dsh 本体 IconCopyOutline16 / IconCheckOutline16 同 path，
@@ -381,7 +381,7 @@ function injectionRow(
   const exact = flowRow(container, group.id)
   if (exact !== null) return { row: exact, exact: true }
   if (typeof group.turn === 'number') {
-    const turnRow = container.querySelector<HTMLElement>(`[data-chat-turn="${group.turn}"]`)
+    const turnRow = flowElements(container, `[data-chat-turn="${group.turn}"]`).find((row) => row.closest(`[${BODY_ATTR}]`) === null) ?? null
     if (turnRow !== null) return { row: turnRow, exact: false }
   }
   return null
@@ -392,15 +392,15 @@ function injectionRow(
  *  （复制按钮写 userText 原文 + hover 显隐时钟），样式与本体 UserStyleBubble
  *  对齐（同 token 同尺寸）。幂等：只做元素存在性/文本写入；事件只挂一次。 */
 function applyInjectionFold(
+  containers: readonly HTMLElement[],
   groups: readonly InjectionGroup[],
   expanded: ReadonlySet<string>,
   onToggle: (id: string) => void,
 ): void {
-  const containers = Array.from(document.querySelectorAll<HTMLElement>('[data-chat-flow]'))
   if (containers.length === 0) return
   const liveIds = new Set(groups.map((g) => g.id))
   for (const container of containers) {
-    for (const stale of Array.from(container.querySelectorAll<HTMLElement>(`[${INJ_ANCHOR_ATTR}]`))) {
+    for (const stale of flowElements(container, `[${INJ_ANCHOR_ATTR}]`)) {
       if (!liveIds.has(stale.getAttribute(INJ_ANCHOR_ATTR) ?? '')) stale.remove()
     }
     for (const group of groups) {
@@ -410,7 +410,7 @@ function applyInjectionFold(
       // turn 首行——绝不能藏，否则用户消息会整行消失（#72 描述与实现的矛盾处修正）。
       if (start.exact) start.row.setAttribute(FOLDED_ATTR, 'true')
       const anchorSlot = start.row
-      let anchor = container.querySelector<HTMLElement>(`[${INJ_ANCHOR_ATTR}="${CSS.escape(group.id)}"]`)
+      let anchor = flowElements(container, `[${INJ_ANCHOR_ATTR}="${CSS.escape(group.id)}"]`)[0] ?? null
       if (anchor === null) {
         anchor = document.createElement('div')
         anchor.setAttribute(INJ_ANCHOR_ATTR, group.id)
@@ -496,17 +496,17 @@ function applyInjectionFold(
  *  只做：行隐藏 + 锚点/细条存在性与文本——不重建；展开组的卡片在
  *  原始行内容变化（流式补全/产物到达/视图重建）时按签名自愈重克隆。 */
 function applyFoldState(
+  containers: readonly HTMLElement[],
   groups: readonly FoldGroup[],
   expanded: ReadonlySet<string>,
   onToggle: (id: string) => void,
   session: ConversationSnapshot,
 ): void {
-  const containers = Array.from(document.querySelectorAll<HTMLElement>('[data-chat-flow]'))
   if (containers.length === 0) return
   const liveIds = new Set(groups.map((group) => group.id))
   for (const container of containers) {
     // 清理已不存在的组的锚点。
-    for (const stale of Array.from(container.querySelectorAll<HTMLElement>(`[${ANCHOR_ATTR}]`))) {
+    for (const stale of flowElements(container, `[${ANCHOR_ATTR}]`)) {
       if (!liveIds.has(stale.getAttribute(ANCHOR_ATTR) ?? '')) stale.remove()
     }
     for (const group of groups) {
@@ -520,15 +520,17 @@ function applyFoldState(
       if (expanded.has(group.id)) {
         // 自愈：克隆快照落后于原始行（点击时行未完整/之后被更新）→ 重克隆收敛。
         const sig = sigOf(container, group.keys)
-        if (bodySigs.get(group.id) !== sig) fillBody(group.id, true, group.keys, session)
+        const body = anchorOf(container, group.id)?.querySelector<HTMLElement>(`:scope > [${BODY_ATTR}]`)
+        if (body && bodySigs.get(body) !== sig) fillBody(container, group.id, true, group.keys, session)
       } else {
-        bodySigs.delete(group.id)
+        const body = anchorOf(container, group.id)?.querySelector<HTMLElement>(`:scope > [${BODY_ATTR}]`)
+        if (body && body.style.display !== 'none') fillBody(container, group.id, false, [], session)
       }
     }
   }
 }
 
-/** 0.1.5 右侧 turn 导航框的内联变量（frameStyle 设置；语义命名非哈希，全文档唯一）。 */
+/** 0.1.5 右侧 turn 导航框的内联变量（frameStyle 设置；语义命名非哈希，每个会话独立）。 */
 const TURN_NAV_FRAME_VAR = '--turn-rail-inset'
 
 /** 隐藏 turn 导航条上的 memory 轮刻度（2026-09-10 用户拍板：反思/梦境独立成轮后
@@ -538,17 +540,87 @@ const TURN_NAV_FRAME_VAR = '--turn-rail-inset'
  *  （数字不随语言变），取其中整数比对 memory turn 集合。
  *  刻度为绝对定位，隐藏后留一小段空隙；hover 预览与跳转随刻度一起消失。
  *  旧宿主（0.1.2-）没有导航条：查询为空，纯 no-op。 */
-function applyTurnNavHiding(memoryTurns: ReadonlySet<number>): void {
-  if (memoryTurns.size === 0) return
-  for (const nav of document.querySelectorAll<HTMLElement>('nav[style]')) {
+function applyTurnNavHiding(root: HTMLElement, memoryTurns: ReadonlySet<number>): void {
+  for (const nav of root.querySelectorAll<HTMLElement>('nav[style]')) {
+    if (nav.closest('[data-conversation-scroll]') !== root) continue
     if (nav.style.getPropertyValue(TURN_NAV_FRAME_VAR) === '') continue // 只处理宿主 turn 导航框
     for (const btn of nav.querySelectorAll('button[aria-label]')) {
       const nums = (btn.getAttribute('aria-label') ?? '').match(/\d+/g)
       if (nums === null) continue
       const turn = Number(nums[nums.length - 1])
       const slot = btn.parentElement
-      if (Number.isInteger(turn) && memoryTurns.has(turn) && slot !== null) slot.style.display = 'none'
+      if (slot === null) continue
+      if (Number.isInteger(turn) && memoryTurns.has(turn)) {
+        if (!slot.hasAttribute('data-meow-memory-nav-display')) {
+          slot.setAttribute('data-meow-memory-nav-display', slot.style.display)
+        }
+        slot.style.display = 'none'
+      } else if (slot.hasAttribute('data-meow-memory-nav-display')) {
+        slot.style.display = slot.getAttribute('data-meow-memory-nav-display') ?? ''
+        slot.removeAttribute('data-meow-memory-nav-display')
+      }
     }
+  }
+}
+
+/** 所有重放入口共享同一会话范围；数据从当前 React 快照读取，不能缓存上一会话。 */
+interface FoldViewState {
+  groups: readonly FoldGroup[]
+  injGroups: readonly InjectionGroup[]
+  expanded: ReadonlySet<string>
+  injExpanded: ReadonlySet<string>
+  toggle: (id: string) => void
+  toggleInj: (id: string) => void
+  snapshot: ConversationSnapshot
+  memTurns: ReadonlySet<number>
+}
+
+/** 一个 composer 对应一个 scroll 区域（DSH 0.1.1+）；不回退到 document。 */
+export function mountMemoryFoldView(root: HTMLElement, read: () => FoldViewState): { apply: () => void; dispose: () => void } {
+  const toggle = (id: string): void => read().toggle(id)
+  const toggleInj = (id: string): void => read().toggleInj(id)
+  let disposed = false
+  const apply = (): void => {
+    if (disposed) return
+    const state = read()
+    const containers = chatFlows(root)
+    // 会话切换/压缩后恢复不再属于折叠组的行；只清理本视图的标记。
+    const hiddenKeys = new Set([...state.groups.flatMap((g) => g.keys), ...state.injGroups.map((g) => g.id)])
+    for (const container of containers) {
+      for (const row of flowElements(container, `[${FOLDED_ATTR}]`)) {
+        if (!hiddenKeys.has(row.getAttribute('data-chat-flow-key') ?? '')) row.removeAttribute(FOLDED_ATTR)
+      }
+    }
+    applyFoldState(containers, state.groups, state.expanded, toggle, state.snapshot)
+    applyInjectionFold(containers, state.injGroups, state.injExpanded, toggleInj)
+    // 状态同步后重新计算，避免重放上次已计算的 running 值。
+    applyDelegateNotices(containers, computeDelegateNotices(state.snapshot))
+    applyTurnNavHiding(root, state.memTurns)
+  }
+  let timer = 0
+  const observer = new MutationObserver(() => {
+    window.clearTimeout(timer)
+    timer = window.setTimeout(apply, 80)
+  })
+  observer.observe(root, { childList: true, subtree: true, characterData: true })
+  const offLocale = onUiLocaleChange(apply)
+  const offState = onDelegateStateChange(apply)
+  apply()
+  return {
+    apply,
+    dispose: () => {
+      disposed = true
+      window.clearTimeout(timer)
+      observer.disconnect()
+      offLocale()
+      offState()
+      for (const container of chatFlows(root)) {
+        for (const anchor of flowElements(container, `[${ANCHOR_ATTR}], [${INJ_ANCHOR_ATTR}]`)) anchor.remove()
+        for (const row of flowElements(container, `[${FOLDED_ATTR}]`)) row.removeAttribute(FOLDED_ATTR)
+      }
+      applyDelegateNotices(chatFlows(root), [])
+      applyTurnNavHiding(root, new Set())
+    },
   }
 }
 
@@ -570,7 +642,9 @@ export function MemoryFoldDock(props: {
   session?: unknown
   /** 新宿主（0.1.3+）：响应式 chat 快照 hook（useChat(selector) → ChatSnapshot）。 */
   useChat?: (selector: (chat: unknown) => unknown) => unknown
-}): null {
+}): ReturnType<typeof createElement> {
+  const sentinelRef = useRef<HTMLElement | null>(null)
+  const viewRef = useRef<ReturnType<typeof mountMemoryFoldView> | null>(null)
   const useChat = props?.useChat
   // hooks 顺序按宿主形态固定（同一宿主内 useChat 要么恒在要么恒缺），不违反规则。
   const chatViaHook = typeof useChat === 'function' ? useChat(chatIdentity) : undefined
@@ -584,7 +658,6 @@ export function MemoryFoldDock(props: {
   const [injExpanded, setInjExpanded] = useState<ReadonlySet<string>>(() => new Set())
   const groups = useMemo(() => computeFoldGroups(snapshot as never), [snapshot])
   const injGroups = useMemo(() => computeInjectionGroups(snapshot as never), [snapshot])
-  const dgNotices = useMemo(() => computeDelegateNotices(snapshot as never), [snapshot])
   const memTurns = useMemo(() => memoryTurnNumbers(snapshot as never), [snapshot])
   const toggle = useCallback((id: string): void => {
     setExpanded((prev) => {
@@ -592,12 +665,9 @@ export function MemoryFoldDock(props: {
       const willExpand = !next.has(id)
       if (willExpand) next.add(id)
       else next.delete(id)
-      // 同步填充/清空展开卡片（不依赖 effect 时序，也避免 observer 循环）。
-      const group = groups.find((candidate) => candidate.id === id)
-      fillBody(id, willExpand, group?.keys ?? [], snapshot as never)
       return next
     })
-  }, [groups, snapshot])
+  }, [])
   const toggleInj = useCallback((id: string): void => {
     setInjExpanded((prev) => {
       const next = new Set(prev)
@@ -607,47 +677,24 @@ export function MemoryFoldDock(props: {
     })
   }, [])
 
-  // 快照/展开态变化 → 重放折叠（行隐藏 + 锚点，不改卡片内容）。
+  const state: FoldViewState = { groups, expanded, toggle, snapshot: snapshot as ConversationSnapshot, injGroups, injExpanded, toggleInj, memTurns }
+  const latest = useRef(state)
+  latest.current = state
+  // 隐形 span 定位自身会话，兼容没有 data-conversation-session 的旧宿主。
+  // Chat/trajectory 切换只替换 scroll 区内的消息视图，observer 仍可发现新 flow。
   useLayoutEffect(() => {
-    applyFoldState(groups, expanded, toggle, snapshot as never)
-    applyInjectionFold(injGroups, injExpanded, toggleInj)
-    applyDelegateNotices(dgNotices)
-    applyTurnNavHiding(memTurns)
-  }, [groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns])
-
-  // 兜底：视图切换/元素重建/流式重渲染导致 DOM 变化时自愈（防抖）。
-  const latest = useRef({ groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns })
-  latest.current = { groups, expanded, toggle, snapshot, injGroups, injExpanded, toggleInj, dgNotices, memTurns }
-  useEffect(() => {
-    let timer = 0
-    const observer = new MutationObserver(() => {
-      window.clearTimeout(timer)
-      timer = window.setTimeout(() => {
-        applyFoldState(latest.current.groups, latest.current.expanded, latest.current.toggle, latest.current.snapshot as never)
-        applyInjectionFold(latest.current.injGroups, latest.current.injExpanded, latest.current.toggleInj)
-        applyDelegateNotices(latest.current.dgNotices)
-        applyTurnNavHiding(latest.current.memTurns)
-      }, 80)
-    })
-    observer.observe(document.body, { childList: true, subtree: true })
+    const root = sentinelRef.current?.closest<HTMLElement>('[data-conversation-scroll]')
+    if (!root) return
+    const view = mountMemoryFoldView(root, () => latest.current)
+    viewRef.current = view
     return () => {
-      window.clearTimeout(timer)
-      observer.disconnect()
+      viewRef.current = null
+      view.dispose()
     }
   }, [])
+  useLayoutEffect(() => { viewRef.current?.apply() })
 
-  // UI 语言切换（DSH 设置 → 通用 → 语言）：横条/气泡文案是纯 DOM 写入，不会随
-  // React 重渲染自动更新——用重放注册表在语言变化时用当前语言重刷一次。重放读
-  // ref 里的最新快照（订阅回调不依赖闭包时序），且与 observer 同款幂等。
-  useEffect(() => {
-    return onUiLocaleChange(() => {
-      applyFoldState(latest.current.groups, latest.current.expanded, latest.current.toggle, latest.current.snapshot as never)
-      applyInjectionFold(latest.current.injGroups, latest.current.injExpanded, latest.current.toggleInj)
-      applyDelegateNotices(latest.current.dgNotices)
-    })
-  }, [])
-
-  return null
+  return createElement('span', { ref: sentinelRef, 'data-meow-memory-dock': '', style: { display: 'none' } })
 }
 
 /**
