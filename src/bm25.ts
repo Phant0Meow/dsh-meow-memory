@@ -22,8 +22,11 @@ export interface Doc {
   keywords: string[]
   importance: number
   created_at: number
-  /** 记忆时间戳 = 最后更新时间（艾宾浩斯按它算年龄）。 */
+  /** 记忆时间戳 = 最后更新时间。 */
   updated_at: number
+  /** #91：最后使用时间（自动注入/检索命中时刷新）。衰减按"多久没用过"而非
+   *  "多久没被编辑"——从未被用（null/缺省）回退 updated_at。 */
+  last_accessed_at?: number | null
 }
 
 // CJK 类：汉字（\p{Script=Han} 覆盖基本区+Ext A~I）+ 假名 + 日文词内符号（々 叠字 / ー
@@ -292,7 +295,9 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
     if (raw[di] <= 0) continue
     let w = 1
     if (now !== null && docs[di].importance < 3 && !(raw[di] >= 0.85 * maxRaw)) {
-      w = recencyWeight(now - docs[di].updated_at) // 艾宾浩斯按记忆时间戳（最后更新时间）
+      // #91：艾宾浩斯按"最后使用时间"（last_accessed_at，从未被用回退 updated_at）——
+      // updated_at 只在编辑时刷新，长期在用但没人改的记忆会被误判成过期。
+      w = recencyWeight(now - (docs[di].last_accessed_at ?? docs[di].updated_at))
     }
     hits.push({
       id: docs[di].id,
@@ -365,7 +370,7 @@ export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions 
     const coverage = len > 0 ? overlap / len : 0
     let w = 1
     if (now !== null && docs[di].importance < 3 && !(raw[di] >= 0.85 * maxRaw)) {
-      w = recencyWeight(now - docs[di].updated_at)
+      w = recencyWeight(now - (docs[di].last_accessed_at ?? docs[di].updated_at)) // #91 同 search：按最后使用时间衰减
     }
     const impW = 1 + (docs[di].importance - 1) * 0.25
     const titleHit = tokenize(docs[di].title ?? '').some((t) => qTf.has(t))

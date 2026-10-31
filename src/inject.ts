@@ -229,6 +229,7 @@ function toDocs(rows: MemoryRow[]): Doc[] {
     importance: r.importance,
     created_at: r.created_at,
     updated_at: r.updated_at,
+    last_accessed_at: r.last_accessed_at, // #91：衰减按最后使用时间
   }))
 }
 
@@ -603,6 +604,10 @@ export function buildHitInjection(
   const text = lines.join('\n').trimEnd()
   const ids = fresh.map((h) => h.id)
   markInjected(workspace, sessionId, ids, dir)
+  // #91：注入=使用。自动注入是记忆进入上下文的主路径，此前只有 memory_search
+  // 计数——hit_count/last_accessed_at 的冷热信号接在错误事件上（被搜过≠被用过，
+  // 编辑≠使用）。首轮快照注入刻意不计：全量一过没有区分度，只会淹没信号。
+  for (const h of fresh) db.bumpHit(h.level as Parameters<MemoryDb['bumpHit']>[0], h.id)
   return { text, injectedIds: ids }
 }
 

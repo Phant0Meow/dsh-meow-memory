@@ -40,7 +40,7 @@ export const CONFIG_DEFAULTS = {
     timeZone: 'Asia/Shanghai',
     rulesReviewDays: DEFAULT_RULES_REVIEW_DAYS,
   },
-  delegate: { model: '' },
+  delegate: { model: '', effort: '' },
   /** 记忆库自动备份（#37 增量②，默认关）：开启后每次 dream 收尾把 memory.db
    *  快照轮转到 memory.db.bak（VACUUM INTO 一致性备份）。 */
   backup: { enabled: false },

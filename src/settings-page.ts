@@ -106,6 +106,7 @@ const FIELDS: GroupSpec[] = [
     title: 'settings.group.delegate',
     fields: [
       { key: 'model', sub: 'delegate', label: 'settings.field.delegateModel.label', type: 'str', hint: 'settings.field.delegateModel.hint', placeholder: 'settings.field.delegateModel.placeholder' },
+      { key: 'effort', sub: 'delegate', label: 'settings.field.delegateEffort.label', type: 'str', hint: 'settings.field.delegateEffort.hint', placeholder: 'settings.field.delegateEffort.placeholder' },
     ],
   },
   {

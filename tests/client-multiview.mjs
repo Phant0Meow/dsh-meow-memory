@@ -108,6 +108,29 @@ try {
       assert.ok(foldBody(p.root)); assert.match(noticeLabel(p.root), /in progress/)
     }
   })
+
+  // #93：PTC 会话里宿主给聊天流设两级 data-chat-flow 容器（属性值空串），旧实现
+  // querySelectorAll 全匹配 → 每层各插一次横条（报告者实测一份内容最多 7 份、
+  // 13 个锚点只有 2 个唯一 id）。作用域化后 chatFlows 只保留最外层容器：
+  // 内层零锚点、外层无重复。
+  const ptc = pane('ptc')
+  const innerFlow = document.createElement('div')
+  innerFlow.setAttribute('data-chat-flow', '')
+  innerFlow.setAttribute('data-step-process-content', '')
+  ptc.flow.append(innerFlow)
+  const innerFlow2 = document.createElement('div')
+  innerFlow2.setAttribute('data-chat-flow', '')
+  innerFlow2.setAttribute('data-step-process-content', '')
+  ptc.flow.append(innerFlow2)
+  await wait()
+  check('nested same-view flow containers get no duplicate bars (#93)', () => {
+    assert.equal(ptc.flow.querySelectorAll('[data-meow-injection-anchor]').length, 1)
+    assert.equal(innerFlow.querySelectorAll('[data-meow-injection-anchor]').length, 0)
+    assert.equal(innerFlow2.querySelectorAll('[data-meow-injection-anchor]').length, 0)
+    assert.equal(ptc.flow.querySelectorAll('[data-meow-memory-anchor]').length, 1)
+    assert.equal(innerFlow.querySelectorAll('[data-meow-memory-anchor]').length, 0)
+    assert.equal(innerFlow2.querySelectorAll('[data-meow-memory-anchor]').length, 0)
+  })
   let mutations = 0
   const watch = new MutationObserver(records => { mutations += records.length })
   watch.observe(document.body, { childList: true, characterData: true, subtree: true })

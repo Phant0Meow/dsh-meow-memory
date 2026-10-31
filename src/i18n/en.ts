@@ -108,6 +108,10 @@ export const en: Record<UiKey, string> = {
   'settings.field.delegateModel.hint':
     "Empty = the main model throughout. When set, reflection and dream turns run on that model and switch back to the main model at the end of the turn (the rest of the conversation is unaffected); 'provider/model' selects the route, 'model' only changes the model name",
   'settings.field.delegateModel.placeholder': 'e.g. zai-coding-cn/glm-5.3-flash',
+  'settings.field.delegateEffort.label': 'Reasoning effort for the delegate model',
+  'settings.field.delegateEffort.hint':
+    "Empty = strip the main session's reasoning effort (default, recommended: requests fail outright with UNSUPPORTED_REASONING_EFFORT if the target model does not declare efforts). 'inherit' keeps the main effort; or set a value the delegate model supports (e.g. high)",
+  'settings.field.delegateEffort.placeholder': 'empty = strip; inherit / low / medium / high',
   'settings.field.dreamEnabled.label': 'Idle consolidation switch',
   'settings.field.dream.idleMinutes.label': 'Idle minutes',
   'settings.field.dream.idleMinutes.hint': 'A window idle for this many minutes allows a dream',

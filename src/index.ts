@@ -364,6 +364,8 @@ export function validateConfigUserLayer(value: unknown): void {
     // v0.24 移除 delegate.reflect/dream（独立执行不再可选）；历史 settings.yaml
     // user 层里残留的这两个键只忽略不报错（手编配置宽容，读取方不再消费）。
     if (ddg.model !== undefined && typeof ddg.model !== 'string') throw new Error('delegate.model 必须是字符串')
+    // #98：effort 控制 delegate 轮的 reasoningEffort——''（默认）/ 'inherit' / 任意非空值原样下发
+    if (ddg.effort !== undefined && typeof ddg.effort !== 'string') throw new Error('delegate.effort 必须是字符串')
   }
   if (v.disabledWorkspaces !== undefined) {
     if (!Array.isArray(v.disabledWorkspaces)) throw new Error('disabledWorkspaces 必须是字符串数组')
@@ -422,7 +424,7 @@ interface ResolvedConfig {
   /** undefined = 用户未配置（首次设置引导的触发信号）；运行时语言兜底 zh。 */
   promptLang: string | undefined
   dream: DreamConfig
-  delegate: { modelSpec: AgentOptionsSpec | undefined }
+  delegate: { modelSpec: AgentOptionsSpec | undefined; effort: string | undefined }
   /** 记忆库自动备份（#37）：注册期消费（dream 收尾信号侧）。 */
   backup: { enabled: boolean }
   /** 工作区停用名单（#28）：原样保留，判定时路径归一。 */
@@ -432,7 +434,7 @@ interface ResolvedConfig {
 function resolveConfig(config: unknown): ResolvedConfig {
   const c = (config ?? {}) as Partial<ResolvedConfig>
   const d = (c.dream ?? {}) as Partial<DreamConfig>
-  const dg = (c.delegate ?? {}) as { reflect?: boolean; model?: string }
+  const dg = (c.delegate ?? {}) as { reflect?: boolean; model?: string; effort?: string }
   const bk = (c.backup ?? {}) as { enabled?: boolean }
   return {
     enabled: c.enabled ?? true,
@@ -456,7 +458,12 @@ function resolveConfig(config: unknown): ResolvedConfig {
     delegate: (() => {
       // 反思/梦境永远 steer（主窗口执行，v0.24 拍板）；modelSpec 仅供 agent/request
       // waterfall 在插件轮请求上覆盖模型（轮次结束自动换回主模型）。
-      return { modelSpec: parseModelSpec(dg.model) }
+      // #98：effort——undefined（'' 默认）= 覆盖时剥离主会话的 reasoningEffort
+      // （目标模型能力未知，带着 effort 会在发出前被宿主 UNSUPPORTED_REASONING_EFFORT
+      // 拒掉，dream 同组反复投递直到预算耗尽）；'inherit' = 透传主会话 effort（旧行为）；
+      // 其余非空值 = 原样下发（用户确认 delegate 模型支持时手动填，如 'high'）。
+      const effortRaw = typeof dg.effort === 'string' ? dg.effort.trim() : ''
+      return { modelSpec: parseModelSpec(dg.model), effort: effortRaw === '' ? undefined : effortRaw }
     })(),
     disabledWorkspaces: Array.isArray(c.disabledWorkspaces)
       ? c.disabledWorkspaces.map((p) => String(p).trim()).filter((p) => p.length > 0)
@@ -1736,11 +1743,15 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
             delegateRestore.delete(oldest)
           }
         }
-        ctx.logger.info(`meow-memory: memory task turn → model override ${spec.provider ?? '(inherit)'}/${spec.model ?? ''}`)
+        ctx.logger.info(`meow-memory: memory task turn → model override ${spec.provider ?? '(inherit)'}/${spec.model ?? ''}${resolved.delegate.effort === undefined ? ' (effort stripped)' : ` (effort ${resolved.delegate.effort})`}`)
+        // #98：effort 随覆盖一并处理（ ReasoningEffortId 是模型声明的不透明值，无法
+        // 在覆盖点探测目标模型支持什么——默认剥离，显式配置才下发）。
+        const { reasoningEffort: _mainEffort, ...rest } = config
         return {
-          ...config,
+          ...rest,
           ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
           ...(spec.model !== undefined ? { model: spec.model } : {}),
+          ...(resolved.delegate.effort !== undefined && resolved.delegate.effort !== 'inherit' ? { reasoningEffort: resolved.delegate.effort } : resolved.delegate.effort === 'inherit' && _mainEffort !== undefined ? { reasoningEffort: String(_mainEffort) } : {}),
         }
       }
       const remembered = delegateRestore.get(sid)
@@ -1752,7 +1763,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       const { reasoningEffort: _inherited, ...rest } = config
       return { ...rest, provider: remembered.main.provider, model: remembered.main.model, ...(remembered.main.reasoningEffort === undefined ? {} : { reasoningEffort: remembered.main.reasoningEffort }) }
     })
-    ctx.logger.info(`meow-memory: model override armed for reflect/dream turns (${spec.provider ?? '(inherit)'}/${spec.model ?? ''})`)
+    ctx.logger.info(`meow-memory: model override armed for reflect/dream turns (${spec.provider ?? '(inherit)'}/${spec.model ?? ''}, effort ${resolved.delegate.effort ?? 'stripped'} — #98: target model with undeclared reasoning efforts fails UNSUPPORTED_REASONING_EFFORT unless stripped; set delegate.effort to override)`)
   }
 
   // 3) 空闲整理（按窗口；windowIndex 记录 sessionId → workspace）。

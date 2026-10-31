@@ -1122,6 +1122,33 @@ check('new session gets hits', inj3 !== null && inj3.text.includes('3081 端口�
   dbH.close()
   rmSync(wsH, { recursive: true, force: true })
 }
+// ── #91：注入=使用。buildHitInjection 后 hit_count/last_accessed_at 要刷新 ──
+{
+  const wsU = mkdtempSync(join(tmpdir(), 'mm-usage-'))
+  const dbU = new MemoryDb(memoryDbPath(wsU))
+  const rowU = dbU.insert({ level: 'fact', content: '喵版端口约定 3099 丙', project: null, created_at: Date.now() - 90 * 86_400_000 })
+  check('#91 pre: entry never accessed', dbU.findById(rowU.id)?.row.hit_count === 0 && dbU.findById(rowU.id)?.row.last_accessed_at === null)
+  const injU = buildHitInjection(dbU, wsU, 's-usage', '喵版端口是多少', { hitTopK: 1 }, '.dsh-meow')
+  check('#91 hit injection happened', injU !== null && injU.injectedIds.includes(rowU.id))
+  const after = dbU.findById(rowU.id)?.row
+  check('#91 injection bumps hit_count and last_accessed_at', after?.hit_count === 1 && typeof after?.last_accessed_at === 'number' && after.last_accessed_at > 0, JSON.stringify({ hc: after?.hit_count, la: after?.last_accessed_at }))
+  // 衰减读数换轨：长期在用（last_accessed_at 新）但没人编辑（updated_at 老）的记忆不再被判过期。
+  // 需要第二个文档压住 raw≥0.85×max 的"超级匹配豁免"——单文档检索永不衰减。
+  const { search, recencyWeight } = await import('./lib/index.js')
+  const now = Date.now()
+  const strong = { id: 'strong', level: 'fact', title: null, content: '端口约定 端口约定 端口约定', keywords: [], importance: 3, created_at: 0, updated_at: now }
+  const target = (la) => ({ id: 't', level: 'fact', title: null, content: '端口约定 备注说明', keywords: [], importance: 1, created_at: 0, updated_at: now - 90 * 86_400_000, ...(la === undefined ? {} : { last_accessed_at: la }) })
+  const wOf = (la) => search('端口约定', [strong, target(la)], { now, k: 5, explain: true }).find((h) => h.id === 't').explain.recencyWeight
+  const wUsed = wOf(now - 3_600_000) // 1 小时前刚被用过
+  const wNever = wOf(undefined) // 从未被用 → 回退 updated_at（90 天前）
+  const wOld = wOf(now - 90 * 86_400_000) // 90 天前用过一次
+  check('#91 decay reads last_accessed_at (used 1h ago → weight 1)', wUsed === 1, String(wUsed))
+  check('#91 never-used falls back to updated_at (90d → 0.15)', wNever === 0.15 && wNever < 1, String(wNever))
+  check('#91 used-90d-ago decays same as never (signal is usage time)', wOld === 0.15, String(wOld))
+  check('#91 recencyWeight tier sanity', recencyWeight(90 * 86_400_000) === 0.15)
+  dbU.close()
+  rmSync(wsU, { recursive: true, force: true })
+}
 // #56：会话 id 含冒号（Windows 非法文件名字符）→ 文件名百分号编码，seen 读写不再 ENOENT
 {
   const wsC = mkdtempSync(join(tmpdir(), 'mm-colon-'))
@@ -2293,6 +2320,35 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   const d2 = makeCtx()
   await applyGateOff(d2.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
   check('model override: no model → no waterfall registered', d2.handlers['agent/request'] === undefined)
+
+  // ── #98：覆盖时 reasoningEffort 一并处理（目标模型不声明思考档位时带着会直接被拒）──
+  const reflectEvents98 = reflectEvents
+  const seedHigh = async () => ({ provider: 'base', model: 'base-model', reasoningEffort: 'high' })
+  // 默认（未配置 effort）→ 剥离
+  const d98a = makeCtx()
+  await applyGateOff(d98a.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
+  const out98a = await d98a.handlers['agent/request']({ agent: { session: { header: { cwd: ws, id: 's-98a' }, events: reflectEvents98 } }, turn: 1, step: 1, signal: new AbortController().signal }, seedHigh)
+  check('#98 default strips main effort on override', out98a.provider === 'prov' && out98a.model === 'main' && out98a.reasoningEffort === undefined, JSON.stringify(out98a))
+  // 'inherit' → 透传主会话档位（旧行为）
+  const d98b = makeCtx()
+  await applyGateOff(d98b.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main', effort: 'inherit' } })
+  const out98b = await d98b.handlers['agent/request']({ agent: { session: { header: { cwd: ws, id: 's-98b' }, events: reflectEvents98 } }, turn: 1, step: 1, signal: new AbortController().signal }, seedHigh)
+  check("#98 effort='inherit' passes main effort through", out98b.reasoningEffort === 'high', JSON.stringify(out98b))
+  // 显式值 → 原样下发
+  const d98c = makeCtx()
+  await applyGateOff(d98c.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main', effort: 'low' } })
+  const out98c = await d98c.handlers['agent/request']({ agent: { session: { header: { cwd: ws, id: 's-98c' }, events: reflectEvents98 } }, turn: 1, step: 1, signal: new AbortController().signal }, seedHigh)
+  check("#98 explicit effort value is sent verbatim", out98c.reasoningEffort === 'low', JSON.stringify(out98c))
+  // 剥离后还原：主模型的档位要跟着主模型一起回来
+  const d98d = makeCtx()
+  await apply(d98d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
+  const req98 = d98d.handlers['agent/request']
+  const sig98 = new AbortController().signal
+  const log98 = [events.turnStart(), { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-dream] 整理' }] } }]
+  await req98({ agent: { session: { header: { cwd: ws, id: 's-98d' }, events: log98 } }, turn: 1, step: 1, signal: sig98 }, seedHigh)
+  log98.push(events.turnStart())
+  const out98d = await req98({ agent: { session: { header: { cwd: ws, id: 's-98d' }, events: log98 } }, turn: 2, step: 1, signal: sig98 }, async () => ({ provider: 'prov', model: 'main', reasoningEffort: 'high' }))
+  check('#98 restore brings back main model effort after stripped override', out98d.provider === 'base' && out98d.model === 'base-model' && out98d.reasoningEffort === 'high', JSON.stringify(out98d))
 }
 
 // #71：反思/dream 轮结束后的普通请求不得继承 delegate 路由。宿主把每次请求的实际路由写进

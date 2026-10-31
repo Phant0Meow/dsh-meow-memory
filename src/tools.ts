@@ -474,6 +474,7 @@ function searchTool(dir: string): ToolDefinition {
         importance: r.importance,
         created_at: r.created_at,
         updated_at: r.updated_at,
+        last_accessed_at: r.last_accessed_at, // #91：衰减按最后使用时间
       }))
       // 全量排名（分高到低）后分段选取（用户拍板 2026-08-19）：
       //   前 5 条无脑取（不排除任何记忆，含已见/本 session 建立的）；
@@ -608,6 +609,7 @@ function findSimilarTool(dir: string): ToolDefinition {
         importance: r.importance,
         created_at: r.created_at,
         updated_at: r.updated_at,
+        last_accessed_at: r.last_accessed_at, // #91：衰减按最后使用时间
       }))
       const hits = findSimilar(found.row.content, docs, k)
       markSearched(workspace, sessionId ?? 'unknown', hits.map((h) => h.id), dir)

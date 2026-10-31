@@ -99,6 +99,10 @@ export const ptBr: Record<UiKey, string> = {
   'settings.field.delegateModel.hint':
     "Vazio = modelo principal do começo ao fim. Preenchido, as rodadas de reflexão e de consolidação ociosa passam a usar esse modelo e voltam ao principal no fim da rodada (o resto da conversa não muda); 'provider/model' escolhe a rota, 'model' troca só o nome do modelo",
   'settings.field.delegateModel.placeholder': 'ex.: zai-coding-cn/glm-5.3-flash',
+  'settings.field.delegateEffort.label': 'Esforço de raciocínio do modelo substituto',
+  'settings.field.delegateEffort.hint':
+    "Vazio = descarta o esforço de raciocínio da sessão principal (padrão, recomendado: a requisição falha com UNSUPPORTED_REASONING_EFFORT se o modelo alvo não declara esforços). 'inherit' mantém o esforço principal; ou defina um valor aceito pelo modelo (ex.: high)",
+  'settings.field.delegateEffort.placeholder': 'vazio = descartar; inherit / low / medium / high',
   'settings.field.dreamEnabled.label': 'Ligar a consolidação ociosa',
   'settings.field.dream.idleMinutes.label': 'Minutos de ociosidade',
   'settings.field.dream.idleMinutes.hint': 'Uma janela ociosa por esses minutos já permite um dream',

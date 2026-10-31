@@ -97,6 +97,10 @@ export const zh: Record<UiKey, string> = {
   'settings.field.delegateModel.hint':
     "留空=全程主模型。填写后反思轮与梦境轮自动换用该模型执行，轮次结束自动换回主模型（其余对话不受影响）；'provider/model' 指定路由，'model' 只换模型名",
   'settings.field.delegateModel.placeholder': '如 zai-coding-cn/glm-5.3-flash',
+  'settings.field.delegateEffort.label': '换用模型的思考档位',
+  'settings.field.delegateEffort.hint':
+    "留空=剥离主会话的思考档位（默认，推荐：目标模型不声明思考档位时带着会直接被拒）。填 'inherit' 沿用主会话档位；或显式填 delegate 模型支持的档位（如 high）",
+  'settings.field.delegateEffort.placeholder': '留空=剥离；inherit / low / medium / high',
   'settings.field.dreamEnabled.label': '空闲整理开关',
   'settings.field.dream.idleMinutes.label': '空闲分钟数',
   'settings.field.dream.idleMinutes.hint': '窗口空闲满该分钟数即允许 dream',
