@@ -277,7 +277,7 @@ function enhanceClone(clone: HTMLElement, node: ChatNode | undefined): void {
     })
   } else if (node.kind === 'tool-call') {
     const root = (node.data as ToolChatData).root
-    if (root === undefined) return // issue #2：异常数据无 root 时跳过增强（与 toolNameOf 同防护）
+    if (root === undefined) return // issue #2：异常数据无 root 时跳过增强（与 toolNameOfBlock 同防护）
     const rowEl = clone.querySelector<HTMLElement>('[data-disclosure-row]')
     if (rowEl === null) return
     const name = 'name' in root ? root.name : (root.call?.name ?? root.callId)

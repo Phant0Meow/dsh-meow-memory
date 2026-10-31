@@ -43,9 +43,11 @@ function assistantNode(key, loc, status) {
   return { key, kind: 'assistant', location: loc, data: { status } }
 }
 function toolNode(key, loc, name) {
+  // callId 按 key 唯一（宿主契约：callId 是调用身份，并行调用各不相同；
+  // #85 起计数按 callId 去重，夹具共用一个 id 会被误去重）
   const root = name === null
-    ? { kind: 'tool-result', callId: 'c', call: null, content: [] }
-    : { callId: 'c', name, argsRaw: '{}', turn: 1, step: 1, time: 0, subCalls: [] }
+    ? { kind: 'tool-result', callId: key, call: null, content: [] }
+    : { callId: key, name, argsRaw: '{}', turn: 1, step: 1, time: 0, subCalls: [] }
   return { key, kind: 'tool-call', location: loc, data: { root } }
 }
 function snapshot(order, nodes, getTurn) {
@@ -499,6 +501,82 @@ console.log('=== 7. 旧宿主（nodes 无 values）回归 ===')
   const groups = computeFoldGroups(s)
   check('旧宿主：照常识别与计数', groups.length === 1 && groups[0].rememberCount === 1 && groups[0].keys.length === 4)
   check('旧宿主：范围与 getTurn 一致', JSON.stringify(groups[0].keys) === JSON.stringify(['ctx-1', 'asst-1', 'tool-1', 'tail-1']))
+}
+
+// ---- 13. PTC 子调用计数（#85）：run_code 根 + 递归 subCalls，按 callId 去重 ----
+// 宿主形状（dsh-client-ui-conversation records.d.ts 实证）：ToolCallBlock 两变体
+// （RunningToolCall / ToolResultNode）都带 subCalls，递归结构、dispatch 序；
+// PTC 会话里顶层工具节点恒为 run_code，memory_* 只出现在 subCalls 里。
+console.log('=== 13. PTC subCalls 计数 ===')
+{
+  const sub = (name, callId, subCalls = []) => ({ callId, name, argsRaw: '{}', turn: 5, step: 1, time: 0, subCalls })
+  const ptcNode = (key, subCalls) => ({
+    key, kind: 'tool-call', location: turnLoc(5),
+    data: { root: { callId: key, name: 'run_code', argsRaw: '{}', turn: 5, step: 1, time: 0, subCalls } },
+  })
+  // 一个 run_code 派出 bash + 2×remember + 1×update（含一层嵌套）
+  const nodes = new Map([
+    ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(5))],
+    ['tool-rc', ptcNode('tool-rc', [
+      sub('bash', 'rc:ptc:1'),
+      sub('memory_remember', 'rc:ptc:2'),
+      sub('memory_remember', 'rc:ptc:3'),
+      sub('memory_update', 'rc:ptc:4'),
+      sub('run_code', 'rc:ptc:5', [sub('memory_remember', 'rc:ptc:5:ptc:1')]),
+    ])],
+    ['tail-1', { key: 'tail-1', kind: 'turn-tail', location: turnLoc(5), data: { turn: 5 } }],
+  ])
+  const s = snapshot(['ctx-1', 'tool-rc', 'tail-1'], nodes, () => ['ctx-1', 'tool-rc', 'tail-1'])
+  const [g] = computeFoldGroups(s)
+  check('PTC：子调用 remember 计数（含嵌套层）= 3', g.rememberCount === 3, `got ${g.rememberCount}`)
+  check('PTC：子调用 update 计数 = 1', g.updateCount === 1, `got ${g.updateCount}`)
+  check('PTC：根 run_code 与非 memory 子调用不计', foldLabel(g, false).includes('新增记忆 3 条'))
+}
+{
+  // callId 去重：同一调用既作顶层根又出现在别的节点 subCalls 里 → 只计一次
+  const sub = (name, callId) => ({ callId, name, argsRaw: '{}', turn: 6, step: 1, time: 0, subCalls: [] })
+  const nodes = new Map([
+    ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(6))],
+    ['tool-top', toolNode('tool-top', turnLoc(6), 'memory_remember')],
+    ['tool-rc', {
+      key: 'tool-rc', kind: 'tool-call', location: turnLoc(6),
+      // 子调用与顶层节点撞同一 callId（异常快照形状）：只计一次
+      data: { root: { callId: 'tool-rc', name: 'run_code', argsRaw: '{}', turn: 6, step: 1, time: 0, subCalls: [sub('memory_remember', 'tool-top')] } },
+    }],
+  ])
+  const s = snapshot(['ctx-1', 'tool-top', 'tool-rc'], nodes, () => ['ctx-1', 'tool-top', 'tool-rc'])
+  const [g] = computeFoldGroups(s)
+  check('PTC：callId 去重（顶层与 subCalls 同 callId 只计一次）', g.rememberCount === 1, `got ${g.rememberCount}`)
+}
+{
+  // ToolResultNode 形态的根（已落定）也带 subCalls：照常下钻
+  const nodes = new Map([
+    ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(7))],
+    ['tool-rc', {
+      key: 'tool-rc', kind: 'tool-call', location: turnLoc(7),
+      data: { root: { kind: 'tool-result', callId: 'rc7', call: { name: 'run_code', argsRaw: '{}' }, content: [], subCalls: [{ kind: 'tool-result', callId: 'rc7:ptc:1', call: { name: 'memory_update', argsRaw: '{}' }, content: [] }] } },
+    }],
+  ])
+  const s = snapshot(['ctx-1', 'tool-rc'], nodes, () => ['ctx-1', 'tool-rc'])
+  const [g] = computeFoldGroups(s)
+  check('PTC：tool-result 根的子调用照常计数', g.updateCount === 1 && g.rememberCount === 0, `got ${g.updateCount}/${g.rememberCount}`)
+}
+{
+  // 异常形状防护：subCalls 非数组 / 子块为 null → 静默跳过不炸（issue #2 同款）
+  const nodes = new Map([
+    ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(8))],
+    ['tool-bad', { key: 'tool-bad', kind: 'tool-call', location: turnLoc(8), data: { root: { callId: 'b', name: 'run_code', argsRaw: '{}', time: 0, subCalls: null } } }],
+    ['tool-bad2', { key: 'tool-bad2', kind: 'tool-call', location: turnLoc(8), data: { root: { callId: 'b2', name: 'run_code', argsRaw: '{}', time: 0, subCalls: [null, 42, { callId: 'ok', name: 'memory_remember', time: 0 }] } } }],
+  ])
+  const s = snapshot(['ctx-1', 'tool-bad', 'tool-bad2'], nodes, () => ['ctx-1', 'tool-bad', 'tool-bad2'])
+  let g
+  try {
+    ;[g] = computeFoldGroups(s)
+    check('PTC：异常 subCalls 形状不抛异常', true)
+  } catch {
+    check('PTC：异常 subCalls 形状不抛异常', false)
+  }
+  check('PTC：异常块中的合法子调用仍计数', g?.rememberCount === 1, `got ${g?.rememberCount}`)
 }
 
 console.log(failures === 0 ? '\nALL CLIENT-FOLD TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)

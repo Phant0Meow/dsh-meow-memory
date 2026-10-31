@@ -64,6 +64,16 @@ export function scanTurn(events: readonly unknown[]): {
           texts.push(block.text)
         }
       }
+    } else if (e?.type === 'tool/ptc-dispatch') {
+      // PTC（#85）：一个 turn 的顶层工具调用恒为 run_code，真正执行的工具名只在
+      // 子调用落定事件里（与 tool/ptc-dispatch-start 的 name 完全一致，取落定事件
+      // =「最后一个完成的工具」）。宿主 drainDispatches 保证全部 settle 事件在
+      // run_code 外层结果之前落流（dsh-tools ptc.js），turn 收尾时必然可见。
+      const name = (e.data as { name?: unknown } | undefined)?.name
+      if (typeof name === 'string') {
+        sawToolCall = true
+        lastToolName = name
+      }
     }
   }
   return { sawToolCall, lastToolName, sawReflect, turnText: texts.join('\n').slice(-2000) }
@@ -74,6 +84,9 @@ export function scanTurn(events: readonly unknown[]): {
  * 每个 tool-call 计 1 step（同一 assistant/message 内的并行调用逐个计数）；
  * memory_ 工具调用中断连续段（已主动记忆，不再反思）。用户拍板：一次任务
  * 连续 react ≥7 个工具 step 才在任务结束时触发反思。
+ * PTC（#85）：顶层工具恒为 run_code，子调用名在 tool/ptc-dispatch 落定事件里——
+ * 子调用不计 step（一个 run_code 可能派发几十个子调用，全算会瞬间打满阈值），
+ * 但 memory_* 子调用 = 已主动记忆，同样中断连续段。
  */
 export function consecutiveToolSteps(events: readonly unknown[]): number {
   let startIdx = 0
@@ -88,7 +101,11 @@ export function consecutiveToolSteps(events: readonly unknown[]): number {
   for (let i = startIdx; i < events.length; i++) {
     const e = events[i] as {
       type?: string
-      data?: { message?: { content?: Array<{ type?: string; name?: string }> } }
+      data?: { name?: unknown; message?: { content?: Array<{ type?: string; name?: string }> } }
+    }
+    if (e?.type === 'tool/ptc-dispatch') {
+      if (typeof e.data?.name === 'string' && e.data.name.startsWith('memory_')) cur = 0
+      continue
     }
     if (e?.type !== 'assistant/message') continue
     for (const b of e.data?.message?.content ?? []) {

@@ -122,15 +122,40 @@ function variantOf(node: ChatNode): FoldVariant {
   return text.includes(DREAM_MARKER) ? 'dream' : 'reflect'
 }
 
-/** 统计一个工具节点的调用名（memory_remember / memory_update）。
+/** 单个 ToolCallBlock 的调用名（RunningToolCall 直取 name；ToolResultNode 取
+ *  call?.name——窗口截断时 call 可能为 null）。形状异常返回 undefined。
  *  注意：工具节点的渲染 kind 是 'tool-call'（ui-conversation 的 toolDefinition
  *  以 chatNode(context, 'tool-call', ...) 发布），不是 'tool'。 */
-function toolNameOf(node: ChatNode): string | undefined {
-  if (node.kind !== 'tool-call') return undefined
-  const root = (node.data as ToolChatData).root
-  if (root === undefined) return undefined
-  if ('name' in root) return root.name // RunningToolCall
-  return root.call?.name // ToolResultNode（窗口截断时 call 可能为 null）
+function toolNameOfBlock(block: unknown): string | undefined {
+  if (block === null || typeof block !== 'object') return undefined
+  const b = block as { name?: unknown; call?: { name?: unknown } | null }
+  if (typeof b.name === 'string') return b.name
+  if (typeof b.call?.name === 'string') return b.call.name
+  return undefined
+}
+
+/** PTC（#85）：顶层工具节点只携带根调用（PTC 会话里恒为 run_code），memory_*
+ *  子调用挂在 root.subCalls 上（宿主 ToolCallBlock 两个变体都带、递归结构、
+ *  dispatch 序；子调用不单独成 chat 节点，只嵌在根卡片里）。按 callId 去重后
+ *  按名计数；形状异常静默跳过——计数在每次渲染都跑，不能炸（issue #2 同防护）。 */
+function countMemoryCalls(node: ChatNode, seen: Set<string>, counts: { remember: number; update: number }): void {
+  if (node.kind !== 'tool-call') return
+  visitCallBlock((node.data as ToolChatData).root, seen, counts)
+}
+
+function visitCallBlock(block: unknown, seen: Set<string>, counts: { remember: number; update: number }): void {
+  if (block === null || typeof block !== 'object') return
+  const b = block as { callId?: unknown; subCalls?: unknown }
+  if (typeof b.callId === 'string') {
+    if (seen.has(b.callId)) return
+    seen.add(b.callId)
+  }
+  const name = toolNameOfBlock(block)
+  if (name === 'memory_remember') counts.remember++
+  else if (name === 'memory_update') counts.update++
+  if (Array.isArray(b.subCalls)) {
+    for (const sub of b.subCalls) visitCallBlock(sub, seen, counts)
+  }
 }
 
 /** 会话键序（0.2.x 兼容，#53/#58/#72）：order 为准，再补齐未进 order 的节点。
@@ -215,22 +240,23 @@ export function computeFoldGroups(snapshot: ConversationSnapshot): FoldGroup[] {
         return n !== undefined && n.kind !== 'user' && n.kind !== 'steering'
           && (n.kind !== 'turn-tail' || ownsTurn)
       })
-    let rememberCount = 0
-    let updateCount = 0
+    const counts = { remember: 0, update: 0 }
+    // PTC 子调用计数按 callId 全组去重（顶层节点与嵌套 subCalls 理论上不相交——
+    // 子调用只经 ptc-dispatch 事件投影进根卡片的 subCalls——去重是投影形状
+    // 演变时的保险，宁可少计不重复计）。
+    const seenCalls = new Set<string>()
     let status: FoldStatus = 'done'
     for (const k of keys) {
       const n = nodes.get(k)
       if (n === undefined) continue
-      const name = toolNameOf(n)
-      if (name === 'memory_remember') rememberCount++
-      else if (name === 'memory_update') updateCount++
+      countMemoryCalls(n, seenCalls, counts)
       if (n.kind === 'assistant') {
         const data = n.data as AssistantChatData
         if (data.status === 'running') status = 'running'
         else if (data.status === 'interrupted' && status !== 'running') status = 'interrupted'
       }
     }
-    groups.push({ id: anchor.key, variant: anchor.variant, keys, rememberCount, updateCount, status, turn: anchor.turn })
+    groups.push({ id: anchor.key, variant: anchor.variant, keys, rememberCount: counts.remember, updateCount: counts.update, status, turn: anchor.turn })
   }
   return groups
 }

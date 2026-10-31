@@ -1774,6 +1774,9 @@ const events = {
   assistantWithTool: (name) => ({ type: 'assistant/message', data: { message: { content: [{ type: 'tool-call', id: 'c1', name, arguments: '{}' }] } } }),
   assistantText: (text) => ({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } }),
   turnStart: () => ({ type: 'turn/start', data: {} }),
+  // #85 PTC：run_code 子调用落定事件（形状按宿主 dsh-tools ptc.js 实证：
+  // rootCallId/parentCallId/subCallId/name/arguments/isError/content；subCallId = <root>:ptc:<N>）
+  ptcDispatch: (name, n = 1) => ({ type: 'tool/ptc-dispatch', data: { rootCallId: 'rc1', parentCallId: 'rc1', subCallId: `rc1:ptc:${n}`, name, arguments: '{}', isError: false, content: [] } }),
 }
 
 // pre-step 注入
@@ -2120,6 +2123,73 @@ const steered3 = []
 const agentF = { session: { header: { cwd: ws, id: 's6' }, events: [events.turnStart(), events.userMsg('记住'), events.assistantWithTool('memory_remember')] }, steer: (m) => steered3.push(m) }
 stopping({ agent: agentF, turn: 1, signal: new AbortController().signal })
 check('no steer after memory_ tool', steered3.length === 0)
+
+// ── #85 PTC（run_code 派发子调用）：子调用名只在 tool/ptc-dispatch 落定事件里 ──
+{
+  const { scanTurn } = await import('./lib/index.js')
+  // scanTurn：lastToolName 下钻到子调用（顶层恒为 run_code，守卫 otherwise 恒 false）
+  const ptcTurn = [
+    events.turnStart(), events.userMsg('干活'),
+    events.assistantWithTool('run_code'),
+    events.ptcDispatch('bash', 1), events.ptcDispatch('memory_remember', 2),
+  ]
+  const scanned = scanTurn(ptcTurn)
+  check('#85 scanTurn PTC：lastToolName = 最后一个子调用', scanned.lastToolName === 'memory_remember' && scanned.sawToolCall === true, `got ${scanned.lastToolName}`)
+  const scanned2 = scanTurn([...ptcTurn.slice(0, -1), events.ptcDispatch('bash', 3)])
+  check('#85 scanTurn PTC：后续非 memory 子调用覆盖（守卫正确放行反思）', scanned2.lastToolName === 'bash')
+  check('#85 scanTurn 非 PTC 不受影响', scanTurn([events.turnStart(), events.userMsg('x'), events.assistantWithTool('bash')]).lastToolName === 'bash')
+
+  // consecutiveToolSteps：子调用不计 step；memory_* 子调用中断连续段
+  check('#85 子调用不参与计数（一个 run_code 里 5 个 bash 子调用仍是 1 step）',
+    consecutiveToolSteps([events.turnStart(), events.userMsg('干活'), events.assistantWithTool('run_code'), ...[1, 2, 3, 4, 5].map((n) => events.ptcDispatch('bash', n))]) === 1)
+  check('#85 memory_* 子调用中断连续段',
+    consecutiveToolSteps([
+      events.turnStart(), events.userMsg('干活'),
+      events.assistantWithTool('run_code'), events.ptcDispatch('memory_remember', 1),
+      events.assistantWithTool('run_code'), events.assistantWithTool('run_code'),
+    ]) === 2)
+  check('#85 18 个子调用打不满阈值（6 个 run_code × 3 bash 子调用）',
+    consecutiveToolSteps([
+      events.turnStart(), events.userMsg('干活'),
+      ...Array.from({ length: 6 }, (_, i) => [events.assistantWithTool('run_code'), events.ptcDispatch('bash', i * 3 + 1), events.ptcDispatch('grep', i * 3 + 2), events.ptcDispatch('read', i * 3 + 3)]).flat(),
+    ]) === 6)
+
+  // turn-stopping 集成：7 个 run_code step、最后落定的子调用是 memory_remember → 守卫拦下
+  const steeredPtc1 = []
+  const agentPtc1 = {
+    session: { header: { cwd: ws, id: 's85a' }, events: [
+      events.turnStart(), events.userMsg('干活'),
+      ...Array.from({ length: 7 }, (_, i) => [events.assistantWithTool('run_code'), events.ptcDispatch('bash', i * 2 + 1), events.ptcDispatch('memory_remember', i * 2 + 2)]).flat(),
+    ] },
+    steer: (m) => steeredPtc1.push(m),
+  }
+  stopping({ agent: agentPtc1, turn: 1, signal: new AbortController().signal })
+  check('#85 PTC 反思守卫生效（最后子调用 memory_ → 不再触发反思）', steeredPtc1.length === 0, `got ${steeredPtc1.length}`)
+
+  // 7 个 run_code step、子调用全非 memory → 照常反思
+  const steeredPtc2 = []
+  const agentPtc2 = {
+    session: { header: { cwd: ws, id: 's85b' }, events: [
+      events.turnStart(), events.userMsg('干活'),
+      ...Array.from({ length: 7 }, (_, i) => [events.assistantWithTool('run_code'), events.ptcDispatch('bash', i * 2 + 1), events.ptcDispatch('grep', i * 2 + 2)]).flat(),
+    ] },
+    steer: (m) => steeredPtc2.push(m),
+  }
+  stopping({ agent: agentPtc2, turn: 1, signal: new AbortController().signal })
+  check('#85 PTC 子调用非 memory 且 step 足 → 反思照常触发', steeredPtc2.length === 1 && steeredPtc2[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
+
+  // 6 个 run_code step、每个派 3 个子调用：step 数按顶层算 → 不触发
+  const steeredPtc3 = []
+  const agentPtc3 = {
+    session: { header: { cwd: ws, id: 's85c' }, events: [
+      events.turnStart(), events.userMsg('干活'),
+      ...Array.from({ length: 6 }, (_, i) => [events.assistantWithTool('run_code'), events.ptcDispatch('bash', i * 3 + 1), events.ptcDispatch('grep', i * 3 + 2), events.ptcDispatch('read', i * 3 + 3)]).flat(),
+    ] },
+    steer: (m) => steeredPtc3.push(m),
+  }
+  stopping({ agent: agentPtc3, turn: 1, signal: new AbortController().signal })
+  check('#85 PTC 子调用不虚增 step 数（6×3 子调用仍不触发）', steeredPtc3.length === 0, `got ${steeredPtc3.length}`)
+}
 
 // ═══════════════════════ delegate（fork 子代理执行体） ═══════════════════════
 
