@@ -276,8 +276,10 @@ function rememberTool(dir: string): ToolDefinition {
       // 锚定当前 project：带 project 参数的 memory 调用更新会话状态（命中检索用它）；"全局"与多项目（逗号分隔）不锚定。
       if (project && !isGlobalProject(project) && !project.includes(',')) setCurrentProject(workspace, source_session ?? 'unknown', project, dir)
 
-      // 去重：同 level 找相似条目 → 合并更新
-      const existing = db.list(level)
+      // 去重：同 level 找相似条目 → 合并更新。只认 active（#99）：archived/stale 是
+      // 被 dream/用户有意降档的条目，新内容合进去会继承隐藏状态、注入检索都不可见
+      // （=新记忆被吞）；想复活归档条目走 memory_update 显式操作。
+      const existing = db.list(level, { status: 'active' })
       let merged: MemoryRow | undefined
       for (const r of existing) {
         if (similarity(r.content, content) >= DEDUP_THRESHOLD) {

@@ -1528,6 +1528,23 @@ const r1 = await rememberToolW.execute({ content: '本会话新建的记忆条�
 check('remember insert records written', readWritten(wsWritten, 's-w', '.dsh-meow').includes(r1.id))
 const r2 = await rememberToolW.execute({ content: '本会话新建的记忆条目', project: 'femo', keywords: ['新建', '记忆', '测试', '压缩', '重注入', '回放', '痕迹', '条目'], importance: 2 }, writtenCtx)
 check('remember merge records written', r2.merged === true && r2.id === r1.id && readWritten(wsWritten, 's-w', '.dsh-meow').includes(r2.id))
+
+// ── #99：去重只认 active——archived 条目不吞新写入 ──
+{
+  const ctx99 = { agent: { session: { header: { cwd: wsWritten, id: 's-99' } } } } // 独立会话：不污染 s-w 的 written 断言
+  const db99 = new MemoryDb(memoryDbPath(wsWritten))
+  // 一条 archived（≥0.8 相似的目标），一条 active（<0.8 的干扰项）
+  const arch = db99.insert({ level: 'fact', content: '部署流水线使用 GitHub Actions 构建', project: 'femo', keywords: ['部署', '流水线'], importance: 1 })
+  db99.update('fact', arch.id, { status: 'archived' })
+  const rArch = await rememberToolW.execute({ content: '部署流水线使用 GitHub Actions 构建', project: 'femo', keywords: ['部署', '流水线', '构建'], importance: 2 }, ctx99)
+  const archAfter = db99.findById(arch.id)?.row
+  check('#99 archived 不被合并（新写入自立 active 条目）',
+    rArch.merged !== true && rArch.id !== arch.id, `merged=${rArch.merged} id=${rArch.id.slice(0, 8)}`)
+  check('#99 archived 条目内容不被改写', archAfter?.content === '部署流水线使用 GitHub Actions 构建' && archAfter?.status === 'archived')
+  const rActive = await rememberToolW.execute({ content: '部署流水线使用 GitHub Actions 构建', project: 'femo', keywords: ['部署', '流水线', '构建'], importance: 2 }, ctx99)
+  check('#99 同内容再写仍合并进新建的 active 条目', rActive.merged === true && rActive.id === rArch.id)
+  db99.close()
+}
 const r3 = await updateToolW.execute({ id: r1.id, importance: 3 }, writtenCtx)
 check('update success records written', r3.ok === true && readWritten(wsWritten, 's-w', '.dsh-meow').includes(r1.id))
 const r4 = await updateToolW.execute({ id: 'nonexistent-id-xxxx', importance: 1 }, writtenCtx)
