@@ -11,19 +11,37 @@
 #
 # This script is Windows-only (NTFS junctions). On macOS/Linux, replace the
 # junction with a symlink (ln -s) — the layout is identical.
+#
+# 注意：npm install 会清掉非依赖树内的 junction，装完包要重跑本脚本。
+# dsh-llm external 化（PR #88）后 build 不再需要 junction；直接 node 跑
+# lib/index.js 的本地测试（test.mjs）仍需要。
 
 param(
   [string]$MeowRoot = "D:\myFiles\dsh\dsh-meow"
 )
 
 $ErrorActionPreference = 'Stop'
-$linkRoot = Join-Path $PSScriptRoot "..\node_modules\@deepseek-ai"
+# 规范化掉 ..（Join-Path $PSScriptRoot "..\..." 留下的点段在某些 cmdlet 里行为不一）
+$linkRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\node_modules\@deepseek-ai"))
 New-Item -ItemType Directory $linkRoot -Force | Out-Null
-$found = 0
+$created = 0
+$skipped = 0
 
-function Try-Link($dir) {
-  $pjFile = Join-Path $dir "package.json"
-  if (-not (Test-Path $pjFile)) { return }
+if (-not (Test-Path (Join-Path $MeowRoot "pnpm-workspace.yaml"))) {
+  # 缺 workspace（外部贡献者 / CI 干净安装）不挡构建：dsh-llm 已 external（PR #88），
+  # 只有直接 node 跑 lib/index.js 的本地测试才需要 junction——提示手动补，不强求。
+  Write-Host "WARN: $MeowRoot does not look like a dsh-meow workspace (pnpm-workspace.yaml missing); skipping junction mirrors"
+  exit 0
+}
+
+# -Depth 3：现行布局是 packages/<组>/<包> 两层（如 packages/llm/llm），
+# 旧的 -Depth 1 扫不到（2026-10-31 npm install 清掉镜像后 build 全红的教训）。
+# 用 foreach 内联而非管道+函数：管线版在部分环境下静默不创建（2026-10-31 实证）。
+$roots = @((Join-Path $MeowRoot "packages"), (Join-Path $MeowRoot "vendor"))
+$dirs = $roots | ForEach-Object { Get-ChildItem $_ -Directory -Recurse -Depth 3 -ErrorAction SilentlyContinue }
+foreach ($d in $dirs) {
+  $pjFile = Join-Path $d.FullName "package.json"
+  if (-not (Test-Path $pjFile)) { continue }
   try {
     $raw = [System.IO.File]::ReadAllText($pjFile, [System.Text.Encoding]::UTF8)
     $pj = $raw | ConvertFrom-Json
@@ -31,21 +49,15 @@ function Try-Link($dir) {
       $name = $pj.name.Substring(13)
       $link = Join-Path $linkRoot $name
       if (-not (Test-Path $link)) {
-        New-Item -ItemType Junction -Path $link -Target $dir | Out-Null
-        $script:found++
+        New-Item -ItemType Junction -Path $link -Target $d.FullName | Out-Null
+        $created++
+      } else {
+        $skipped++
       }
     }
   } catch {
-    Write-Host "skip $($dir): $($_.Exception.Message)"
+    Write-Host "skip $($d.FullName): $($_.Exception.Message)"
   }
 }
 
-if (-not (Test-Path (Join-Path $MeowRoot "pnpm-workspace.yaml"))) {
-  Write-Host "ERROR: $MeowRoot does not look like a dsh-meow workspace (pnpm-workspace.yaml missing)"
-  exit 1
-}
-
-Get-ChildItem (Join-Path $MeowRoot "packages") -Directory -Recurse -Depth 1 -ErrorAction SilentlyContinue | ForEach-Object { Try-Link $_ }
-Get-ChildItem (Join-Path $MeowRoot "vendor") -Directory -ErrorAction SilentlyContinue | ForEach-Object { Try-Link $_ }
-
-Write-Host "created $found new junctions; total: $((Get-ChildItem $linkRoot).Count) in $linkRoot"
+Write-Host "created $created new junctions (already present: $skipped); total: $((Get-ChildItem $linkRoot).Count) in $linkRoot"

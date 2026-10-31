@@ -7,10 +7,9 @@
  *  - lib/client.js — browser bundle in ModuleLoader.load format (the web
  *    shell's client module loader; see @deepseek-ai/dsh-client-modules).
  *
- * Everything is bundled (esbuild) so the plugin is self-contained:
- * @deepseek-ai/* imports are linked in at build time via the node_modules
- * junction mirrors (scripts/link-workspace.ps1); react stays external on the
- * client side (shell singleton, ModuleLoader resolves it).
+ * Plugin code is bundled with esbuild. Host-owned schemastery and dsh-llm
+ * stay external and are resolved by the DSH profile loader; react stays
+ * external on the client side (shell singleton, ModuleLoader resolves it).
  */
 import { build, context } from 'esbuild';
 import { cpSync } from 'node:fs';
@@ -28,8 +27,11 @@ const hostOptions = {
   entryPoints: ['src/index.ts'],
   bundle: true,
   platform: 'node',
-  // Config must use the same schema constructor as the running DSH Host.
-  external: ['@deepseek-ai/schemastery'],
+  // Both peers are supplied by the running DSH Host. In particular, the
+  // optional dsh-llm peer is absent during a clean GitHub prepare build.
+  // Do not restore it as a devDependency: file/link installs can introduce
+  // another copy of a host core package into the profile (see #84).
+  external: ['@deepseek-ai/schemastery', '@deepseek-ai/dsh-llm'],
   format: 'esm',
   target: 'node22',
   nodePaths,

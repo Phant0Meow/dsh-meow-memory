@@ -20,7 +20,7 @@ Version **0.31.0** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Supports **ds
 - **Reflection**: after ≥7 consecutive tool steps within one task the plugin asks the model whether anything since the last consolidation is worth remembering. A turn whose last tool is a `memory_*` tool counts as already consolidated (no re-reflection).
 - **External memory trust gate**: a workspace-carried `.dsh-meow` that was not created on this machine (e.g. a cloned external repo) is paused by default — one notice on the first round, then `/meow-trust` re-enables instantly; libraries created locally and workspaces opened before the upgrade are trusted automatically, so normal use never notices.
 - **Client UI**: injected text collapses into a slim bar, reflection/dream turns collapse into one expandable card, and the session list shows dream state icons (🌙 consolidated / breathing moon in progress / muted-gray slashed moon skipped).
-- **Zero runtime dependencies**: `node:sqlite` + self-contained esbuild bundle (`lib/index.js`). No native modules.
+- **No separately installed runtime dependencies**: `node:sqlite` + an esbuild bundle (`lib/index.js`); the DSH Host resolves the `schemastery` and `dsh-llm` peers. No native modules.
 
 ## 📦 Install
 
@@ -148,14 +148,23 @@ There is also the `/dream` command: type `/dream` in the composer to consolidate
 
 ```sh
 npm install
-npm run build          # esbuild bundle → lib/index.js (self-contained)
+npm run build          # esbuild bundle → lib/index.js (Host peers stay external)
 npm run test           # 228 logic tests: db / bm25 / migrate / inject / reflect / dream / tools / apply
 ```
 
 The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's
 `node_modules`. On Windows, `npm run link-workspace` (or `scripts/link-workspace.ps1`)
 creates junction mirrors of the workspace packages so esbuild can resolve them;
-`build.mjs` uses `nodePaths` to pick them up. The links are build-time only.
+`build.mjs` uses `nodePaths` to pick them up. Building does not require the optional
+`dsh-llm` peer. To run tests directly with Node, link `@deepseek-ai/dsh-llm` from a
+matching DSH workspace; normal plugin loading resolves it through the DSH profile
+loader. Do not restore it as a devDependency: `file:` / `link:` installs can introduce
+a second copy of a Host core package into the profile (#84).
+
+`node tests/build-host-peers.mjs` checks a clean build without Host peers (#87).
+`node tests/host-peers.mjs /path/to/node_modules/@deepseek-ai/dsh` uses an independently
+installed official DSH to check real Host loading and message contracts in an isolated
+profile, without model calls.
 
 ## 📚 Documentation
 
