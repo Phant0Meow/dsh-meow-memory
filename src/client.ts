@@ -281,8 +281,9 @@ function enhanceClone(clone: HTMLElement, node: ChatNode | undefined): void {
     const rowEl = clone.querySelector<HTMLElement>('[data-disclosure-row]')
     if (rowEl === null) return
     const name = 'name' in root ? root.name : (root.call?.name ?? root.callId)
-    const argsRaw = 'name' in root ? root.argsRaw : (root.call?.argsRaw ?? '')
-    const detail = toolCallDetail({ name, argsRaw })
+    // #86-②：传整份 root，参数由 toolArgsOf 兜底链解析（argsRaw/arguments/对象参数），
+    // 形状偏差降级为只显示工具名——绝不抛进 slot 渲染（会连锁拆掉整个 dock）。
+    const detail = toolCallDetail({ name, root })
     const resultText = 'content' in root ? blocksToText(root.content) : ''
     attachDisclosure(rowEl, 'tool', resultText.length > 0 ? `${detail}\n\n${t('inject.result')}\n${resultText}` : detail)
   } else if (node.kind === 'context') {
@@ -318,7 +319,14 @@ function fillBody(id: string, visible: boolean, keys: readonly string[], session
       clone.removeAttribute('data-chat-anchor-key')
       clone.removeAttribute('data-chat-flow-kind')
       body.appendChild(clone)
-      enhanceClone(clone, session.chat?.nodes.get(key))
+      // #86-②：单行增强失败降级为未增强行——enhanceClone 链上一处抛错会沿
+      // applyFoldState 传进 useLayoutEffect，被外壳按 slot 崩溃处理拆掉整个 dock
+      // （#92 症状：折叠条整块消失），这里兜住。
+      try {
+        enhanceClone(clone, session.chat?.nodes.get(key))
+      } catch {
+        /* 该行详情缺失可接受，其余行继续 */
+      }
     }
     bodySigs.set(id, sigOf(container, keys))
   }

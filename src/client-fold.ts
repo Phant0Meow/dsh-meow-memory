@@ -293,15 +293,46 @@ export function foldLabel(group: FoldGroup, expanded: boolean): string {
   return `${arrow} ${t('fold.status.nothing', { title })}`
 }
 
-/** 渲染一个 tool 调用的详情文本：名称 + 格式化参数（JSON pretty）。 */
-export function toolCallDetail(block: { name: string; argsRaw: string }): string {
-  let args = block.argsRaw
-  try {
-    args = JSON.stringify(JSON.parse(block.argsRaw), null, 2)
-  } catch {
-    /* 非 JSON 参数原样展示 */
+/** 工具参数字段跨宿主形态容错（#86-②）：客户端投影用 argsRaw，assistant wire
+ *  记录用 arguments，部分形态是 args / input 且可为对象。缺失返回 undefined。 */
+function argsFieldOf(record: unknown): unknown {
+  if (record === null || typeof record !== 'object') return undefined
+  const s = record as { argsRaw?: unknown; arguments?: unknown; args?: unknown; input?: unknown }
+  return s.argsRaw ?? s.arguments ?? s.args ?? s.input
+}
+
+/** 参数兜底链：块自身 → root（tool-call 节点传整份 root）→ call → root.call。 */
+function toolArgsOf(record: unknown): unknown {
+  const r = record as { root?: unknown; call?: unknown } | null | undefined
+  for (const c of [record, r?.root, r?.call, (r?.root as { call?: unknown } | undefined)?.call]) {
+    const v = argsFieldOf(c)
+    if (v !== undefined) return v
   }
-  return args.length > 0 ? `${block.name}\n${args}` : block.name
+  return ''
+}
+
+/** 渲染一个 tool 调用的详情文本：名称 + 格式化参数（JSON pretty）。
+ *  #86-②：任何字段缺失/形状偏差都降级为只显示工具名，绝不抛——抛进 slot 渲染
+ *  会被外壳按槽位崩溃处理，当场拆掉整个折叠 dock（conversation.composer.dock）。 */
+export function toolCallDetail(block: { name?: unknown } & Record<string, unknown>): string {
+  const raw = toolArgsOf(block)
+  let args: string
+  if (typeof raw === 'string') {
+    args = raw
+    try {
+      args = JSON.stringify(JSON.parse(raw), null, 2)
+    } catch {
+      /* 非 JSON 参数原样展示 */
+    }
+  } else {
+    try {
+      args = raw === null || raw === undefined ? '' : (JSON.stringify(raw, null, 2) ?? '')
+    } catch {
+      args = String(raw)
+    }
+  }
+  const name = typeof block?.name === 'string' ? block.name : ''
+  return args.length > 0 ? `${name}\n${args}` : name
 }
 
 /** 从 content blocks 提取纯文本（tool result / 消息正文）。 */

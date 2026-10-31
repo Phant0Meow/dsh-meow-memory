@@ -579,5 +579,31 @@ console.log('=== 13. PTC subCalls 计数 ===')
   check('PTC：异常块中的合法子调用仍计数', g?.rememberCount === 1, `got ${g?.rememberCount}`)
 }
 
+// ---- 14. toolCallDetail 形状容错（#86-②）：任何偏差降级为只显示工具名，绝不抛 ----
+console.log('=== 14. toolCallDetail 形状容错 ===')
+{
+  const det = (block) => {
+    try {
+      const v = toolCallDetail(block)
+      return { ok: true, v }
+    } catch (e) {
+      return { ok: false, e }
+    }
+  }
+  check('无字段 → 只显示名（不抛）', det({ name: 'bash' }).ok && det({ name: 'bash' }).v === 'bash')
+  check('argsRaw undefined → 只显示名', det({ name: 'bash', argsRaw: undefined }).v === 'bash')
+  check('argsRaw null → 只显示名', det({ name: 'bash', argsRaw: null }).v === 'bash')
+  check('缺 name 缺参数 → 空串', det({}).v === '')
+  check('arguments 字符串（wire 形态）→ pretty', det({ name: 'bash', arguments: '{"cmd":"ls"}' }).v.includes('"cmd": "ls"'))
+  check('args 对象 → JSON pretty', det({ name: 'bash', args: { cmd: 'ls' } }).v.includes('"cmd": "ls"'))
+  check('call.argsRaw 兜底', det({ name: 'bash', call: { argsRaw: '{"a":1}' } }).v.includes('"a": 1'))
+  check('root 包装（tool-call 节点整份传入）', det({ name: 'bash', root: { name: 'bash', argsRaw: '{"a":1}' } }).v.includes('"a": 1'))
+  check('root.call 兜底（tool-result 形态）', det({ name: 'bash', root: { call: { argsRaw: '{"b":2}' } } }).v.includes('"b": 2'))
+  check('合法 argsRaw 仍 pretty（旧行为不变）', det({ name: 'bash', argsRaw: '{"cmd":"ls -la"}' }).v.includes('"cmd": "ls -la"'))
+  check('空 argsRaw → 只显示名（旧行为不变）', det({ name: 'bash', argsRaw: '' }).v === 'bash')
+  check('非 JSON 字符串原样展示', det({ name: 'bash', argsRaw: 'plain text' }).v === 'bash\nplain text')
+  check('name 非字符串 → 忽略', det({ name: 42, argsRaw: '{"a":1}' }).v.includes('"a": 1'))
+}
+
 console.log(failures === 0 ? '\nALL CLIENT-FOLD TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)
 process.exit(failures === 0 ? 0 : 1)

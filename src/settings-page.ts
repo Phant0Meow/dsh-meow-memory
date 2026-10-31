@@ -722,25 +722,44 @@ export function applySettingsPage(ctx: any, opts?: SettingsPageMountOptions): ()
   const mountWithScope = (scope: any): () => void => {
     injectSettingsCss()
     let disposeEntry: (() => void) | null = null
+    // #86-①：外壳 ui-settings 挂载前，sidebar.settings 的 children 表还没声明
+    // settings.section——onUiLocaleChange 订阅即同步回调一次，那时注册必抛
+    // （"slot settings.section is not declared"），每次加载刷一条 error。以 inject
+    // 回调作就绪信号：外壳真正渲染该 slot 时才会调用，此前的语言回调一律跳过
+    // （真渲染会用当前语言注册，不丢文案）；就绪后的注册失败降级 info（slot 拆除
+    // 期间的竞态不该以 error 面目示人），dispose 后置空避免失败路径残留旧 disposer。
+    let slotReady = false
     const registerSection = (): void => {
       try {
         disposeEntry?.()
       } catch {
         /* 旧条目已在卸载：继续注册新条目 */
       }
-      disposeEntry = ctx.slots.register(
-        {
-          name: 'settings.section',
-          id: SETTINGS_NS,
-          order: 35,
-          label: () => t('settings.title'),
-          inject: (): unknown => ({ scope }),
-        },
-        MemorySettingsSection,
-      )
+      disposeEntry = null
+      try {
+        disposeEntry = ctx.slots.register(
+          {
+            name: 'settings.section',
+            id: SETTINGS_NS,
+            order: 35,
+            label: () => t('settings.title'),
+            inject: (): unknown => ({ scope }),
+          },
+          MemorySettingsSection,
+        )
+      } catch (error) {
+        console.info('[meow-memory] settings.section 尚未声明，跳过本次注册（插槽就绪后由 inject 回调补挂）：',
+          error instanceof Error ? error.message : String(error))
+      }
     }
-    const disposeInjection = ctx.slots.inject('settings.section', registerSection)
-    const unsubscribeLocale = onUiLocaleChange(registerSection)
+    const disposeInjection = ctx.slots.inject('settings.section', () => {
+      slotReady = true
+      registerSection()
+    })
+    const unsubscribeLocale = onUiLocaleChange(() => {
+      if (!slotReady) return
+      registerSection()
+    })
     return () => {
       unsubscribeLocale()
       try {

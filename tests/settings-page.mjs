@@ -142,6 +142,41 @@ const afterDispose = registrations.length
 settings.setUiLocaleForTest('en')
 check('dispose 后不再重注册', registrations.length === afterDispose, String(registrations.length))
 
+// ── 1.5 #86-①：slot 未声明（inject 未回调）时，语言订阅的同步首调不注册、不抛 ──
+// 真实外壳语义：inject 的回调在外壳渲染 settings 页时才调用；挂载时 slot 还没声明，
+// onUiLocaleChange 订阅即同步回调——未就绪就注册会抛 "slot settings.section is not
+// declared"（每次界面加载刷一条 error）。以 inject 回调作就绪信号：未就绪跳过。
+console.log('=== 1.5 #86-① 未就绪不抢注册 ===')
+{
+  const regs15 = []
+  let injectFire
+  const ctx15 = {
+    settingsScope: { bind: () => ({ subscribe: () => () => {}, getSnapshot: () => ({}), set: async () => {}, unset: async () => {} }) },
+    slots: {
+      register: (options, component) => {
+        regs15.push({ options, component })
+        return () => {}
+      },
+      inject: (_slot, cb) => {
+        injectFire = cb // 挂载时不调用（slot 未声明），外壳渲染时才调用
+        return () => {}
+      },
+    },
+  }
+  const dispose15 = settings.applySettingsPage(ctx15)
+  check('未就绪时零注册（不再刷 slot 未声明 error）', regs15.length === 0, String(regs15.length))
+  settings.setUiLocaleForTest('pt-br') // 未就绪时的语言变化：跳过注册
+  check('未就绪时语言变化仍零注册', regs15.length === 0, String(regs15.length))
+  injectFire() // 外壳渲染 slot → 就绪，补挂注册
+  check('就绪后注册一次', regs15.length === 1 && regs15[0].options.name === 'settings.section', String(regs15.length))
+  const before15 = regs15.length
+  settings.setUiLocaleForTest('en')
+  check('就绪后语言变化重注册', regs15.length === before15 + 1, String(regs15.length))
+  dispose15()
+  settings.setUiLocaleForTest('zh')
+  check('dispose 后不再注册', regs15.length === before15 + 1, String(regs15.length))
+}
+
 // ── 2. 页面文案随语言切换 ───────────────────────────────────────────────────
 console.log('=== 2. 页面渲染文案 ===')
 settings.setUiLocaleForTest('zh')
