@@ -108,6 +108,7 @@ Changing it migrates the old directory automatically (same-volume move / cross-v
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `delegate.model` | string | `''` (always the main model) | Model for reflection/dream turns: `'provider/model'` sets both, `'model'` swaps the model only (provider inherited from the main session) |
+| `delegate.effort` | string | `''` (strip) | Reasoning effort for the delegate model (#98): empty = strip the main session's `reasoningEffort` on override (recommended — if the target model does not declare reasoning efforts, the request is rejected outright with `UNSUPPORTED_REASONING_EFFORT`); `'inherit'` = keep the main session's effort (old behavior); any other non-empty value = sent verbatim (set it manually when you know the delegate model supports it, e.g. `'high'`). The main effort is restored together with the main model when the turn ends |
 
 ---
 
@@ -130,6 +131,8 @@ When it is unset: the plugin runs as `zh`, and the first real user message after
 The reflection turn and each dream group always run in the main window (steer) — prompts, replies, and tool calls land in the main session log (the fold UI keeps them tidy). The standalone fork-subagent execution mode was removed in v0.24; there is no longer an "independent execution" switch.
 
 To run memory work on a different (cheaper) model: with `delegate.model` set, every LLM request issued during reflection/dream turns gets its provider/model overridden via dsh's `agent/request` waterfall, and the main model takes over again once the turn ends — normal conversation and tool rounds are untouched. The implementation is stateless: each request is judged by whether the current turn carries a reflection/dream directive marker, so user aborts, crashes, and hot reloads can never leave a stuck "overridden" state.
+
+**Reasoning effort**: the main session's `reasoningEffort` does not travel with the override — the target model's declared capabilities are unknown, and carrying it can get the request rejected before it is sent (`UNSUPPORTED_REASONING_EFFORT`), which shows up as "the model answered but the round still fails, the same dream group is redelivered". It is stripped by default; set `delegate.effort: 'inherit'` when the delegate model supports the same efforts, or specify an effort it supports.
 
 ---
 
