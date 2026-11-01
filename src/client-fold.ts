@@ -107,19 +107,25 @@ function contextText(node: ChatNode): string {
  *  （waking = nextTurn claim 或 idleSteer），buildViewNode 会改标成 'turn-trigger'
  *  （界面即「收到执行请求」chip）。反思/dream prompt 正是靠 followup 触发新一轮的
  *  那条消息，实测走这条路径 —— 只认 'context' 时折叠锚点永远找不到、横条不出现
- *  （2026-10-08 本机复现）。'context' 仍保留：共享轮（宿主回退 steer、未领取）是原形状。 */
+ *  （2026-10-08 本机复现）。'context' 仍保留：共享轮（宿主回退 steer、未领取）是原形状。
+ *  #93 问题四：只认**开头 40 字符**内的标记，不做全文匹配——记忆库里只要有一条
+ *  正文提到 "[meow-memory-reflect]"（比如本 issue 的讨论被记成了记忆），全文匹配
+ *  就把整块长期记忆注入误判成反思提示词，自我毒性。真 prompt 恒以标记开头
+ *  （buildReflectMessage/buildDreamMessage 均为 `${MARKER} …`）。 */
 function isMemoryPrompt(node: ChatNode): boolean {
   if (node.kind !== 'context' && node.kind !== 'turn-trigger') return false
   const source = (node.data as ContextLike).source
   if (!isMeowSource(source)) return false
-  const text = contextText(node)
-  return text.includes(REFLECT_MARKER) || text.includes(DREAM_MARKER)
+  return promptVariantHead(contextText(node)) !== undefined
 }
 
-/** 从 prompt 文本判定轮次类型（reflect / dream）。 */
-function variantOf(node: ChatNode): FoldVariant {
-  const text = contextText(node)
-  return text.includes(DREAM_MARKER) ? 'dream' : 'reflect'
+/** 头部标记判定（#93 问题四）：trimStart 后 40 字符内含反思/dream 标记才算。
+ *  返回 undefined = 不是 memory prompt；'reflect' / 'dream' = 变体。 */
+function promptVariantHead(text: string): FoldVariant | undefined {
+  const head = text.trimStart().slice(0, 40)
+  if (head.includes(REFLECT_MARKER)) return 'reflect'
+  if (head.includes(DREAM_MARKER)) return 'dream'
+  return undefined
 }
 
 /** 单个 ToolCallBlock 的调用名（RunningToolCall 直取 name；ToolResultNode 取
@@ -211,7 +217,7 @@ export function computeFoldGroups(snapshot: ConversationSnapshot): FoldGroup[] {
     if (node === undefined || !isMemoryPrompt(node)) continue
     const turn = turnOf(node)
     if (turn === undefined) continue // 定位未解析（历史窗口外）：不折叠，保持可见
-    const variant = variantOf(node)
+    const variant = promptVariantHead(contextText(node)) ?? 'reflect'
     const mapKey = `${turn}:${variant}`
     if (anchors.has(mapKey)) continue
     anchors.set(mapKey, { key, turn, variant })

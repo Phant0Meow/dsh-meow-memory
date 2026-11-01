@@ -319,6 +319,20 @@ function fillBody(container: HTMLElement, id: string, visible: boolean, keys: re
     clone.removeAttribute('data-chat-flow-key')
     clone.removeAttribute('data-chat-anchor-key')
     clone.removeAttribute('data-chat-flow-kind')
+    // #93 问题二/五：展开区只留正文。同一 assistant 步骤行里混着本轮 tool-call 块
+    // （宿主卡片带「已调用工具并运行了代码」外壳 + memory_search 等调用行）——整块
+    // 剔除 [data-chat-call-id]（属性是宿主渲染钩子、插件从未消费），再删掉剔除后
+    // 留下的纯空白行。只作用于展开克隆体，原始行不动。
+    for (const el of Array.from(clone.querySelectorAll<HTMLElement>('[data-chat-call-id]'))) {
+      const host = el.parentElement
+      if (host !== null && host !== clone) host.remove()
+      else el.remove()
+    }
+    for (const child of Array.from(clone.children)) {
+      if (child.textContent?.trim() === '' && child.querySelector('[data-disclosure-row], [data-chat-call-id]') === null) {
+        child.remove()
+      }
+    }
     body.appendChild(clone)
     // #86-②：单行增强失败降级为未增强行——enhanceClone 链上一处抛错会沿
     // applyFoldState 传进 useLayoutEffect，被外壳按 slot 崩溃处理拆掉整个 dock

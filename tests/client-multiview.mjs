@@ -160,6 +160,24 @@ try {
     assert.equal(foldBody(y.root).style.display, 'none')
     assert.equal(foldBody(y.root).textContent, '')
   })
+
+  // #93 问题二/五：展开区只留正文——同一行里混着的 tool-call 块（宿主外壳 +
+  // data-chat-call-id 卡片）整块剔除，剔除后的纯空白行也删掉。原始行不动。
+  const junk = pane('shell-junk')
+  junk.rows.answer.innerHTML =
+    '<div>整理结论正文。</div>' +
+    '<div><span data-chat-call-id="c1">已调用工具并运行了代码</span><span data-chat-call-id="c2">工具调用 memory_search</span></div>' +
+    '<div>   </div>'
+  query(junk.root, '[data-meow-memory-anchor] > button').click()
+  check('expanded card strips host shell / tool-call blocks and blank rows (#93)', () => {
+    const bodyText = foldBody(junk.root).textContent
+    assert.match(bodyText, /整理结论正文/)
+    assert.doesNotMatch(bodyText, /已调用工具并运行了代码/)
+    assert.doesNotMatch(bodyText, /memory_search/)
+    assert.equal(foldBody(junk.root).querySelectorAll('[data-chat-call-id]').length, 0)
+    // 原始行保持原样（只清理克隆体）
+    assert.ok(junk.rows.answer.querySelector('[data-chat-call-id]'))
+  })
   query(y.root, '[data-meow-memory-anchor] > button').click()
   check('each view has its own clone signature and contents', () => {
     assert.match(foldBody(y.root).textContent, /fork-b answer/)

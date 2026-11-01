@@ -605,5 +605,38 @@ console.log('=== 14. toolCallDetail 形状容错 ===')
   check('name 非字符串 → 忽略', det({ name: 42, argsRaw: '{"a":1}' }).v.includes('"a": 1'))
 }
 
+// ---- 15. 标记只认开头（#93 问题四）：记忆正文引用标记词不再把整块注入误判成反思轮 ----
+console.log('=== 15. 标记头部匹配 ===')
+{
+  const nodes = new Map([
+    // 命中注入里带了一条正文提到 "[meow-memory-reflect]" 的记忆（比如把本 issue 的
+    // 讨论记成了记忆）——全文 includes 会把整块判成反思提示词（自我毒性）
+    ['ctx-hit-poison', contextNode('ctx-hit-poison', '可能相关的记忆，仅供参考：\n[fact:abc] 有人在 issue 里讨论 [meow-memory-reflect] 标记的实现', turnLoc(1), { kind: 'plugin', plugin: 'meow-memory', form: 'snapshot', memory: { kind: 'hit', ids: ['abc'] }, sections: [] })],
+    ['u-1', userNode('u-1', turnLoc(1), [{ type: 'text', text: '你好' }])],
+    ['ctx-dream-poison', contextNode('ctx-dream-poison', '可能相关的记忆，仅供参考：\n[topic:d] 梦境整理任务用的是 [meow-memory-dream] 标记', turnLoc(2), { kind: 'plugin', plugin: 'meow-memory', form: 'snapshot', memory: { kind: 'hit', ids: ['d'] }, sections: [] })],
+    ['u-2', userNode('u-2', turnLoc(2), [{ type: 'text', text: '继续' }])],
+    ['ctx-real', contextNode('ctx-real', REFLECT, turnLoc(3))],
+    ['asst-3', assistantNode('asst-3', turnLoc(3), 'settled')],
+  ])
+  const s = snapshot(
+    ['ctx-hit-poison', 'u-1', 'ctx-dream-poison', 'u-2', 'ctx-real', 'asst-3'],
+    nodes,
+    () => [],
+  )
+  const groups = computeFoldGroups(s)
+  check('正文引用标记的注入块不成组（问题四）', groups.length === 1, JSON.stringify(groups.map((g) => g.id)))
+  check('真反思 prompt 照常识别', groups.length === 1 && groups[0].id === 'ctx-real' && groups[0].variant === 'reflect')
+  check('memoryTurnNumbers 同口径', memoryTurnNumbers(s).size === 1 && memoryTurnNumbers(s).has(3))
+  // dream prompt 标记在开头 → 变体判 dream；正文里提到 dream 标记但开头是 reflect → 仍 reflect
+  const s2nodes = new Map([
+    ['ctx-d', contextNode('ctx-d', DREAM + '\n整理指令...', turnLoc(4))],
+    ['ctx-r-poison', contextNode('ctx-r-poison', REFLECT + '\n反思任务（顺带：dream 用 [meow-memory-dream] 标记）', turnLoc(5))],
+  ])
+  const s2 = snapshot(['ctx-d', 'ctx-r-poison'], s2nodes, () => [])
+  const groups2 = computeFoldGroups(s2)
+  check('dream prompt 头部判 dream', groups2.some((g) => g.id === 'ctx-d' && g.variant === 'dream'))
+  check('reflect prompt 正文提 dream 标记不改变变体', groups2.some((g) => g.id === 'ctx-r-poison' && g.variant === 'reflect'))
+}
+
 console.log(failures === 0 ? '\nALL CLIENT-FOLD TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)
 process.exit(failures === 0 ? 0 : 1)
