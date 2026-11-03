@@ -112,6 +112,7 @@ export const en: Record<UiKey, string> = {
   'settings.field.delegateEffort.hint':
     "Empty = strip the main session's reasoning effort (default, recommended: requests fail outright with UNSUPPORTED_REASONING_EFFORT if the target model does not declare efforts). 'inherit' keeps the main effort; or set a value the delegate model supports (e.g. high)",
   'settings.field.delegateEffort.placeholder': 'empty = strip; inherit / low / medium / high',
+  'fold.body.unloaded': "This turn's content is not loaded yet (not mounted under virtual scrolling) — scroll to that turn and it fills in automatically",
   'settings.field.dreamEnabled.label': 'Idle consolidation switch',
   'settings.field.dream.idleMinutes.label': 'Idle minutes',
   'settings.field.dream.idleMinutes.hint': 'A window idle for this many minutes allows a dream',

@@ -93,6 +93,7 @@ export const UI_KEYS = [
   'settings.field.delegateEffort.label',
   'settings.field.delegateEffort.hint',
   'settings.field.delegateEffort.placeholder',
+  'fold.body.unloaded',
   'settings.field.dreamEnabled.label',
   'settings.field.dream.idleMinutes.label',
   'settings.field.dream.idleMinutes.hint',

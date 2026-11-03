@@ -103,6 +103,7 @@ export const ptBr: Record<UiKey, string> = {
   'settings.field.delegateEffort.hint':
     "Vazio = descarta o esforço de raciocínio da sessão principal (padrão, recomendado: a requisição falha com UNSUPPORTED_REASONING_EFFORT se o modelo alvo não declara esforços). 'inherit' mantém o esforço principal; ou defina um valor aceito pelo modelo (ex.: high)",
   'settings.field.delegateEffort.placeholder': 'vazio = descartar; inherit / low / medium / high',
+  'fold.body.unloaded': 'O conteúdo desta rodada ainda não foi carregado (não montado na rolagem virtual) — role até ela para preencher automaticamente',
   'settings.field.dreamEnabled.label': 'Ligar a consolidação ociosa',
   'settings.field.dream.idleMinutes.label': 'Minutos de ociosidade',
   'settings.field.dream.idleMinutes.hint': 'Uma janela ociosa por esses minutos já permite um dream',

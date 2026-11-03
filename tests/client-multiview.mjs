@@ -142,6 +142,25 @@ try {
   await wait()
   check('sibling streaming does not wake the other observer', () => assert.equal(b.reads, bReads))
 
+  // #100：虚拟滚动下组内行全部未挂载 → 空卡片。修复：占位提示行 + 行挂载后自愈重填。
+  const virt = pane('virtual-scroll')
+  virt.flow.removeChild(virt.rows.reflect)
+  virt.flow.removeChild(virt.rows.answer)
+  query(virt.root, '[data-meow-memory-anchor] > button').click()
+  check('empty group shows placeholder hint instead of a blank card (#100)', () => {
+    const body = foldBody(virt.root)
+    assert.equal(body.querySelectorAll('[data-chat-call-id]').length, 0)
+    assert.ok(body.querySelector('[data-meow-memory-unloaded]'))
+    assert.match(body.textContent, /not loaded yet|未加载/)
+  })
+  virt.flow.append(virt.rows.reflect, virt.rows.answer)
+  await wait()
+  check('rows mounting later self-heals the expanded card (#100)', () => {
+    const body = foldBody(virt.root)
+    assert.equal(body.querySelector('[data-meow-memory-unloaded]'), null)
+    assert.match(body.textContent, /virtual-scroll reflection|virtual-scroll answer/)
+  })
+
   const plain = pane('plain', { empty: true })
   plain.flow.innerHTML = '<div data-chat-turn="1">ordinary message</div>'
   const fallback = pane('fallback', { fallback: true })

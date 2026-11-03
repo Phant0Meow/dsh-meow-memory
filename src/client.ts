@@ -343,6 +343,17 @@ function fillBody(container: HTMLElement, id: string, visible: boolean, keys: re
       /* 该行详情缺失可接受，其余行继续 */
     }
   }
+  // #100：虚拟滚动下组内所有行都不在当前 DOM（未进视口）→ 逐行 continue 后 body
+  // 是个 display:block 的空卡片。给占位提示行；行挂载后 observer 触发重放，
+  // sigOf 随行文本变化 → bodySigs 失配 → 重克隆吞掉提示、填入真正文（自愈）。
+  if (body.childElementCount === 0) {
+    const hint = document.createElement('div')
+    hint.setAttribute('data-meow-memory-unloaded', 'true')
+    hint.textContent = t('fold.body.unloaded')
+    hint.style.color = 'var(--dsw-alias-label-secondary, inherit)'
+    hint.style.fontSize = '12px'
+    body.appendChild(hint)
+  }
   bodySigs.set(body, sigOf(container, keys))
 }
 

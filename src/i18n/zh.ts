@@ -101,6 +101,7 @@ export const zh: Record<UiKey, string> = {
   'settings.field.delegateEffort.hint':
     "留空=剥离主会话的思考档位（默认，推荐：目标模型不声明思考档位时带着会直接被拒）。填 'inherit' 沿用主会话档位；或显式填 delegate 模型支持的档位（如 high）",
   'settings.field.delegateEffort.placeholder': '留空=剥离；inherit / low / medium / high',
+  'fold.body.unloaded': '该轮正文暂未加载（虚拟滚动下尚未挂载）——滚动到该轮位置后会自动填充',
   'settings.field.dreamEnabled.label': '空闲整理开关',
   'settings.field.dream.idleMinutes.label': '空闲分钟数',
   'settings.field.dream.idleMinutes.hint': '窗口空闲满该分钟数即允许 dream',
