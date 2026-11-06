@@ -1057,6 +1057,11 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig | (() => DreamConfi
   let timer: ReturnType<typeof setTimeout> | undefined
   let stopped = false
   let lastEnabled: boolean | undefined
+  // #106：挂起恢复补发检测。setTimeout 在系统睡眠期间冻结，唤醒后立刻补发——
+  // 那一刻网络常未恢复（Modern Standby 合盖过夜实测：唤醒后 1.5 分钟才连上网），
+  // dream 投出去必然 TRANSPORT 失败并烧掉封存预算。tick 间隔超过 1.5×周期+60s
+  // 即视为系统曾被挂起，本次不投递、5 分钟后再查。
+  let lastTickAt = Date.now()
   const arm = (minutes: number): void => {
     if (stopped) return
     timer = setTimeout(tick, minutes * 60_000)
@@ -1065,15 +1070,23 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig | (() => DreamConfi
   }
   const tick = (): void => {
     let c: DreamConfig | undefined
+    let deferred = false
+    const gapMs = Date.now() - lastTickAt
+    lastTickAt = Date.now()
     try {
       c = read()
       if (c !== undefined && c.enabled !== lastEnabled) {
         lastEnabled = c.enabled
         ctx.logger.info(`meow-memory: dream 调度器${c.enabled ? '启用' : '停用'}（配置热生效，issue #26）`)
       }
-      dreamSweepTick(ctx, c, dir, windowIndex, onDreamState, workspaceDisabled)
+      if (gapMs > checkMinutesOf(c) * 60_000 * 1.5 + 60_000) {
+        deferred = true
+        ctx.logger.info(`meow-memory: dream 调度器检测到系统挂起 ${Math.round(gapMs / 60_000)} 分钟，本次跳过、5 分钟后再查`)
+      } else {
+        dreamSweepTick(ctx, c, dir, windowIndex, onDreamState, workspaceDisabled)
+      }
     } finally {
-      arm(checkMinutesOf(c)) // read 抛错时 c=undefined → 按 15min 兜底重排，循环不断
+      arm(deferred ? 5 : checkMinutesOf(c)) // read 抛错时 c=undefined → 按 15min 兜底重排，循环不断
     }
   }
   let initial: DreamConfig | undefined

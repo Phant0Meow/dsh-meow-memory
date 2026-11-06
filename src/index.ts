@@ -367,6 +367,15 @@ export function validateConfigUserLayer(value: unknown): void {
     // #98：effort 控制 delegate 轮的 reasoningEffort——''（默认）/ 'inherit' / 任意非空值原样下发
     if (ddg.effort !== undefined && typeof ddg.effort !== 'string') throw new Error('delegate.effort 必须是字符串')
   }
+  if (v.projectDir !== undefined) {
+    if (v.projectDir === null || typeof v.projectDir !== 'string') throw new Error('projectDir 必须是字符串')
+    // #102：Windows 的 path.join 不会让绝对段覆盖前缀，绝对路径 projectDir 会拼出
+    // "D:\ws\C:\Users\..." 非法路径，报错只有难自查的 ENOENT。设计内的共享库方式是
+    // homeDir / MEOW_MEMORY_HOME（v0.31.1 起有跨重启指针），projectDir 恒相对工作区。
+    if (/^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(v.projectDir.trim())) {
+      throw new Error('projectDir 必须是相对工作区的路径（如 .dsh-meow）；跨工作区共享记忆库请配置 homeDir（或环境变量 MEOW_MEMORY_HOME）指向共享目录')
+    }
+  }
   if (v.disabledWorkspaces !== undefined) {
     if (!Array.isArray(v.disabledWorkspaces)) throw new Error('disabledWorkspaces 必须是字符串数组')
     for (const p of v.disabledWorkspaces) {
@@ -1373,12 +1382,27 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       // ② 「裸轮」error（本 turn 全程零 user/message）且有活跃 dream 租约 → 同样处理
       //    （dream 任务被 claim 后未及落盘就装配崩溃的形状；窗口此刻非活跃使用场景，
       //    误判代价仅为提前重试一次）。
-      if (t === 'turn/end' && (event.data as { reason?: { kind?: string } } | undefined)?.reason?.kind === 'error') {
+      if (t === 'turn/end' && (event.data as { reason?: { kind?: string; error?: { code?: unknown; message?: unknown } } | undefined })?.reason?.kind === 'error') {
         const pluginTurn = isPluginTurn.get(sid) === true
         const nakedTurn = turnHadMessage.get(sid) === false // turn/start 已见、其后零消息
         if ((pluginTurn || nakedTurn) && typeof cwd === 'string' && existsSync(memoryDbPath(cwd, resolved.projectDir))) {
-          const outcome = handleMemoryTurnFailure(getDb(cwd, resolved.projectDir), sid, cwd, resolved.projectDir)
-          if (outcome !== 'none') broadcast.broadcast(sid, 'active') // 摘掉 dreaming 呼吸灯（重试/封存状态由后续 sweep 表达）
+          // #106：TRANSPORT（断网/睡眠唤醒补发）是环境性失败，不该烧语义性重试预算
+          //（3 次封存）——释放租约不计数，下个 sweep 自动重试（与 dream 轮
+          // endReason==='error' 分支的 releaseDream 同语义，v0.26.0 断网教训）。
+          // 宿主 dsh-llm-pi-ai 的 classifyPiAiError 把网络类失败统一归码 TRANSPORT；
+          // message 正则兜底老宿主可能不填 code 的形状。
+          const errCode = String((event.data as { reason?: { error?: { code?: unknown } } })?.reason?.error?.code ?? '')
+          const errMsg = String((event.data as { reason?: { error?: { message?: unknown } } })?.reason?.error?.message ?? '')
+          if (errCode === 'TRANSPORT' || /transport|network|connection|ECONN/i.test(errMsg)) {
+            try {
+              getDb(cwd, resolved.projectDir).releaseDream(sid)
+              appendFileSync(join(cwd, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] dream transport-fail sid=${shortSessionId(sid)} -> released (not counted, #106)\n`)
+            } catch { /* 释放失败不阻塞 */ }
+            broadcast.broadcast(sid, 'active')
+          } else {
+            const outcome = handleMemoryTurnFailure(getDb(cwd, resolved.projectDir), sid, cwd, resolved.projectDir)
+            if (outcome !== 'none') broadcast.broadcast(sid, 'active') // 摘掉 dreaming 呼吸灯（重试/封存状态由后续 sweep 表达）
+          }
         }
       }
       if (isPluginTurn.get(sid)) return // 插件轮内：不 touchWindow

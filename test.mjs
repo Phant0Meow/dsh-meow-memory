@@ -591,6 +591,71 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   rmSync(wsF, { recursive: true, force: true })
 }
 
+// ── #102/#103/#104/#106 回归：配置校验 / tokenize 碎片 / 连接重连 / TRANSPORT 免计 ──
+{
+  // #102：绝对路径 projectDir 给可读报错（引导 homeDir），不再 ENOENT 硬崩
+  const { validateConfigUserLayer } = await import('./lib/index.js')
+  for (const bad of ['C:/shared/meow', 'C:\\shared\\meow', '\\\\nas\\share', '/opt/meow']) {
+    let msg = ''
+    try { validateConfigUserLayer({ projectDir: bad }) } catch (e) { msg = String(e?.message ?? e) }
+    check(`#102 absolute projectDir rejected readably (${bad})`, msg.includes('homeDir') && msg.includes('相对'), msg)
+  }
+  let okRelative = true
+  try { validateConfigUserLayer({ projectDir: '.dsh-meow' }) } catch { okRelative = false }
+  check('#102 relative projectDir still accepted', okRelative)
+
+  // #104：连接失效 → 重连重放；非瞬态错误照常冒出
+  const ws104 = mkdtempSync(join(tmpdir(), 'mm-reconn-'))
+  const d104 = new MemoryDb(memoryDbPath(ws104))
+  d104.insert({ level: 'fact', content: 'reconnect probe', project: null, keywords: [], importance: 1 })
+  const realDb = d104.db
+  let thrown = false
+  d104.db = { prepare: (sql) => { if (!thrown) { thrown = true; throw new Error('disk I/O error') } return realDb.prepare(sql) }, close: () => { try { realDb.close() } catch { /* 已关 */ } } }
+  // 先执行查询（重连发生在这里），再断言——反过来的 && 短路会在执行前就判 false
+  let rows104 = -1
+  try { rows104 = d104.list('fact').length } catch { /* 保持 -1 */ }
+  check('#104 transient disk I/O reconnects and replays', thrown === true && rows104 === 1, `thrown=${thrown} rows=${rows104}`)
+  const reopened = d104.db // 立即捕获重连句柄（下面第二个桩会覆盖 this.db）
+  let propagated = false
+  try { d104.db = { prepare: () => { throw new Error('syntax error in SQL') } }; d104.list('fact') } catch (e) { propagated = /syntax error/.test(String(e?.message ?? e)) }
+  check('#104 non-transient error propagates without reconnect', propagated)
+  d104.db = reopened
+  d104.close()
+  rmSync(ws104, { recursive: true, force: true })
+
+  // #103：URL/版本号碎片不再把无关记忆撞进命中注入
+  const ws103 = mkdtempSync(join(tmpdir(), 'mm-url-'))
+  const db103 = new MemoryDb(memoryDbPath(ws103))
+  db103.insert({ level: 'fact', content: 'ABBrobot 10.11 版本升级说明', project: null, keywords: ['ABBrobot', '10.11', '版本', '升级'], importance: 1 })
+  const inj103a = buildHitInjection(db103, ws103, 's-url', '看看这个视频 https://www.bilibili.com/video/B1xx?spm_id_from=333.1391.0.0', { hitTopK: 3 }, '.dsh-meow')
+  check('#103 URL-bearing message does not hit version memory', inj103a === null, JSON.stringify(inj103a))
+  const inj103b = buildHitInjection(db103, ws103, 's-url2', 'ABBrobot 版本升级到哪一步了', { hitTopK: 3 }, '.dsh-meow')
+  check('#103 topical query still hits', inj103b !== null && inj103b.injectedIds.length === 1)
+  db103.close()
+  rmSync(ws103, { recursive: true, force: true })
+
+  // #106：TRANSPORT 失败释放租约且不烧封存预算
+  const ws106 = mkdtempSync(join(tmpdir(), 'mm-tsp-'))
+  const d106 = getDb(ws106, '.dsh-meow')
+  const wid106 = 'win-106'
+  d106.touchWindow(wid106, ws106, Date.now() - 4 * 3600_000)
+  d106.claimDream(wid106, 'o-106', 1000, LEASE)
+  const d106b = makeCtx()
+  await applyGateOff(d106b.ctx, { enabled: true, projectDir: '.dsh-meow' })
+  await d106b.handlers['session/event']({ id: wid106, header: { cwd: ws106 } }, { type: 'turn/start', time: Date.now() })
+  await d106b.handlers['session/event']({ id: wid106, header: { cwd: ws106 } }, { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'error', error: { code: 'TRANSPORT', message: 'DeepSeek Messages transport failed' } } } })
+  check('#106 transport failure releases lease', d106.getDreamLease(wid106) === null)
+  check('#106 transport failure burns no budget (counter still 0)', d106.recordDreamFailure(wid106, 1000) === 1)
+  d106.clearDreamFailure(wid106)
+  // 非 TRANSPORT 错误照常计数：普通 error → handleMemoryTurnFailure 记入 lease.T=1000 桶
+  d106.claimDream(wid106, 'o-106b', 1000, LEASE)
+  await d106b.handlers['session/event']({ id: wid106, header: { cwd: ws106 } }, { type: 'turn/start', time: Date.now() })
+  await d106b.handlers['session/event']({ id: wid106, header: { cwd: ws106 } }, { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'error', error: { code: 'OTHER', message: 'boom' } } } })
+  check('#106 non-transport failure still counts', d106.getDreamLease(wid106) === null && d106.recordDreamFailure(wid106, 1000) === 2)
+  d106.close()
+  rmSync(ws106, { recursive: true, force: true })
+}
+
 // The ordinary-session owner, not the memory plugin, resolves the model and preset.
 {
   const cfgR2 = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2 }

@@ -329,13 +329,18 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
 export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions = {}): RankedHit[] {
   const k = opts.k ?? 2
   const now = opts.now === undefined ? Date.now() : opts.now
-  const q = tokenize(query)
+  // #103：过滤单字符 token。tokenize 按字符类别切分，"10.11"→"10"/"."/“11"、URL 的
+  // "?spm_id_from=333.1391.0.0" 切出 "."/"_"/"0" 这类单字符碎片——raw>0 即入候选、
+  // 无最低分阈值，任何带 URL/版本号的消息必然撞上含点号/下划线关键词的记忆。
+  // CJK bigram 恒 ≥2 字符不受影响；英文单词字母被剪掉的只有 "a"/"I" 这类停用词级碎片。
+  const keep = (ts: string[]): string[] => ts.filter((t) => t.length >= 2)
+  const q = keep(tokenize(query))
   if (q.length === 0 || docs.length === 0) return []
   const qTf = new Map<string, number>()
   for (const t of q) qTf.set(t, (qTf.get(t) ?? 0) + 1)
 
   const n = docs.length
-  const docToks = docs.map((d) => tokenize([d.content, d.title ?? ''].join(' ')))
+  const docToks = docs.map((d) => keep(tokenize([d.content, d.title ?? ''].join(' '))))
   const df = new Map<string, number>()
   const tf: Array<Map<string, number>> = []
   for (const toks of docToks) {

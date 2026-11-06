@@ -203,9 +203,41 @@ export function memoryDbPath(workspace: string, dir = '.dsh-meow'): string {
 }
 
 export class MemoryDb {
-  private readonly db: DatabaseSync
+  private db: DatabaseSync
+  private readonly path: string
+
+  /** #104：node:sqlite 的连接在长会话/WAL 反复增长/外部 checkpoint 后可能进入不可用
+   *  状态（此后每条语句抛 "disk I/O error"），而库文件本身完好（integrity_check ok、
+   *  外部进程可写）——重启即恢复证明只需重建连接。所有运行时语句经此包装：命中
+   *  瞬时失效（disk I/O / locked / not open）时重连一次并重放本条语句。
+   *  prepare 放在 try 内：连接已死时 prepare 本身就会抛，同样走重连。 */
+  private p(sql: string): { run: (...args: unknown[]) => unknown; get: (...args: unknown[]) => unknown; all: (...args: unknown[]) => unknown } {
+    const exec = (m: 'run' | 'get' | 'all', args: unknown[]): unknown => {
+      try {
+        return this.db.prepare(sql)[m](...args)
+      } catch (e) {
+        const msg = String((e as Error)?.message ?? e)
+        if (!/disk I\/O|database is locked|not open/i.test(msg)) throw e
+        try {
+          this.db.close()
+        } catch {
+          /* 死连接关闭失败不阻塞重连 */
+        }
+        this.db = new DatabaseSync(this.path)
+        this.db.exec('PRAGMA journal_mode = WAL')
+        this.db.exec('PRAGMA busy_timeout = 5000')
+        return this.db.prepare(sql)[m](...args)
+      }
+    }
+    return {
+      run: (...args) => exec('run', args),
+      get: (...args) => exec('get', args),
+      all: (...args) => exec('all', args),
+    }
+  }
 
   constructor(path: string) {
+    this.path = path
     mkdirSync(dirname(path), { recursive: true })
     this.db = new DatabaseSync(path)
     this.db.exec('PRAGMA journal_mode = WAL')
@@ -251,7 +283,7 @@ export class MemoryDb {
   private upgrade(): void {
     for (const level of LEVELS) {
       const cols = new Set(
-        (this.db.prepare(`PRAGMA table_info(${level})`).all() as Array<{ name: string }>).map((c) => c.name),
+        (this.p(`PRAGMA table_info(${level})`).all() as Array<{ name: string }>).map((c) => c.name),
       )
       if (cols.has('dream_at')) {
         // 旧库：记忆时间戳数据合并进 updated_at（取两者较新值），再删 dream_at 列。
@@ -265,17 +297,17 @@ export class MemoryDb {
         this.db.exec('ALTER TABLE topic ADD COLUMN project TEXT')
       }
       // 旧 UUID（不以 9 位时间前缀开头）→ 按 created_at 重写 id
-      const legacy = this.db.prepare(`SELECT id FROM ${level}`).all() as Array<{ id: string }>
+      const legacy = this.p(`SELECT id FROM ${level}`).all() as Array<{ id: string }>
       for (const { id } of legacy) {
         if (/^[0-9a-z]{9}-/.test(id)) continue
-        const created = (this.db.prepare(`SELECT created_at FROM ${level} WHERE id = ?`).get(id) as { created_at: number }).created_at
-        this.db.prepare(`UPDATE ${level} SET id = ? WHERE id = ?`).run(newId(created), id)
+        const created = (this.p(`SELECT created_at FROM ${level} WHERE id = ?`).get(id) as { created_at: number }).created_at
+        this.p(`UPDATE ${level} SET id = ? WHERE id = ?`).run(newId(created), id)
       }
     }
     // windows 表：v0.10.0 起用租约（dream_owner/progress_at/...）替代 dream_pending 布尔。
     // 老库补列；老「dream_pending=1」迁移为「过期租约」——下个检查周期按租约过期补收尾。
     const wCols = new Set(
-      (this.db.prepare('PRAGMA table_info(windows)').all() as Array<{ name: string }>).map((c) => c.name),
+      (this.p('PRAGMA table_info(windows)').all() as Array<{ name: string }>).map((c) => c.name),
     )
     for (const [col, ddl] of [
       ['dream_owner', 'TEXT'],
@@ -293,7 +325,7 @@ export class MemoryDb {
     // 语义显式化为 skip_dream 列，新增 skip_inject / skip_write。老库补列：存量行的
     // 语义就是「跳过 dream」（旧行仅在该语义下产生），skip_dream 补默认 1 正确。
     const sCols = new Set(
-      (this.db.prepare('PRAGMA table_info(dream_skip)').all() as Array<{ name: string }>).map((c) => c.name),
+      (this.p('PRAGMA table_info(dream_skip)').all() as Array<{ name: string }>).map((c) => c.name),
     )
     for (const [col, ddl] of [
       ['skip_dream', 'INTEGER NOT NULL DEFAULT 1'],
@@ -306,7 +338,7 @@ export class MemoryDb {
 
   /** 新库（memories 全空）判定：迁移只在库刚创建时执行一次。 */
   isFresh(): boolean {
-    const row = this.db.prepare('SELECT COUNT(*) AS n FROM soul').get() as { n: number }
+    const row = this.p('SELECT COUNT(*) AS n FROM soul').get() as { n: number }
     return row.n === 0
   }
 
@@ -376,7 +408,7 @@ export class MemoryDb {
     const prefix = id.length < 36
     for (const level of LEVELS) {
       const sql = prefix ? `SELECT * FROM ${level} WHERE id LIKE ?` : `SELECT * FROM ${level} WHERE id = ?`
-      const r = this.db.prepare(sql).get(prefix ? `${id}%` : id) as Record<string, unknown> | undefined
+      const r = this.p(sql).get(prefix ? `${id}%` : id) as Record<string, unknown> | undefined
       if (r) return { row: this.fromRow(level, r), level }
     }
     return undefined
@@ -390,7 +422,7 @@ export class MemoryDb {
     const out: Array<{ row: MemoryRow; level: Level }> = []
     for (const level of LEVELS) {
       const sql = prefix ? `SELECT * FROM ${level} WHERE id LIKE ?` : `SELECT * FROM ${level} WHERE id = ?`
-      const rows = this.db.prepare(sql).all(prefix ? `${id}%` : id) as Record<string, unknown>[]
+      const rows = this.p(sql).all(prefix ? `${id}%` : id) as Record<string, unknown>[]
       for (const r of rows) out.push({ row: this.fromRow(level, r), level })
     }
     return out
@@ -423,7 +455,7 @@ export class MemoryDb {
     // 零命中与旧行为一致返回 false。
     let targetId = id
     if (id.length < 36) {
-      const matches = this.db.prepare(`SELECT id FROM ${level} WHERE id LIKE ?`).all(`${id}%`) as Array<{ id: string }>
+      const matches = this.p(`SELECT id FROM ${level} WHERE id LIKE ?`).all(`${id}%`) as Array<{ id: string }>
       if (matches.length > 1) {
         console.warn(`[meow-memory] update 拒绝歧义短 id：${level} 前缀 "${id}" 命中 ${matches.length} 行，请用完整 id`)
         return false
@@ -431,7 +463,7 @@ export class MemoryDb {
       if (matches.length === 0) return false
       targetId = matches[0].id
     }
-    const res = this.db.prepare(`UPDATE ${level} SET ${sets.join(', ')} WHERE id = ?`).run(...args, targetId)
+    const res = this.p(`UPDATE ${level} SET ${sets.join(', ')} WHERE id = ?`).run(...args, targetId)
     return res.changes > 0
   }
 
@@ -447,7 +479,7 @@ export class MemoryDb {
       args.push(opts.project)
     }
     const sql = `SELECT * FROM ${level}${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY created_at DESC`
-    const rows = this.db.prepare(sql).all(...args) as Record<string, unknown>[]
+    const rows = this.p(sql).all(...args) as Record<string, unknown>[]
     return rows.map((r) => this.fromRow(level, r))
   }
 
@@ -464,20 +496,20 @@ export class MemoryDb {
     const active = this.list(level, { status: 'active' })
     if (level !== 'project') return active
     const todoDone = (
-      this.db.prepare(`SELECT * FROM project WHERE status = 'stale' AND subcategory = 'todo'`).all() as Record<string, unknown>[]
+      this.p(`SELECT * FROM project WHERE status = 'stale' AND subcategory = 'todo'`).all() as Record<string, unknown>[]
     ).map((r) => this.fromRow('project', r))
     return [...active, ...todoDone]
   }
 
   bumpHit(level: Level, id: string): void {
-    this.db.prepare(`UPDATE ${level} SET hit_count = hit_count + 1, last_accessed_at = ? WHERE id = ?`).run(
+    this.p(`UPDATE ${level} SET hit_count = hit_count + 1, last_accessed_at = ? WHERE id = ?`).run(
       Date.now(),
       id,
     )
   }
 
   count(level: Level): number {
-    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM ${level}`).get() as { n: number }
+    const row = this.p(`SELECT COUNT(*) AS n FROM ${level}`).get() as { n: number }
     return row.n
   }
 
@@ -486,7 +518,7 @@ export class MemoryDb {
   listProjectNames(): string[] {
     const names = new Set<string>()
     for (const level of ['project', 'fact', 'lesson', 'topic', 'rules'] as const) {
-      const rows = this.db.prepare(`SELECT project FROM ${level} WHERE project IS NOT NULL AND project != ''`).all() as Array<{ project: string }>
+      const rows = this.p(`SELECT project FROM ${level} WHERE project IS NOT NULL AND project != ''`).all() as Array<{ project: string }>
       for (const r of rows) for (const n of projectList(r.project)) names.add(n)
     }
     return [...names].sort((a, b) => a.localeCompare(b))
@@ -529,7 +561,7 @@ export class MemoryDb {
   }
 
   setWindowDream(sessionId: string, time: number): void {
-    this.db.prepare(`UPDATE windows SET last_dream_time = ? WHERE session_id = ?`).run(time, sessionId)
+    this.p(`UPDATE windows SET last_dream_time = ? WHERE session_id = ?`).run(time, sessionId)
   }
 
   /** 原子抢占 dream 租约（跨进程/实例防重复 start）：返回 true 表示抢占成功（可 start）。
@@ -582,8 +614,8 @@ export class MemoryDb {
 
   /** 记一次 dream 失败，返回当前连续失败次数（同 T 累加，T 变化重计）。 */
   recordDreamFailure(sessionId: string, T: number): number {
-    const prevT = this.db.prepare(`SELECT value FROM dream_meta WHERE key = ?`).get(`dreamfail_t:${sessionId}`) as { value: number | null } | undefined
-    const prevC = this.db.prepare(`SELECT value FROM dream_meta WHERE key = ?`).get(`dreamfail_c:${sessionId}`) as { value: number | null } | undefined
+    const prevT = this.p(`SELECT value FROM dream_meta WHERE key = ?`).get(`dreamfail_t:${sessionId}`) as { value: number | null } | undefined
+    const prevC = this.p(`SELECT value FROM dream_meta WHERE key = ?`).get(`dreamfail_c:${sessionId}`) as { value: number | null } | undefined
     const count = prevT !== undefined && prevT.value === T && prevC !== undefined && typeof prevC.value === 'number' && prevC.value >= 1
       ? prevC.value + 1
       : 1
@@ -598,28 +630,28 @@ export class MemoryDb {
 
   /** 清 dream 失败计数（finishDream 收尾时自动调用；一般无需手动调）。 */
   clearDreamFailure(sessionId: string): void {
-    this.db.prepare(`DELETE FROM dream_meta WHERE key = ?`).run(`dreamfail_t:${sessionId}`)
-    this.db.prepare(`DELETE FROM dream_meta WHERE key = ?`).run(`dreamfail_c:${sessionId}`)
+    this.p(`DELETE FROM dream_meta WHERE key = ?`).run(`dreamfail_t:${sessionId}`)
+    this.p(`DELETE FROM dream_meta WHERE key = ?`).run(`dreamfail_c:${sessionId}`)
   }
 
   /** dream_meta 通用读写（KV，跨实例/重启共享）。当前用于轮次计划快照
    *  `dreamplan:<sid>`（#69）。 */
   setDreamMeta(key: string, value: string): void {
-    this.db.prepare(`INSERT INTO dream_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value)
+    this.p(`INSERT INTO dream_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value)
   }
 
   getDreamMeta(key: string): string | undefined {
-    const r = this.db.prepare(`SELECT value FROM dream_meta WHERE key = ?`).get(key) as { value: unknown } | undefined
+    const r = this.p(`SELECT value FROM dream_meta WHERE key = ?`).get(key) as { value: unknown } | undefined
     return typeof r?.value === 'string' ? r.value : undefined
   }
 
   delDreamMeta(key: string): void {
-    this.db.prepare(`DELETE FROM dream_meta WHERE key = ?`).run(key)
+    this.p(`DELETE FROM dream_meta WHERE key = ?`).run(key)
   }
 
   /** 是否有进行中/未收尾的 dream（租约存在，无论是否过期）。 */
   isDreamPending(sessionId: string): boolean {
-    const row = this.db.prepare(`SELECT dream_owner FROM windows WHERE session_id = ?`).get(sessionId) as
+    const row = this.p(`SELECT dream_owner FROM windows WHERE session_id = ?`).get(sessionId) as
       | { dream_owner: string | null }
       | undefined
     return row?.dream_owner != null
@@ -685,10 +717,10 @@ export class MemoryDb {
     this.db
       .prepare(`INSERT INTO dream_skip (session_id, created_at, skip_dream, skip_inject, skip_write) VALUES (?, ?, 0, 0, 0) ON CONFLICT(session_id) DO NOTHING`)
       .run(sessionId, Date.now())
-    this.db.prepare(`UPDATE dream_skip SET ${col} = ? WHERE session_id = ?`).run(value ? 1 : 0, sessionId)
+    this.p(`UPDATE dream_skip SET ${col} = ? WHERE session_id = ?`).run(value ? 1 : 0, sessionId)
     const scope = this.getMemoryScope(sessionId)
     if (!scope.dream && !scope.inject && !scope.write) {
-      this.db.prepare(`DELETE FROM dream_skip WHERE session_id = ?`).run(sessionId)
+      this.p(`DELETE FROM dream_skip WHERE session_id = ?`).run(sessionId)
     }
   }
 
@@ -725,7 +757,7 @@ export class MemoryDb {
 
   /** 原子抢占一次检查窗口：minIntervalMs 内只有一个调用方返回 true。 */
   claimCheckGate(minIntervalMs: number): boolean {
-    this.db.prepare(`INSERT OR IGNORE INTO dream_meta (key, value) VALUES ('last_check', 0)`).run()
+    this.p(`INSERT OR IGNORE INTO dream_meta (key, value) VALUES ('last_check', 0)`).run()
     const now = Date.now()
     return (
       this.db
@@ -735,13 +767,13 @@ export class MemoryDb {
   }
 
   getWindow(sessionId: string): { session_id: string; workspace: string; last_event_time: number; last_dream_time: number | null } | undefined {
-    return this.db.prepare(`SELECT * FROM windows WHERE session_id = ?`).get(sessionId) as
+    return this.p(`SELECT * FROM windows WHERE session_id = ?`).get(sessionId) as
       | { session_id: string; workspace: string; last_event_time: number; last_dream_time: number | null }
       | undefined
   }
 
   listWindows(): Array<{ session_id: string; workspace: string; last_event_time: number; last_dream_time: number | null }> {
-    return this.db.prepare(`SELECT * FROM windows ORDER BY last_event_time DESC`).all() as Array<{
+    return this.p(`SELECT * FROM windows ORDER BY last_event_time DESC`).all() as Array<{
       session_id: string
       workspace: string
       last_event_time: number
@@ -753,7 +785,7 @@ export class MemoryDb {
   idsBySession(sessionId: string): Array<{ level: Level; id: string }> {
     const out: Array<{ level: Level; id: string }> = []
     for (const level of LEVELS) {
-      const rows = this.db.prepare(`SELECT id FROM ${level} WHERE source_session = ?`).all(sessionId) as Array<{ id: string }>
+      const rows = this.p(`SELECT id FROM ${level} WHERE source_session = ?`).all(sessionId) as Array<{ id: string }>
       for (const r of rows) out.push({ level, id: r.id })
     }
     return out
@@ -764,7 +796,7 @@ export class MemoryDb {
   stampDream(sessionId: string, time: number): number {
     let n = 0
     for (const { level, id } of this.idsBySession(sessionId)) {
-      n += this.db.prepare(`UPDATE ${level} SET updated_at = MAX(updated_at, ?) WHERE id = ?`).run(time, id).changes
+      n += this.p(`UPDATE ${level} SET updated_at = MAX(updated_at, ?) WHERE id = ?`).run(time, id).changes
     }
     return n
   }

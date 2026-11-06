@@ -805,14 +805,24 @@ export function apply(ctx: any): () => void {
   } catch (e) {
     console.warn('[meow-memory] 文案层初始化失败（UI 退回默认语言）：', e)
   }
+  // 以下四个客户端子系统各自独立降级（#105）：宿主对 entry 激活失败的处理是
+  // 「web boot 致命错误、应用打不开」——任何一处抛错都会连带整个应用。每个
+  // 包 try/catch，失败只丢对应功能，绝不阻断 entry 激活。
+  const safePush = (name: string, start: () => () => void): void => {
+    try {
+      disposers.push(start())
+    } catch (e) {
+      console.warn(`[meow-memory] ${name} 初始化失败（该功能降级，其余不受影响）：`, e)
+    }
+  }
   // 会话列表"已 dream"小月牙：独立于 slots，直接启动（host 路由不可用时静默降级）。
-  disposers.push(startDreamIconManager())
+  safePush('dream 图标', startDreamIconManager)
   // delegate 打点气泡的 dream 状态同步（SSE）：dream 完成时气泡「处理中…」→「已完成 ✓」。
-  disposers.push(startDelegateStateSync())
+  safePush('delegate 气泡同步', startDelegateStateSync)
   // 会话「…」菜单「跳过梦境整理记忆」toggle（v0.16.0）：同上独立启动，静默降级。
-  disposers.push(startDreamSkipManager())
+  safePush('dream 跳过菜单', startDreamSkipManager)
   // 指令菜单 dream 行换官方脸（0.1.7 菜单 DOM 装饰；0.1.6 菜单结构不同天然不命中）。
-  disposers.push(startMenuDreamFace())
+  safePush('菜单 dream 脸', startMenuDreamFace)
   // 设置页「喵记忆」标签页（settings.section 顶级分区，0.1.6/0.1.7 双版本）：
   // 服务缺失、轮询超时或注册失败只警告，不影响折叠/图标。
   try {
