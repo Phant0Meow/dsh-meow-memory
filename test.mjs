@@ -866,6 +866,10 @@ const d2 = dreamMsg2.content.map((b) => (b.type === 'text' ? b.text : '')).join(
 check('dream round2 summary title + projects', d2.includes('第 3/3 组 - 项目总结') && d2.includes('本组涉及的项目：dsh、femo'))
 check('dream round2 memory_project flow + rules', d2.includes('请再次使用 memory_project 工具') && d2.includes('长期记忆') && d2.includes('每一条里面只讲一个要点') && d2.includes('已被你的新总结取代') && d2.includes('status=archived') && d2.includes('本组整理完成'))
 check('dream round2 has no entry list', !d2.includes('【本组记忆】') && !d2.includes('事实1'))
+// #95：每组 prompt 携带组标记（客户端按它分段，三组产出同条可见）
+check('#95 group marker in round1 prompt', d1.includes('[meow-dream-group 2/3 topic记忆条目]'), d1.slice(0, 300))
+check('#95 group marker in round2 prompt', d2.includes('[meow-dream-group 3/3 项目总结]'))
+check('#95 group marker instruction present', d1.includes('第一行必须原样包含组标记') && d2.includes('第一行必须原样包含组标记'))
 dbD.close()
 
 // topic 轮默认触发：窗口无任何记忆也发（空 topic 轮提示 AI 回顾建新 topic）

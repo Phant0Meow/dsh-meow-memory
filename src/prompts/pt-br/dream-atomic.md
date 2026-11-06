@@ -25,6 +25,6 @@ O primeiro turno injeta apenas: soul (a própria IA) / user (as preferências do
 Observações:
 Importante: percorra uma por uma e arquive ou conserte as memórias desatualizadas ou que te induzem ao erro — prefira arquivar.
 Para uma memória que você considera muito importante, se estiver em dúvida sobre qual é a verdade, vá ler os arquivos do projeto e confira. Apenas para memórias que realmente importam.
-Quando terminar, responda "este grupo está consolidado" e não chame nenhuma outra ferramenta.
+Quando terminar, responda diretamente; a primeira linha da resposta deve conter o marcador de grupo {groupMarker} literalmente (copie caractere por caractere, sem alterações), seguida por "este grupo está consolidado" e o resumo a partir da segunda linha. Não chame nenhuma outra ferramenta.
 
 Você pode chamar várias ferramentas em um turno — por favor, conclua todas as chamadas de ferramenta desta tarefa em uma única resposta.

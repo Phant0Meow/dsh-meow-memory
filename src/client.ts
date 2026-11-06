@@ -354,7 +354,58 @@ function fillBody(container: HTMLElement, id: string, visible: boolean, keys: re
     hint.style.fontSize = '12px'
     body.appendChild(hint)
   }
+  segmentDreamGroups(body)
   bodySigs.set(body, sigOf(container, keys))
+}
+
+/** dream 组标记（AI 终稿回复首行必须携带，prompt 由 dream.ts 填入 {groupMarker}）。 */
+const GROUP_MARKER_RE = /\[meow-dream-group\s+(\d+)\/(\d+)[\s·]*([^\]]*)\]/
+
+/** 从克隆体的文本节点里剥掉第一处组标记（标题已单独展示，正文不再显示原始标记）。 */
+function stripGroupMarker(el: HTMLElement): void {
+  const walker = document.createTreeWalker(el, window.NodeFilter.SHOW_TEXT)
+  for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+    const data = node.nodeValue ?? ''
+    if (GROUP_MARKER_RE.test(data)) {
+      node.nodeValue = data.replace(GROUP_MARKER_RE, '').replace(/^\s+/, '')
+      return
+    }
+  }
+}
+
+/** #95：dream 三组产出同条可见。同一轮的行全部克隆进卡片后，按回复首行的组标记
+ *  （[meow-dream-group N/M 标签]）切段，每段插一个小标题；标记文本从展示中剥掉。
+ *  首个标记之前的行（prompt/过程行）保持原位不归段；没有任何标记 → 一行都不动
+ *  （现状单段，兼容旧会话与 AI 忘写标记的兜底）。 */
+function segmentDreamGroups(body: HTMLElement): void {
+  const children = Array.from(body.children) as HTMLElement[]
+  const first = children.findIndex((c) => GROUP_MARKER_RE.test(c.textContent ?? ''))
+  if (first === -1) return
+  const heading = (n: string, total: string, label: string): HTMLElement => {
+    const h = document.createElement('div')
+    h.setAttribute('data-meow-dream-section', `${n}/${total}`)
+    h.textContent = `${n}/${total} · ${label}`
+    h.style.color = 'var(--dsw-alias-label-secondary, inherit)'
+    h.style.fontSize = '12px'
+    h.style.fontWeight = '600'
+    h.style.margin = '10px 0 4px'
+    h.style.paddingTop = '8px'
+    h.style.borderTop = '1px solid var(--dsw-alias-border-secondary, rgba(127,127,127,.25))'
+    return h
+  }
+  const rebuild = document.createDocumentFragment()
+  for (const child of children.slice(0, first)) rebuild.appendChild(child) // 首标记前的行原样保留
+  let current: HTMLElement | null = null
+  for (const child of children.slice(first)) {
+    const m = (child.textContent ?? '').match(GROUP_MARKER_RE)
+    if (m !== null) {
+      current = heading(m[1], m[2], m[3])
+      rebuild.appendChild(current)
+      stripGroupMarker(child)
+    }
+    rebuild.appendChild(child)
+  }
+  body.replaceChildren(rebuild)
 }
 
 /** 复制/已复制图标（与 dsh 本体 IconCopyOutline16 / IconCheckOutline16 同 path，

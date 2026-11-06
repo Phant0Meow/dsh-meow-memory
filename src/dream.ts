@@ -181,6 +181,10 @@ export function buildDreamMessage(
 ): ReturnType<typeof createUserMessage> {
   const round = rounds[idx]
   const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
+  // #95：组标记。AI 的本组终稿回复第一行必须原样携带它——客户端展开折叠条时按
+  // 标记切段，三组产出同条可见（此前第 2/3 组走 steering 不渲染，产出埋没在
+  // 过渡话里）。标签用 dream.round.* 本地化名，与 dream-header 的 N/M 同源。
+  const groupMarker = `[meow-dream-group ${idx + 1}/${rounds.length} ${lbl(`dream.round.${round.kind}`)}]`
   const lines: string[] = [
     `${DREAM_MARKER} ${lbl('dream.title')}`,
     '',
@@ -194,7 +198,7 @@ export function buildDreamMessage(
   ]
   if (round.kind === 'project-summary') {
     // 项目总结轮：不带条目列表——AI 自己逐个调 memory_project 看当前项目描述（用户拍板 2026-08-22）。
-    lines.push(...resolveSlotText('dream-project-summary', { projects: (round.projects ?? []).join('、') }).split('\n'))
+    lines.push(...resolveSlotText('dream-project-summary', { projects: (round.projects ?? []).join('、'), groupMarker }).split('\n'))
   } else {
     const kwLabel = lbl('dream.row.keywordsLabel')
     const noneLabel = lbl('dream.row.none')
@@ -206,7 +210,7 @@ export function buildDreamMessage(
       .join('\n\n')
     // 列表块：有组 = 空行+组文本（组间空行）；空轮（topic 默认触发）= 换行+提示（对应指导 2）。
     const listBlock = round.groups.length === 0 ? `\n${lbl('dream.topic.empty')}` : `\n\n${groupsText}`
-    lines.push(...resolveSlotText(round.kind === 'topic' ? 'dream-topic' : 'dream-atomic', { list: listBlock }).split('\n'))
+    lines.push(...resolveSlotText(round.kind === 'topic' ? 'dream-topic' : 'dream-atomic', { list: listBlock, groupMarker }).split('\n'))
   }
   return createUserMessage({ content: [{ type: 'text', text: lines.join('\n') }], source: PLUGIN_SOURCE })
 }

@@ -17,6 +17,6 @@ Se você encontrar topics bagunçados — a causa de algo no topic A, o resultad
 8. Registre o project (um nome de projeto, ou global) e a importance.
 9. Para um topic que você considera muito importante, se estiver em dúvida sobre qual é a verdade, vá ler os arquivos do projeto e confira. Apenas para memórias que realmente importam.
 10. Importante: verifique nestes topics qualquer coisa desatualizada, derrubada, provada errada ou enganosa — arquive-a (status=archived) ou reescreva-a (prefira arquivar). Nunca deixe isso como active. E não infle a importance: progresso comum em um assunto é 1, no máximo 2; só algo sério merece 3.
-11. Quando terminar, responda "este grupo está consolidado" e não chame nenhuma outra ferramenta.
+11. Quando terminar, responda diretamente; a primeira linha da resposta deve conter o marcador de grupo {groupMarker} preenchido acima (copie caractere por caractere, sem alterações), seguida por "este grupo está consolidado" e o resumo a partir da segunda linha. Não chame nenhuma outra ferramenta.
 
 Você pode chamar várias ferramentas em um turno — por favor, conclua todas as chamadas de ferramenta desta tarefa em uma única resposta.

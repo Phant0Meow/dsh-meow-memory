@@ -219,6 +219,54 @@ try {
   check('recreated expanded card is repopulated even when source text is unchanged', () =>
     assert.match(foldBody(y.root).textContent, /fork-b answer/))
 
+  // #95：dream 三组产出同条可见——按回复首行的组标记分段，段标题 + 标记剥除；
+  // 无标记 → 单段不动（旧会话/忘写标记兜底）。
+  const dg = pane('dream-groups')
+  dg.rows.answer.innerHTML =
+    '<div>[meow-dream-group 1/3 原子记忆条目]</div><div>本组整理完成。新增 2 条：端口约定、备份策略。</div>'
+  const chatter = document.createElement('div')
+  chatter.setAttribute('data-chat-flow-key', 'dream-groups-chatter')
+  chatter.setAttribute('data-chat-turn', '2')
+  chatter.textContent = '这条已归档，无需处理。'
+  dg.flow.append(chatter)
+  dg.nodes.set('dream-groups-chatter', { key: 'dream-groups-chatter', kind: 'assistant-step', location: { kind: 'turn', turn: { turn: 2 } }, data: { status: 'settled', blocks: [] } })
+  const final2 = document.createElement('div')
+  final2.setAttribute('data-chat-flow-key', 'dream-groups-final2')
+  final2.setAttribute('data-chat-turn', '2')
+  final2.innerHTML = '<div>[meow-dream-group 2/3 话题记忆]</div><div>本组整理完成。话题合并 3 条。</div>'
+  dg.flow.append(final2)
+  dg.nodes.set('dream-groups-final2', { key: 'dream-groups-final2', kind: 'assistant-step', location: { kind: 'turn', turn: { turn: 2 } }, data: { status: 'settled', blocks: [] } })
+  const final3 = document.createElement('div')
+  final3.setAttribute('data-chat-flow-key', 'dream-groups-final3')
+  final3.setAttribute('data-chat-turn', '2')
+  final3.innerHTML = '<div>[meow-dream-group 3/3 项目总结]</div><div>本组整理完成。项目总结合并为 1 条。</div>'
+  dg.flow.append(final3)
+  dg.nodes.set('dream-groups-final3', { key: 'dream-groups-final3', kind: 'assistant-step', location: { kind: 'turn', turn: { turn: 2 } }, data: { status: 'settled', blocks: [] } })
+  query(dg.root, '[data-meow-memory-anchor] > button').click()
+  check('dream groups segment by marker with section headings (#95)', () => {
+    const body = foldBody(dg.root)
+    const heads = body.querySelectorAll('[data-meow-dream-section]')
+    assert.equal(heads.length, 3, `heads=${heads.length}`)
+    assert.equal(heads[0].getAttribute('data-meow-dream-section'), '1/3')
+    assert.equal(heads[1].getAttribute('data-meow-dream-section'), '2/3')
+    assert.equal(heads[2].getAttribute('data-meow-dream-section'), '3/3')
+    assert.match(heads[0].textContent, /原子记忆条目/)
+    assert.match(heads[2].textContent, /项目总结/)
+    // 三段内容都在卡里
+    assert.match(body.textContent, /端口约定、备份策略/)
+    assert.match(body.textContent, /话题合并 3 条/)
+    assert.match(body.textContent, /项目总结合并为 1 条/)
+    // 标记从展示文本中剥除
+    assert.doesNotMatch(body.textContent, /\[meow-dream-group/)
+  })
+  // 无标记的反思轮照旧：单段、不插标题
+  const nr = pane('no-marker-reflect')
+  query(nr.root, '[data-meow-memory-anchor] > button').click()
+  check('no-marker groups stay single-segment (#95 fallback)', () => {
+    assert.equal(foldBody(nr.root).querySelectorAll('[data-meow-dream-section]').length, 0)
+    assert.match(foldBody(nr.root).textContent, /no-marker-reflect answer/)
+  })
+
   const detail = document.createElement('div')
   detail.setAttribute('data-chat-flow', '')
   detail.innerHTML = '<div data-chat-turn="1">nested thinking detail</div>'

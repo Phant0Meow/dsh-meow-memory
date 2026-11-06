@@ -25,6 +25,6 @@ The first turn injects only: soul (the AI itself) / user (the user's preferences
 Notes:
 Important: go through them one by one, and archive or fix memories that are out of date or that mislead you — prefer archiving.
 For a memory you consider very important, if you are unsure what the truth is, go read the project's files and check. Only for memories that really matter.
-When you are finished, reply "this group is consolidated" and call no other tools.
+When you are finished, reply directly; the first line of the reply must contain the group marker {groupMarker} verbatim (copy it character for character, no changes), followed by "this group is consolidated" and the summary from the second line on. Call no other tools.
 
 You can call several tools in one turn — please finish every tool call for this task in a single response.
