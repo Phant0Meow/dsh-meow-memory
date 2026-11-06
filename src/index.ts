@@ -370,10 +370,11 @@ export function validateConfigUserLayer(value: unknown): void {
   if (v.projectDir !== undefined) {
     if (v.projectDir === null || typeof v.projectDir !== 'string') throw new Error('projectDir 必须是字符串')
     // #102：Windows 的 path.join 不会让绝对段覆盖前缀，绝对路径 projectDir 会拼出
-    // "D:\ws\C:\Users\..." 非法路径，报错只有难自查的 ENOENT。设计内的共享库方式是
-    // homeDir / MEOW_MEMORY_HOME（v0.31.1 起有跨重启指针），projectDir 恒相对工作区。
+    // "D:\ws\C:\Users\..." 非法路径，报错只有难自查的 ENOENT。记忆库按工作区隔离
+    //（每工作区 <ws>/<projectDir>/memory.db）是设计内行为，跨工作区共享目前无机制
+    //（homeDir 只管日志/window-index/prompts 覆盖层，不重定向 memory.db）。
     if (/^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(v.projectDir.trim())) {
-      throw new Error('projectDir 必须是相对工作区的路径（如 .dsh-meow）；跨工作区共享记忆库请配置 homeDir（或环境变量 MEOW_MEMORY_HOME）指向共享目录')
+      throw new Error('projectDir 必须是相对工作区的路径（如 .dsh-meow）——记忆库按工作区隔离是设计内行为，跨工作区共享记忆暂无支持')
     }
   }
   if (v.disabledWorkspaces !== undefined) {

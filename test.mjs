@@ -598,7 +598,7 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   for (const bad of ['C:/shared/meow', 'C:\\shared\\meow', '\\\\nas\\share', '/opt/meow']) {
     let msg = ''
     try { validateConfigUserLayer({ projectDir: bad }) } catch (e) { msg = String(e?.message ?? e) }
-    check(`#102 absolute projectDir rejected readably (${bad})`, msg.includes('homeDir') && msg.includes('相对'), msg)
+    check(`#102 absolute projectDir rejected readably (${bad})`, msg.includes('相对') && !msg.includes('homeDir'), msg)
   }
   let okRelative = true
   try { validateConfigUserLayer({ projectDir: '.dsh-meow' }) } catch { okRelative = false }
