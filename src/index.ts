@@ -1745,14 +1745,68 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // waterfall 契约：listener 必须 return 最终 config（不改也要透传 next() 结果）。
   if (resolved.delegate.modelSpec !== undefined) {
     const spec = resolved.delegate.modelSpec
+    const delegateEffort = resolved.delegate.effort
     // #71：sid → 主模型路由 + 我们写下的 delegate 路由（配对保存，避免把 delegate 当主模型）
     const delegateRestore = new Map<string, { main: ModelRoute; route: ModelRoute }>()
     const MAX_DELEGATE_TRACKED = 512
-    ctx.on('agent/request', async (payload: { agent?: { session?: { header?: SessionHeaderLike } } }, next: () => Promise<unknown>) => {
+    const rememberOverride = (sid: string, main: ModelRoute, route: ModelRoute): void => {
+      if (sid === 'unknown' || delegateRestore.has(sid)) return
+      delegateRestore.set(sid, { main, route })
+      // 进程级 Map 兜底上限（Map 保留插入序）：只保最近 MAX_DELEGATE_TRACKED 个会话
+      while (delegateRestore.size > MAX_DELEGATE_TRACKED) {
+        const oldest = delegateRestore.keys().next().value
+        if (oldest === undefined) break
+        delegateRestore.delete(oldest)
+      }
+    }
+    // #110（0.2.2+ 契约）：宿主把步骤的 provider/model 在准备阶段定死，agent/request
+    // waterfall 改 route 直接抛错（"use agent.model.select() before step preparation"）。
+    // 新通路：agent/pre-step 里用 agent.model.select() 记录 delegate 选择——payload 带
+    // 当前 modelSelection（记主模型用），equal 选择是宿主侧 no-op，每步重选无害。
+    ctx.on('agent/pre-step', async (payload: { agent?: { model?: { select?: unknown }; session?: { header?: SessionHeaderLike } }; modelSelection?: unknown }, next: () => Promise<unknown>) => {
+      const agent = payload?.agent
+      // 运行时能力检测：宿主没有 agent.model.select（≤0.2.1.x）→ 本 listener 不作为，
+      // 覆盖由下方 agent/request waterfall 承担。两路互斥，同一宿主只走一条。
+      if (agent === undefined || typeof (agent as { model?: { select?: unknown } }).model?.select !== 'function') return next()
+      if (agent.session?.header?.origin === 'subagent') return next()
+      const sel = payload.modelSelection as ModelRoute | undefined
+      const sid = sessionIdOfAgent(agent as never)
+      const events = sessionEventsOf(agent.session as never)
+      if (isMemoryTaskTurn(events)) {
+        const route: ModelRoute = { provider: spec.provider ?? sel?.provider, model: spec.model ?? sel?.model }
+        rememberOverride(sid, mainRouteOf(sel ?? {}), route)
+        ctx.logger.info(`meow-memory: memory task turn → model override ${route.provider}/${route.model}${delegateEffort === undefined ? ' (effort stripped)' : ` (effort ${delegateEffort})`}`)
+        // #98 effort 语义映射到 select：strip=缺省（0.2.2 文档：omitted effort follows
+        // adapter defaults，天然=剥离）；inherit=传主模型当前 effort；显式值原样传。
+        ;(agent as unknown as { model: { select: (s: ModelRoute) => void } }).model.select(
+          delegateEffort === 'inherit' && sel?.reasoningEffort !== undefined
+            ? { provider: route.provider, model: route.model, reasoningEffort: String(sel.reasoningEffort) }
+            : delegateEffort !== undefined && delegateEffort !== 'inherit'
+              ? { provider: route.provider, model: route.model, reasoningEffort: delegateEffort }
+              : { provider: route.provider, model: route.model },
+        )
+        return next()
+      }
+      const remembered = delegateRestore.get(sid)
+      if (remembered === undefined) return next() // 没覆盖过 / 已还原：零开销放行
+      delegateRestore.delete(sid)
+      if (userSelectedAfterOverride(events, remembered.route)) return next()
+      if (sel?.provider !== remembered.route.provider || sel?.model !== remembered.route.model) return next() // 用户换了别的模型：放行
+      ctx.logger.info(`meow-memory: restore main model ${remembered.main.provider}/${remembered.main.model} after memory task turn`)
+      ;(agent as unknown as { model: { select: (s: ModelRoute) => void } }).model.select({
+        provider: remembered.main.provider,
+        model: remembered.main.model,
+        ...(remembered.main.reasoningEffort === undefined ? {} : { reasoningEffort: remembered.main.reasoningEffort }),
+      })
+      return next()
+    })
+    ctx.on('agent/request', async (payload: { agent?: { model?: { select?: unknown }; session?: { header?: SessionHeaderLike } } }, next: () => Promise<unknown>) => {
       const config = await next() as ModelRoute
       const agent = payload?.agent
-      // 子代理请求不覆盖也不还原（fork 子代理已不再由本插件产生；GUI 手动 fork 的照常放行）
-      if (agent === undefined || agent.session?.header?.origin === 'subagent') return config
+      // #110：0.2.2+ 宿主（有 agent.model.select）禁止 waterfall 改 route——路由由
+      // 上方 pre-step select 承担，此处只透传（改了会整轮失败）。
+      if (agent === undefined || typeof (agent as { model?: { select?: unknown } }).model?.select === 'function') return config
+      if (agent.session?.header?.origin === 'subagent') return config
       const sid = sessionIdOfAgent(agent)
       const events = sessionEventsOf(agent.session as never)
       if (isMemoryTaskTurn(events)) {

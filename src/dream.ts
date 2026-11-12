@@ -466,7 +466,9 @@ function finalizeDream(db: ReturnType<typeof getDb>, sessionId: string, workspac
     db.finishDream(sessionId, Date.now())
     db.logDream(
       `window dream ${reason}: ${shortSessionId(sessionId)} groups=${groupsCount} stamped=${stamped} T=${new Date(T).toISOString()}`,
-      { before: undefined, after: undefined },
+      // #108：changes 落真实计数（此前两处调用硬编码 {before:undefined,after:undefined}
+      // → JSON {}，查库的人会误读成"什么都没改"）。stamped=本轮封存/完结条目数。
+      { stamped, groups: groupsCount },
     )
     dreamLog(workspace, dir, `dream ${reason} session=${shortSessionId(sessionId)} groups=${groupsCount} stamped=${stamped}`)
     onDreamState?.(sessionId, 'dreamed')
@@ -637,7 +639,7 @@ export function recoverInterruptedDream(db: ReturnType<typeof getDb>, sessionId:
   db.finishDream(sessionId, Date.now())
   db.logDream(
     `window dream recovered (interrupted): ${shortSessionId(sessionId)} stamped=${stamped} T=${new Date(T).toISOString()}`,
-    { before: undefined, after: undefined },
+    { stamped }, // #108：changes 落真实计数，不再硬编码空对象
   )
   dreamLog(workspace, dir, `dream recovered session=${shortSessionId(sessionId)} stamped=${stamped}`)
   return stamped

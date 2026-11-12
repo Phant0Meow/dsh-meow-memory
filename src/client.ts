@@ -659,6 +659,12 @@ export function mountMemoryFoldView(root: HTMLElement, read: () => FoldViewState
   const apply = (): void => {
     if (disposed) return
     const state = read()
+    // #109：折叠把行 display:none 后容器高度骤减，但滚动区不重算 scrollHeight——
+    // 折叠时用户贴底的话视口留在原 scrollTop，下方留一整片空白（刷新才恢复）。
+    // 前后各读一次 scrollHeight（读属性本身逼浏览器重排），变矮且折叠前贴底（距底
+    // 160px 内）→ 视口贴回真正底部；用户不在底部 → 不动视口。
+    const before = root.scrollHeight
+    const nearBottom = before - root.clientHeight - root.scrollTop <= 160
     const containers = chatFlows(root)
     // 会话切换/压缩后恢复不再属于折叠组的行；只清理本视图的标记。
     const hiddenKeys = new Set([...state.groups.flatMap((g) => g.keys), ...state.injGroups.map((g) => g.id)])
@@ -672,6 +678,8 @@ export function mountMemoryFoldView(root: HTMLElement, read: () => FoldViewState
     // 状态同步后重新计算，避免重放上次已计算的 running 值。
     applyDelegateNotices(containers, computeDelegateNotices(state.snapshot))
     applyTurnNavHiding(root, state.memTurns)
+    const after = root.scrollHeight
+    if (after < before && nearBottom) root.scrollTop = root.scrollHeight
   }
   let timer = 0
   const observer = new MutationObserver(() => {

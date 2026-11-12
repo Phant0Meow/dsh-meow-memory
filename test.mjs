@@ -2417,7 +2417,44 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   await req98({ agent: { session: { header: { cwd: ws, id: 's-98d' }, events: log98 } }, turn: 1, step: 1, signal: sig98 }, seedHigh)
   log98.push(events.turnStart())
   const out98d = await req98({ agent: { session: { header: { cwd: ws, id: 's-98d' }, events: log98 } }, turn: 2, step: 1, signal: sig98 }, async () => ({ provider: 'prov', model: 'main', reasoningEffort: 'high' }))
-  check('#98 restore brings back main model effort after stripped override', out98d.provider === 'base' && out98d.model === 'base-model' && out98d.reasoningEffort === 'high', JSON.stringify(out98d))
+    check('#98 restore brings back main model effort after stripped override', out98d.provider === 'base' && out98d.model === 'base-model' && out98d.reasoningEffort === 'high', JSON.stringify(out98d))
+}
+
+// ── #110：0.2.2+ select 路径（宿主有 agent.model.select → pre-step select、waterfall 只透传）──
+{
+  const d = makeCtx()
+  await applyGateOff(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
+  const sel = d.handlers['agent/pre-step']
+  check('#110 pre-step listener registered with delegate.model', typeof sel === 'function')
+  const selections = []
+  const mkAgent = (sid, evs) => ({ model: { select: (s) => selections.push({ ...s }) }, session: { header: { cwd: ws, id: sid }, events: evs } })
+  const cur = { provider: 'base', model: 'default-model', reasoningEffort: 'high' }
+  const reflectEvents = [events.turnStart(), { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-reflect] 反思任务' }] } }]
+  const step = async (sid, evs, selection, turn) => sel({ agent: mkAgent(sid, evs), modelSelection: selection, turn, step: 1, signal: new AbortController().signal }, async () => ({}))
+  await step('s-110a', reflectEvents, cur, 1)
+  check('#110 select path overrides on memory task turn', selections.length === 1 && selections[0].provider === 'prov' && selections[0].model === 'main' && selections[0].reasoningEffort === undefined, JSON.stringify(selections))
+  await step('s-110a', [events.turnStart(), events.userMsg('你好')], { provider: 'prov', model: 'main' }, 2)
+  check('#110 select path restores main (full route+effort)', selections.length === 2 && selections[1].restoreCheck === undefined && selections[1].provider === 'base' && selections[1].model === 'default-model' && selections[1].reasoningEffort === 'high', JSON.stringify(selections[1]))
+  // waterfall 透传（能力检测）
+  const req110 = d.handlers['agent/request']
+  const out110 = await req110({ agent: mkAgent('s-110a', reflectEvents) }, async () => ({ provider: 'base', model: 'default-model', reasoningEffort: 'select-host' }))
+  check('#110 waterfall passes through on select-capable host', out110.provider === 'base' && out110.reasoningEffort === 'select-host')
+  // effort 三态经 select
+  const mk = async (effort) => {
+    const dd = makeCtx()
+    await applyGateOff(dd.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main', ...(effort === undefined ? {} : { effort }) } })
+    return dd.handlers['agent/pre-step']
+  }
+  const curE = { provider: 'base', model: 'default-model', reasoningEffort: 'high' }
+  const sel110b = await mk(undefined)
+  await sel110b({ agent: mkAgent('s-110e1', reflectEvents), modelSelection: curE, turn: 1, step: 1 }, async () => ({}))
+  check('#110 effort strip (default) via select omits effort', selections.at(-1).reasoningEffort === undefined)
+  const sel110c = await mk('inherit')
+  await sel110c({ agent: mkAgent('s-110e2', reflectEvents), modelSelection: curE, turn: 1, step: 1 }, async () => ({}))
+  check('#110 effort inherit via select carries main effort', selections.at(-1).reasoningEffort === 'high')
+  const sel110d = await mk('low')
+  await sel110d({ agent: mkAgent('s-110e3', reflectEvents), modelSelection: curE, turn: 1, step: 1 }, async () => ({}))
+  check('#110 effort explicit via select carries value', selections.at(-1).reasoningEffort === 'low')
 }
 
 // #71：反思/dream 轮结束后的普通请求不得继承 delegate 路由。宿主把每次请求的实际路由写进
