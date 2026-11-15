@@ -296,6 +296,11 @@ function buildInjectionBody(
   }
 
   if (lines.length <= 2) return null // 只有标题头，无任何内容
+  // #115：快照尾部加硬边界。注入是 role=user 的独立消息贴在真实用户消息前，此前
+  // 块尾是数据行（"用户的所有 project：…"）且与用户消息之间零边界——模型把记忆块
+  // 与陈述式需求连读，判"本轮无任务"（真机实测）。结束分隔 + 一句边界声明收尾。
+  lines.push(lbl('inject.end'))
+  lines.push(lbl('inject.boundary'))
   return { body: lines.join('\n').trimEnd(), injectedIds: injected }
 }
 
@@ -521,6 +526,7 @@ export function buildReinjection(
     lines.push(written.text)
     lines.push('')
   }
+  lines.push(lbl('inject.boundary')) // #115：重注入块同款边界
   const text = lines.join('\n').trimEnd()
   const replayedIds = [...(snapshot?.injectedIds ?? []), ...(written?.ids ?? [])]
   if (replayedIds.length > 0) markInjected(workspace, sessionId, replayedIds, dir)
@@ -601,6 +607,7 @@ export function buildHitInjection(
     lines.push(h.content)
     lines.push('')
   }
+  lines.push(lbl('inject.boundary')) // #115：命中块同样贴在用户消息前，同款边界
   const text = lines.join('\n').trimEnd()
   const ids = fresh.map((h) => h.id)
   markInjected(workspace, sessionId, ids, dir)

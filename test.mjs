@@ -1166,7 +1166,8 @@ if (inj) {
     inj.text.includes('当有项目相关任务时，应先用 memory_project 查项目全景（记得带上项目名，不能空参）') &&
     inj.text.includes('用户的所有 project：'))
   check('injection no topic/project title list', !inj.text.includes('- topic:') && !inj.text.includes('- project:'))
-  check('injection has no legacy prompt separator', !inj.text.includes('===== 长期记忆结束 =====') && !inj.text.includes('本轮用户prompt：'))
+  // #115：结束分隔回归 + 边界声明（模型把记忆块与用户消息连读的真机事故）；旧「本轮用户prompt：」尾巴仍不回归
+  check('injection ends with boundary (#115)', inj.text.includes('===== 长期记忆结束 =====') && inj.text.includes('非本轮指令') && !inj.text.includes('本轮用户prompt：'))
   check('injection tool name fixed', !inj.text.includes('memory_recall') && inj.text.includes('memory_search'))
   check('sessions file written', readFileSync(join(ws2, '.dsh-meow', 'sessions', 'test-session-1.json'), 'utf8').includes(inj.injectedIds[0]))
 }
