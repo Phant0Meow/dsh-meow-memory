@@ -318,11 +318,25 @@ function safeSteer(agent: unknown, msg: unknown, workspace: string, dir: string,
  * 兼容：followup 0.1.2 起即存在（agent.d.ts 三方法同款）；能力探测，缺失时回退
  * steer——旧宿主行为逐字节不变（继续走共享轮 + 旧折叠形状）。
  */
+/** #110 复测问题 1：宿主 0.2.2 在 pre-step waterfall 之前就 current() 定死本步路由，
+ *  pre-step 里 select() 只对下一步生效——首步永远跑主模型。修法：把 select 提前到
+ *  **turn 入口**（sendMemoryTurn 入队成功后立刻调），第 1 步的 current() 即读到
+ *  delegate。钩子由 index.ts 的 delegate 块注入（spec/effort 在那里）；dream.ts
+ *  保持 spec 无关。测试接点：setMemoryTurnEnqueuedHookForTest。 */
+type MemoryTurnEnqueuedHook = (agent: unknown) => void
+let memoryTurnEnqueuedHook: MemoryTurnEnqueuedHook | undefined
+export function setMemoryTurnEnqueuedHook(fn: MemoryTurnEnqueuedHook | undefined): void {
+  memoryTurnEnqueuedHook = fn
+}
+/** 测试接点（与 setDreamStatesForTest 同款惯例）。 */
+export const setMemoryTurnEnqueuedHookForTest = setMemoryTurnEnqueuedHook
+
 export function sendMemoryTurn(agent: unknown, msg: unknown, workspace: string, dir: string, tag: string): boolean {
   const followup = (agent as { followup?: (m: unknown) => void } | undefined)?.followup
   if (typeof followup !== 'function') return safeSteer(agent, msg, workspace, dir, tag)
   try {
     followup.call(agent, msg)
+    memoryTurnEnqueuedHook?.(agent) // #110：turn 入口 select，首步即 delegate
     return true
   } catch (error: unknown) {
     const text = error instanceof Error ? error.message : String(error)

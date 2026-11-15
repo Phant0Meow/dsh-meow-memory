@@ -45,6 +45,7 @@ import {
   registerLiveAgent,
   scheduleDream,
   sendMemoryTurn,
+  setMemoryTurnEnqueuedHook,
   shortSessionId,
   type DreamConfig,
 } from './dream.js'
@@ -1394,10 +1395,15 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           // message 正则兜底老宿主可能不填 code 的形状。
           const errCode = String((event.data as { reason?: { error?: { code?: unknown } } })?.reason?.error?.code ?? '')
           const errMsg = String((event.data as { reason?: { error?: { message?: unknown } } })?.reason?.error?.message ?? '')
-          if (errCode === 'TRANSPORT' || /transport|network|connection|ECONN/i.test(errMsg)) {
+          // #110 复测问题 2：delegate 到小 contextWindow 模型后长会话必然 400
+          // （litellm ContextWindowExceededError）——同样是环境性失败（会话大小 vs
+          // 目标模型窗口），烧封存预算无意义且重试必然复现。释放租约 + 一条可行动
+          // 的日志（跳过 delegate 或手动 /dream 换主模型跑）。
+          const contextWindowExceeded = errCode === 'CONTEXT_WINDOW_EXCEEDED' || /contextwindow|context window/i.test(errMsg)
+          if (errCode === 'TRANSPORT' || contextWindowExceeded || /transport|network|connection|ECONN/i.test(errMsg)) {
             try {
               getDb(cwd, resolved.projectDir).releaseDream(sid)
-              appendFileSync(join(cwd, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] dream transport-fail sid=${shortSessionId(sid)} -> released (not counted, #106)\n`)
+              appendFileSync(join(cwd, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] dream ${contextWindowExceeded ? 'context-window-fail' : 'transport-fail'} sid=${shortSessionId(sid)} -> released (not counted, #106/#110)\n`)
             } catch { /* 释放失败不阻塞 */ }
             broadcast.broadcast(sid, 'active')
           } else {
@@ -1655,10 +1661,30 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     const t0 = Date.now()
     if (agent.session.header.origin === 'subagent') return // 子代理不参与（origin 权威判定）
     registerLiveAgent(agent)
+    const sidTs = sessionIdOfAgent(agent)
+    // #110 复测问题 3 的根治之一：memory 任务轮**收尾时**就把主模型 select 回去——
+    // 下一轮第 1 步的 current() 读到主模型，恢复不再晚一步（此前恢复只在下一个
+    // 普通请求的 pre-step 里发生）。用户在轮内改选过模型（current ≠ delegate 路由）
+    // 则不动，配对留给 pre-step 路径按 #71 守卫判断放行。
+    if (delegateRestore.has(sidTs) && typeof (agent as { model?: { select?: unknown } }).model?.select === 'function') {
+      try {
+        const remembered = delegateRestore.get(sidTs)!
+        const cur = mainRouteOf((agent as unknown as { model: { current: () => ModelRoute | undefined } }).model.current() ?? {})
+        if (cur.provider === remembered.route.provider && cur.model === remembered.route.model) {
+          ;(agent as unknown as { model: { select: (s: ModelRoute) => void } }).model.select({
+            provider: remembered.main.provider,
+            model: remembered.main.model,
+            ...(remembered.main.reasoningEffort === undefined ? {} : { reasoningEffort: remembered.main.reasoningEffort }),
+          })
+          delegateRestore.delete(sidTs)
+          ctx.logger.info(`meow-memory: restore main model ${remembered.main.provider}/${remembered.main.model} at memory turn end (#110)`)
+        }
+        // cur ≠ delegate 路由 = 用户轮内改选：不还原、配对保留，pre-step 路径按 #71 放行
+      } catch { /* select 不可用：pre-step 路径兜底 */ }
+    }
     const endReason = lastTurnEndReason(sessionEventsOf(agent.session))
     const dreamTurn = wasDreamTurn(sessionEventsOf(agent.session))
     const wsTs = workspaceOfAgent(agent)
-    const sidTs = sessionIdOfAgent(agent)
     if (wsTs) {
       try {
         appendFileSync(join(wsTs, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] turn-stopping pid=${process.pid} sid=${shortSessionId(sidTs)} reason=${endReason ?? 'none'} wasDream=${dreamTurn}\n`)
@@ -1743,22 +1769,55 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   //   用户恰好选中 delegate 模型本身：宿主会 append model/selection，日志里能看见 → 放行。
   //   内存态仅进程内（宿主重启丢一次还原，已知限制）。
   // waterfall 契约：listener 必须 return 最终 config（不改也要透传 next() 结果）。
+  // #71：sid → 主模型路由 + 我们写下的 delegate 路由（配对保存，避免把 delegate 当主模型）。
+  // 内存态（重启丢失 = 已知限制，#114 报告者命中并已确认归属），声明在 apply 作用域：
+  // turn-stopping 的恢复 select（#110 复测）也要读写它。
+  const delegateRestore = new Map<string, { main: ModelRoute; route: ModelRoute }>()
+  const MAX_DELEGATE_TRACKED = 512
+  const rememberOverride = (sid: string, main: ModelRoute, route: ModelRoute): void => {
+    if (sid === 'unknown') {
+      // #114 场景二：无会话 id 时配对记不了，恢复无从谈起——至少留一条可自查的日志
+      ctx.logger.info('meow-memory: delegate override skipped (session id unknown) — restore pairing not recorded (#114)')
+      return
+    }
+    const prev = delegateRestore.get(sid)
+    if (prev === undefined) {
+      delegateRestore.set(sid, { main, route })
+    } else {
+      // 「首个完整者为准」：turn 入口记的 main 来自覆盖前的 current()——那是真主模型；
+      // 后续调用（pre-step / waterfall 第 2 步起）传来的已是 delegate 路由，绝不能覆盖
+      // 真主模型（#71 教训）。仅当首个 main 不完整（current() 尚无选择）时才用新的补全。
+      const complete = (r: ModelRoute): boolean => r.provider !== undefined && r.model !== undefined
+      delegateRestore.set(sid, { main: complete(prev.main) ? prev.main : complete(main) ? main : prev.main, route: prev.route })
+    }
+    // 进程级 Map 兜底上限（Map 保留插入序）：只保最近 MAX_DELEGATE_TRACKED 个会话
+    while (delegateRestore.size > MAX_DELEGATE_TRACKED) {
+      const oldest = delegateRestore.keys().next().value
+      if (oldest === undefined) break
+      delegateRestore.delete(oldest)
+    }
+  }
   if (resolved.delegate.modelSpec !== undefined) {
     const spec = resolved.delegate.modelSpec
     const delegateEffort = resolved.delegate.effort
-    // #71：sid → 主模型路由 + 我们写下的 delegate 路由（配对保存，避免把 delegate 当主模型）
-    const delegateRestore = new Map<string, { main: ModelRoute; route: ModelRoute }>()
-    const MAX_DELEGATE_TRACKED = 512
-    const rememberOverride = (sid: string, main: ModelRoute, route: ModelRoute): void => {
-      if (sid === 'unknown' || delegateRestore.has(sid)) return
-      delegateRestore.set(sid, { main, route })
-      // 进程级 Map 兜底上限（Map 保留插入序）：只保最近 MAX_DELEGATE_TRACKED 个会话
-      while (delegateRestore.size > MAX_DELEGATE_TRACKED) {
-        const oldest = delegateRestore.keys().next().value
-        if (oldest === undefined) break
-        delegateRestore.delete(oldest)
-      }
-    }
+    // #110 复测问题 1：turn 入口 select——sendMemoryTurn 入队成功即调，第 1 步的
+    // current() 就读到 delegate。main 记覆盖前的 current()（真主模型）；后续
+    // pre-step/waterfall 调用走「首个完整者为准」不会覆盖它。
+    setMemoryTurnEnqueuedHook((agent: unknown) => {
+      if (typeof (agent as { model?: { select?: unknown } }).model?.select !== 'function') return
+      const sid = sessionIdOfAgent(agent as never)
+      const cur = mainRouteOf((agent as unknown as { model: { current: () => ModelRoute | undefined } }).model.current() ?? {})
+      const route: ModelRoute = { provider: spec.provider ?? cur.provider, model: spec.model ?? cur.model }
+      rememberOverride(sid, cur, route)
+      ;(agent as unknown as { model: { select: (s: ModelRoute) => void } }).model.select(
+        delegateEffort === 'inherit' && cur.reasoningEffort !== undefined
+          ? { provider: route.provider, model: route.model, reasoningEffort: String(cur.reasoningEffort) }
+          : delegateEffort !== undefined && delegateEffort !== 'inherit'
+            ? { provider: route.provider, model: route.model, reasoningEffort: delegateEffort }
+            : { provider: route.provider, model: route.model },
+      )
+      ctx.logger.info(`meow-memory: memory task turn → model override at turn entry ${route.provider}/${route.model}`)
+    })
     // #110（0.2.2+ 契约）：宿主把步骤的 provider/model 在准备阶段定死，agent/request
     // waterfall 改 route 直接抛错（"use agent.model.select() before step preparation"）。
     // 新通路：agent/pre-step 里用 agent.model.select() 记录 delegate 选择——payload 带
@@ -1811,17 +1870,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       const events = sessionEventsOf(agent.session as never)
       if (isMemoryTaskTurn(events)) {
         // 只在本会话还没记过时记：同一反思轮第 2 步起解析出的是我们写下的 delegate 路由，
-        // 记错会把 delegate 存成主模型（真机日志一次反思有 2 个 header）。无会话 id 不记（防串会话）。
+        // 记错会把 delegate 存成主模型（真机日志一次反思有 2 个 header）。
         const route: ModelRoute = { provider: spec.provider ?? config.provider, model: spec.model ?? config.model }
-        if (sid !== 'unknown' && !delegateRestore.has(sid)) {
-          delegateRestore.set(sid, { main: mainRouteOf(config), route })
-          // 进程级 Map 兜底上限（Map 保留插入序）：只保最近 MAX_DELEGATE_TRACKED 个会话
-          while (delegateRestore.size > MAX_DELEGATE_TRACKED) {
-            const oldest = delegateRestore.keys().next().value
-            if (oldest === undefined) break
-            delegateRestore.delete(oldest)
-          }
-        }
+        rememberOverride(sid, mainRouteOf(config), route)
         ctx.logger.info(`meow-memory: memory task turn → model override ${spec.provider ?? '(inherit)'}/${spec.model ?? ''}${resolved.delegate.effort === undefined ? ' (effort stripped)' : ` (effort ${resolved.delegate.effort})`}`)
         // #98：effort 随覆盖一并处理（ ReasoningEffortId 是模型声明的不透明值，无法
         // 在覆盖点探测目标模型支持什么——默认剥离，显式配置才下发）。
@@ -2193,4 +2244,4 @@ export { authGate, authGateLazy, connectionAuthOf } from './auth-gate.js'
 // 信任门（#64）：normalizeWorkspacePath 原定义在本文件（#28 口径），移入 trust.ts
 // 后在此 re-export 保持既有导出面不变；其余为信任注册表 API（测试直调）。
 export { normalizeWorkspacePath, isTrustedWorkspace, isUntrustedMemoryWorkspace, trustWorkspace, registerCreatedWorkspace, hasExternalNoticeShown, markExternalNoticeShown, enableWorkspaceTrust, disableWorkspaceTrust, seedTrustedWorkspaces, trustCommandDefinition } from './trust.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, sendMemoryTurn, setMemoryTurnEnqueuedHookForTest, type DreamConfig } from './dream.js'

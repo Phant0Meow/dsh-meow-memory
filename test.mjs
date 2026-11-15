@@ -2457,6 +2457,46 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   check('#110 effort explicit via select carries value', selections.at(-1).reasoningEffort === 'low')
 }
 
+// ── #110 复测后续：turn 入口 select（首步即 delegate）+ 收尾恢复 select + CONTEXT_WINDOW 免计 ──
+{
+  const d = makeCtx()
+  await applyGateOff(d.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', delegate: { model: 'prov/main' } })
+  const { setMemoryTurnEnqueuedHookForTest } = await import('./lib/index.js')
+  const selections = []
+  const mkAgent = (sid, evs) => ({ followup: () => {}, steer: () => {}, model: { select: (s) => selections.push({ ...s }), current: () => ({ ...selections.at(-1) ?? { provider: 'base', model: 'default-model', reasoningEffort: 'high' } }) }, session: { header: { id: sid } }, events: evs })
+  const reflectEvents = [events.turnStart(), { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-dream] 整理' }] } }]
+  const { sendMemoryTurn } = await import('./lib/index.js')
+  // turn 入口：sendMemoryTurn 入队即 select——首步 current() 已是 delegate
+  const agent = mkAgent('s-110t', reflectEvents)
+  const ok = sendMemoryTurn(agent, { content: [{ type: 'text', text: '[meow-memory-dream] 整理' }], source: { kind: 'plugin:meow-memory' } }, ws, '.dsh-meow', 'tag')
+  check('#110 turn-entry select fires on enqueue (first-step delegation)', ok === true && selections.length === 1 && selections[0].provider === 'prov' && selections[0].model === 'main')
+  check('#110 turn-entry records main from current() before override', (() => { const restored = selections.at(-1); return restored !== undefined })())
+  // 收尾恢复：turn-stopping 时 current=delegate → select 回主模型
+  const stopper = d.handlers['agent/turn-stopping']
+  const agentWithHeader = { ...mkAgent('s-110t', reflectEvents), session: { header: { cwd: ws, id: 's-110t' }, events: reflectEvents } }
+  stopper({ agent: agentWithHeader, turn: 1 })
+  check('#110 turn-end restores main model (restore no longer one step late)', selections.at(-1).provider === 'base' && selections.at(-1).model === 'default-model' && selections.at(-1).reasoningEffort === 'high', JSON.stringify(selections.at(-1)))
+  // 用户轮内改选：current ≠ delegate 路由 → 不还原（走生产钩子，不替换）
+  const selections2 = []
+  const agent2 = { followup: () => {}, steer: () => {}, model: { select: (s) => selections2.push(s), current: () => ({ provider: 'user-picked', model: 'other' }) }, session: { header: { cwd: ws, id: 's-110t2' }, events: reflectEvents } }
+  sendMemoryTurn(agent2, { content: [{ type: 'text', text: '[meow-memory-dream] 整理' }], source: { kind: 'plugin:meow-memory' } }, ws, '.dsh-meow', 'tag2')
+  stopper({ agent: agent2, turn: 1 })
+  check('#110 user-mid-turn model switch is not restored over', selections2.length === 1 && selections2.at(-1).provider === 'prov' && selections2.at(-1).model === 'main', JSON.stringify(selections2))
+  // CONTEXT_WINDOW 免计：turn/end error 带 ContextWindowExceeded → 释放租约不烧预算
+  const wsCw = mkdtempSync(join(tmpdir(), 'mm-cw-'))
+  const dCw = getDb(wsCw, '.dsh-meow')
+  const widCw = 'win-cw'
+  dCw.touchWindow(widCw, wsCw, Date.now() - 4 * 3600_000)
+  dCw.claimDream(widCw, 'o-cw', 1000, LEASE)
+  const dCwCtx = makeCtx()
+  await applyGateOff(dCwCtx.ctx, { enabled: true, projectDir: '.dsh-meow' })
+  await dCwCtx.handlers['session/event']({ id: widCw, header: { cwd: wsCw } }, { type: 'turn/start', time: Date.now() })
+  await dCwCtx.handlers['session/event']({ id: widCw, header: { cwd: wsCw } }, { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'error', error: { code: 'INVALID_REQUEST', message: '400: litellm.ContextWindowExceededError: prompt tokens exceed' } } } })
+  check('#110 context-window failure releases lease without burning budget', dCw.getDreamLease(widCw) === null && dCw.recordDreamFailure(widCw, 1000) === 1)
+  dCw.close()
+  rmSync(wsCw, { recursive: true, force: true })
+}
+
 // #71：反思/dream 轮结束后的普通请求不得继承 delegate 路由。宿主把每次请求的实际路由写进
 // request/header，modelSelection 投影的 lastUsed 随之变成 delegate；插件必须还原被覆盖的主模型，
 // 且绝不覆盖用户在 dream 期间的选择（用日志里的 model/selection 事件识别）。
