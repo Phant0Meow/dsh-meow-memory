@@ -270,7 +270,7 @@ function rememberTool(dir: string): ToolDefinition {
       const corrected = coerceBoolean(parsed.corrected) ? 1 : 0
 
       const workspace = workspaceOf(exec)
-      if (!workspace) throw new Error('memory_remember: 无法确定工作区（会话无 cwd）')
+      if (!workspace) throw new Error('memory_remember: 无法确定工作区（会话无 cwd）——记忆工具需在有工作区 cwd 的会话内调用，外部/无会话调用链不受支持（#94）')
       const db = getDb(workspace, dir)
       const source_session = sessionIdOf(exec)
       // 锚定当前 project：带 project 参数的 memory 调用更新会话状态（命中检索用它）；"全局"与多项目（逗号分隔）不锚定。
@@ -428,7 +428,7 @@ function searchTool(dir: string): ToolDefinition {
       const query = typeof parsed.query === 'string' ? parsed.query.trim() : ''
       if (!query) throw new Error('memory_search: query 必填且不能为空（例：{"query": "关键词"}）；浏览项目全貌请用 memory_project')
       const workspace = workspaceOf(exec)
-      if (!workspace) throw new Error('memory_search: 无法确定工作区（会话无 cwd）')
+      if (!workspace) throw new Error('memory_search: 无法确定工作区（会话无 cwd）——记忆工具需在有工作区 cwd 的会话内调用，外部/无会话调用链不受支持（#94）')
       const db = getDb(workspace, dir)
       const sessionId = sessionIdOf(exec)
       const seen = readSeen(workspace, sessionId ?? 'unknown', dir)
@@ -587,7 +587,7 @@ function findSimilarTool(dir: string): ToolDefinition {
       const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
       if (!id) throw new Error('memory_find_similar: id 不能为空')
       const workspace = workspaceOf(exec)
-      if (!workspace) throw new Error('memory_find_similar: 无法确定工作区（会话无 cwd）')
+      if (!workspace) throw new Error('memory_find_similar: 无法确定工作区（会话无 cwd）——记忆工具需在有工作区 cwd 的会话内调用，外部/无会话调用链不受支持（#94）')
       const db = getDb(workspace, dir)
       const found = db.findById(id)
       if (!found) throw new Error(`memory_find_similar: 未找到记忆 ${id.slice(0, 12)}`)
@@ -681,7 +681,7 @@ function readTool(dir: string): ToolDefinition {
       const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
       if (!id) throw new Error('memory_read: id 不能为空')
       const workspace = workspaceOf(exec)
-      if (!workspace) throw new Error('memory_read: 无法确定工作区（会话无 cwd）')
+      if (!workspace) throw new Error('memory_read: 无法确定工作区（会话无 cwd）——记忆工具需在有工作区 cwd 的会话内调用，外部/无会话调用链不受支持（#94）')
       const found = getDb(workspace, dir).findById(id)
       if (!found) return { found: false }
       const { row } = found
@@ -750,7 +750,7 @@ function updateTool(dir: string): ToolDefinition {
       const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
       if (!id) throw new Error('memory_update: id 不能为空')
       const workspace = workspaceOf(exec)
-      if (!workspace) throw new Error('memory_update: 无法确定工作区（会话无 cwd）')
+      if (!workspace) throw new Error('memory_update: 无法确定工作区（会话无 cwd）——记忆工具需在有工作区 cwd 的会话内调用，外部/无会话调用链不受支持（#94）')
       const db = getDb(workspace, dir)
       const sessionId = sessionIdOf(exec)
       // 写路径必须歧义拒绝（#62）：findById 取首条 + 拿解析出的全 id 去 update，
@@ -836,7 +836,7 @@ function projectTool(dir: string): ToolDefinition {
       const project = typeof parsed.project === 'string' ? parsed.project.trim() : ''
       if (!project) throw new Error('memory_project: project 不能为空')
       const workspace = workspaceOf(exec)
-      if (!workspace) throw new Error('memory_project: 无法确定工作区（会话无 cwd）')
+      if (!workspace) throw new Error('memory_project: 无法确定工作区（会话无 cwd）——记忆工具需在有工作区 cwd 的会话内调用，外部/无会话调用链不受支持（#94）')
       const db = getDb(workspace, dir)
       // 锚定当前 project：用户话题切到某项目时 AI 调 memory_project → 命中检索立即跟进；"全局"与多项目不锚定。
       const sessionId = sessionIdOf(exec)

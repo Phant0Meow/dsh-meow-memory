@@ -531,7 +531,7 @@ export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamS
     },
     async execute(_args: unknown, exec: ToolRunContext) {
       const workspace = workspaceOf(exec)
-      if (!workspace) throw new Error('memory_dream: 无法确定工作区（会话无 cwd）')
+      if (!workspace) throw new Error('memory_dream: 无法确定工作区（会话无 cwd）——记忆工具需在有工作区 cwd 的会话内调用，外部/无会话调用链不受支持（#94）')
       if (!exec.agent) throw new Error('memory_dream: 无法确定当前 agent')
       if (isSubagentAgent(exec.agent)) {
         // 子代理没有独立记忆窗口：写记忆归属父窗口，dream 也归父窗口（2026-09-05
