@@ -15,6 +15,8 @@ All fields are optional (profile patch or `cordis.patch.yml`). **You don't have 
     promptLang: 'zh'          # ⚠️ set this on first use (see below)
     hitTopK: 2                # max keyword-hit entries injected per user message (fact/lesson/rules/topic)
     titleMax: 40              # guide title truncation length
+    profileMax: 0             # first-turn profile entry cap: soul+user ranked by importance
+                              # then recency, keep top N; 0 = unlimited
     reflect: true             # auto-reflection after ≥reflectTurns consecutive tool turns
     reflectTurns: 7           # consecutive tool turns before reflection triggers
     autoMigrate: true         # migrate a legacy PROJECT.md when the db is first opened
@@ -22,6 +24,9 @@ All fields are optional (profile patch or `cordis.patch.yml`). **You don't have 
     disabledWorkspaces: []    # workspaces with memory fully disabled (cwd-normalised match)
     backup:
       enabled: false          # snapshot memory.db to memory.db.bak at the end of each dream
+    privacy:
+      enabled: false          # when on, the memory write tools' guidance asks the model
+                              # not to record raw secrets (prompt-level, not a hard gate)
     dream:
       enabled: true
       idleMinutes: 180        # window is dream-eligible after ≥180 min (3 h) idle
@@ -75,6 +80,7 @@ Changing it migrates the old directory automatically (same-volume move / cross-v
 |---|---|---|---|
 | `hitTopK` | number 0–10 | `2` | Max keyword hits injected per user message (scope: short fact/lesson/rules/topic entries) |
 | `titleMax` | number 10–200 | `40` | Guide title truncation length |
+| `profileMax` | number ≥0 | `0` | First-turn profile entry cap: soul + user form one pool ranked by importance (ties by update time, newest first); keep the top N (`0` = unlimited, default, current behavior). Profile layers only — the design-principles section is unaffected; trimmed entries stay reachable via memory_search (pass level explicitly). **Consumed at injection time; a change needs a reload** |
 | `reflect` | bool | `true` | Whether to auto-inject reflection after a ReAct task ends |
 | `reflectTurns` | number 1–50 | `7` | Consecutive tool steps within one task before reflection triggers at its end |
 
@@ -90,6 +96,12 @@ Changing it migrates the old directory automatically (same-volume move / cross-v
 |---|---|---|---|
 | `autoMigrate` | bool | `true` | Migrate a legacy `PROJECT.md` when the db is first opened |
 | `backup.enabled` | bool | `false` | Automatic memory-db backup (#37): at the end of each dream, snapshot `memory.db` to `memory.db.bak` (`VACUUM INTO` consistent backup, mtime-based incrementality). **Consumed at registration; a change needs a reload** |
+
+### Privacy
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `privacy.enabled` | bool | `false` | Privacy preference: when on, the `memory_remember` / `memory_update` tool descriptions gain a rule asking the model not to record **raw** secrets (API keys, tokens, passwords — omit the sensitive part, keep the rest of the memory). This is a prompt-level constraint (the model may ignore it, and unrecognized credential shapes still slip through), **not a write gate**; the store is local, so users who deliberately want keys remembered can keep the default. **Consumed at registration; a change needs a reload** |
 
 ### dream
 

@@ -21,9 +21,11 @@ export interface InjectOptions {
   hitTopK: number
   /** 导引里 project/topic 标题超长截断长度。 */
   titleMax: number
+  /** 首轮画像条数上限（soul+user 合并池截 top N；0=全量）。 */
+  profileMax: number
 }
 
-const DEFAULT_OPTS: InjectOptions = { hitTopK: 2, titleMax: 40 }
+const DEFAULT_OPTS: InjectOptions = { hitTopK: 2, titleMax: 40, profileMax: 0 }
 
 export function sessionsFile(workspace: string, sessionId: string, dir = '.dsh-meow'): string {
   // 会话 id 可能含 Windows 文件名非法字符（#56：飞书桥 lark-link:dm:…:0 的冒号）——
@@ -254,8 +256,26 @@ function buildInjectionBody(
 ): { body: string; injectedIds: string[] } | null {
   // 框架词外置（v0.19.0）：labels.md 的 inject.* 键；记忆条目正文本身是数据不是文案，不外置。
   const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
-  const soul = db.list('soul', { status: 'active' })
-  const user = db.list('user', { status: 'active' })
+  const soulAll = db.list('soul', { status: 'active' })
+  const userAll = db.list('user', { status: 'active' })
+  // 首轮画像条数上限（profileMax，0=全量默认）：画像层增长 1-2 条/天、dream 修剪追不上
+  // （反馈实测 user 层 56 条 1.45 万字全量进首轮）——首轮快照是唯一无上限注入路径。
+  // soul+user 合并一个池，importance 降序 → 同重要性 updated_at 新→旧 → created_at 新→旧，
+  // 截 top N。只作用于画像层：rules 区不受影响（已有 全局+importance≥2 双门槛，是行为
+  // 准则，不该被条数预算挤掉）。展示分区不变：survivors 按原【关于你】/【关于user】渲染。
+  // 被截条目不记 injected——保持"未见过"，memory_search 显式传 level 仍可检索到。
+  let soul = soulAll
+  let user = userAll
+  if (o.profileMax > 0 && soulAll.length + userAll.length > o.profileMax) {
+    const kept = [...soulAll, ...userAll]
+      .sort((a, b) =>
+        b.importance - a.importance
+        || b.updated_at - a.updated_at
+        || b.created_at - a.created_at)
+      .slice(0, o.profileMax)
+    soul = kept.filter((r) => r.level === 'soul')
+    user = kept.filter((r) => r.level === 'user')
+  }
 
   const lines: string[] = [lbl('inject.title'), '']
   const injected: string[] = []
@@ -423,7 +443,8 @@ function buildProjectSection(db: MemoryDb, workspace: string, project: string, d
     '——',
     '说明：此处只提供 active 的记忆。',
     `如果你想看非 active 条目（archived=删除 / stale=完结），或某条记忆的具体时间戳（记忆时间戳=该窗口 dream 封存时刻）、记忆来源（source_session）、重要性、关键词等元数据，可以直接去搜记忆库 SQLite：${dbPath}`,
-    '（库内结构：七层表 soul/user/project/fact/lesson/topic/rules，字段含 id/title/content/importance/keywords/status/corrected/project/subcategory/goal/source_session/created_at/updated_at（记忆时间戳=最后更新时间）/last_accessed_at；另有 dream_log 整理留痕表、windows 窗口时间表；也可按 id 用 memory_read 看单条完整元数据）',
+    '（库内结构：七层表 soul/user/project/fact/lesson/topic/rules，字段含 id/title/content/importance/keywords/status/corrected/project/subcategory/goal/source_session/created_at/updated_at（记忆时间戳=最后更新时间）/last_accessed_at/editHistory_infoFrom；另有 dream_log 整理留痕表、windows 窗口时间表；也可按 id 用 memory_read 看单条完整元数据）',
+    'editHistory_infoFrom = 编辑史：每次编辑追加一条事件（分号分隔），格式「场景-动作-会话短id-turn(n)」或「场景-动作-会话短id-turnRange(a,b)」。场景 jot=随手记/reflect=反思/dream=整理；动作 remember=memory_remember 写入（新建或合并）/update=memory_update 改字段/archive=归档/stale=完结。turn(n)=第 n 轮随手写下、出处即该轮；turnRange(a,b)=第 b 轮（反思/dream 处理轮）整理了素材第 a 到 b-1 轮（含头不含尾，b 本身不是素材）。会话短 id=会话 id 剥 "session-" 前缀取前 8 位。',
     `如果你想了解未被记录的更多细节，可以直接去搜会话历史目录（dsh 的 session 日志，位置由 DSH_HOME 决定，默认 ~/.dsh/sessions，喵版为 dsh-home/sessions），按会话 id 查原始记录。`,
   ].join('\n')
   return { text, ids }

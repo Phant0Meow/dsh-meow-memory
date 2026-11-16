@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.33.0 (2026-11-16)
+
+### 新增：隐私倾向 privacy.enabled（大肥鱼三条建议 ①）
+
+- 设置页新增「隐私」分组（默认关）：开启后 `memory_remember` / `memory_update` 的工具描述追加红线句（content/keywords/goal 不得包含密钥、Token、密码等敏感信息**原文**；涉及时省略该部分、其余照常记录），文案外置三语言包（tools.md `privacy.line`）。
+- prompt 级约束而非写入闸门：模型可能不听、认不出的凭据形态照样漏——设置页 hint 明示这一取舍；想主动记 key 的用户保持默认关闭即可。`keyedValue` 缺键回退空串（实例 prompts 覆盖层可能是老版本），绝不因文案缺失炸掉工具注册。
+
+### 新增：首轮画像条数上限 profileMax（大肥鱼三条建议 ②）
+
+- 首轮快照是唯一无上限注入路径（soul/user 全量直出，反馈方实测 user 层 56 条 1.45 万字）：新增 `profileMax`（默认 0=全量，现状不变）。开启后 soul+user 合并一个池，按 importance 降序 → 同重要性按 updated_at 新→旧截 top N；rules 区不受影响（保持「全局 + importance≥2」双门槛）。
+- 被截条目不记 injected（保持"未见过"，memory_search 显式传 level 仍可检索）；首轮与压缩重注入共用 buildInjectionBody，自动同策略。设置页「注入」分组加字段，i18n ×3、配置文档 ×2 同步。
+
+### 新增：editHistory_infoFrom 编辑史/出处审计列（大肥鱼三条建议 ③）
+
+- 七层表各加一列 TEXT：每次落库写入（remember 新建/合并、update 字段/归档/完结）追加一条事件，分号分隔。格式 `场景-动作-会话短id-turn(n)`（随手记，出处=该轮）或 `场景-动作-会话短id-turnRange(a,b)`（反思/整理轮，素材=a..b-1 轮，b=处理轮本身，含头不含尾；a=上次同类标记所在轮+1，无标记=1）。场景 jot/reflect/dream 由当前轮内的插件标记消息判定；动作 remember/update/archive/stale 直接映射两个写工具的结果。
+- 每个事件自带会话短 id（跨会话编辑同一条记忆不指错日志）；cap 10 保出生事件；拿不到坐标（无会话/事件流不可读）不追加、绝不影响写入；老数据 null，`upgrade()` 自动补列（老库补列 / 全新库建表自带 / 备份恢复后重开，三路径实测）。memory_read 返回该字段并在 render 展示；项目全景「库内结构」尾注附格式说明（供模型翻库时解读）。
+- 只做审计展示，不参与任何运行时判定；`source_session` 现语义不动（dream 圈范围、重注入、命中排除仍依赖它）。
+
+### 修复：宿主会话事件流兼容（桌面版 rc.2 实测教训）
+
+- 桌面版宿主的 agent.session 暴露 `ownEvents()` 方法而非 `events` 数组：editHistory 首版直连 `.events` 拿到空，两次不同轮次的写入都记成 turn(1)。补 `sessionEventsOf` 同款兼容读取（ownEvents() 优先、events 回落）；事件流不可读时不追加事件（宁可没数据不可错数），写入不受影响。
+
 ## v0.31.1 (2026-10-22)
 
 ### 修复：0.2.x 上旧格式轮次的折叠/注入横条全缺（#53/#58/#72）

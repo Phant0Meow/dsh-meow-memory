@@ -231,6 +231,10 @@ const config = z.object({
   hitTopK: z.number().min(0).max(10).default(2),
   /** 导引标题截断长度。 */
   titleMax: z.number().min(10).max(200).default(40),
+  /** 首轮画像条数上限（soul+user 合并池按 importance 降序、同重要性按更新时间新→旧
+   *  截 top N；0=全量默认，现状不变）。只作用于画像层：rules 区不受影响（已有
+   *  全局+importance≥2 双门槛）。被截条目仍可用 memory_search 显式 level 检索。 */
+  profileMax: z.number().min(0).max(500).default(0),
   /** 是否在 ReAct 任务结束后自动注入反思。 */
   reflect: z.boolean().default(true),
   /** 单任务内连续工具 step 达到该值才在结束时触发反思（用户拍板：react ≥7 轮）。 */
@@ -270,6 +274,15 @@ const config = z.object({
   /** 记忆库自动备份（#37，默认关）：每次 dream 收尾把 memory.db 快照轮转到
    *  memory.db.bak（VACUUM INTO 一致性备份，mtime 判增量）。注册期消费，改动需重载。 */
   backup: z
+    .object({
+      enabled: z.boolean().default(false),
+    })
+    .default({}),
+  /** 隐私倾向（默认关=记忆如实记录）：开启后在 memory_remember / memory_update 的
+   *  工具描述中追加红线句，要求模型不记录密钥/Token 等敏感信息原文。prompt 级约束
+   *  （模型可能不听、认不出的凭据形态照样漏），不是写入闸门——取舍由设置页 hint 向
+   *  用户说明。注册期消费，改动需重载。 */
+  privacy: z
     .object({
       enabled: z.boolean().default(false),
     })
@@ -333,6 +346,7 @@ export function validateConfigUserLayer(value: unknown): void {
   reqStr('homeDir')
   reqNum('hitTopK')
   reqNum('titleMax')
+  reqNum('profileMax')
   reqBool('reflect')
   reqNum('reflectTurns')
   reqBool('autoMigrate')
@@ -367,6 +381,12 @@ export function validateConfigUserLayer(value: unknown): void {
     if (ddg.model !== undefined && typeof ddg.model !== 'string') throw new Error('delegate.model 必须是字符串')
     // #98：effort 控制 delegate 轮的 reasoningEffort——''（默认）/ 'inherit' / 任意非空值原样下发
     if (ddg.effort !== undefined && typeof ddg.effort !== 'string') throw new Error('delegate.effort 必须是字符串')
+  }
+  const pv = v.privacy
+  if (pv !== undefined) {
+    if (pv === null || typeof pv !== 'object' || Array.isArray(pv)) throw new Error('privacy 必须是对象')
+    const pvp = pv as Record<string, unknown>
+    if (pvp.enabled !== undefined && typeof pvp.enabled !== 'boolean') throw new Error('privacy.enabled 必须是布尔值')
   }
   if (v.projectDir !== undefined) {
     if (v.projectDir === null || typeof v.projectDir !== 'string') throw new Error('projectDir 必须是字符串')
@@ -429,6 +449,8 @@ interface ResolvedConfig {
   homeDir: string | undefined
   hitTopK: number
   titleMax: number
+  /** 首轮画像条数上限（soul+user 合并池截 top N；0=全量）。注入期消费（首轮+重注入）。 */
+  profileMax: number
   reflect: boolean
   reflectTurns: number
   autoMigrate: boolean
@@ -438,6 +460,8 @@ interface ResolvedConfig {
   delegate: { modelSpec: AgentOptionsSpec | undefined; effort: string | undefined }
   /** 记忆库自动备份（#37）：注册期消费（dream 收尾信号侧）。 */
   backup: { enabled: boolean }
+  /** 隐私倾向：注册期消费（工具描述拼接）。 */
+  privacy: { enabled: boolean }
   /** 工作区停用名单（#28）：原样保留，判定时路径归一。 */
   disabledWorkspaces: string[]
 }
@@ -447,12 +471,17 @@ function resolveConfig(config: unknown): ResolvedConfig {
   const d = (c.dream ?? {}) as Partial<DreamConfig>
   const dg = (c.delegate ?? {}) as { reflect?: boolean; model?: string; effort?: string }
   const bk = (c.backup ?? {}) as { enabled?: boolean }
+  const pv = (c.privacy ?? {}) as { enabled?: boolean }
   return {
     enabled: c.enabled ?? true,
     projectDir: c.projectDir ?? '.dsh-meow',
     homeDir: typeof c.homeDir === 'string' ? c.homeDir : undefined,
     hitTopK: c.hitTopK ?? 2,
     titleMax: c.titleMax ?? 40,
+    // 手编 settings.yaml 不经 zod/设置页校验——这里兜底防御（非有限数字/负数回落全量）。
+    profileMax: typeof c.profileMax === 'number' && Number.isFinite(c.profileMax)
+      ? Math.max(0, Math.round(c.profileMax))
+      : 0,
     reflect: c.reflect ?? true,
     reflectTurns: c.reflectTurns ?? 7,
     autoMigrate: c.autoMigrate ?? true,
@@ -481,6 +510,9 @@ function resolveConfig(config: unknown): ResolvedConfig {
       : [],
     backup: {
       enabled: bk.enabled ?? false,
+    },
+    privacy: {
+      enabled: pv.enabled ?? false,
     },
   }
 }
@@ -1244,7 +1276,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   registerMemoryTools((t) => {
     const dispose = ctx.tools.register(t)
     if (typeof dispose === 'function') toolDisposers.push(dispose)
-  }, resolved.projectDir)
+  }, resolved.projectDir, { privacy: resolved.privacy.enabled })
   // 会话列表"已 dream"小月牙信号（用户拍板 2026-08-19）：dream 开始推 dreaming、
   // 完成推 dreamed、有新活动推 active。
   const broadcast = new DreamStateBroadcast(ctx.logger)
@@ -1513,6 +1545,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       const reinj = buildReinjection(db, ws, sid, readProjectQueried(ws, sid, resolved.projectDir), {
         hitTopK: resolved.hitTopK,
         titleMax: resolved.titleMax,
+        profileMax: resolved.profileMax,
       }, resolved.projectDir)
       clearReinjectPending(ws, sid, resolved.projectDir)
       if (reinj !== null) {
@@ -1553,6 +1586,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           const injected = buildInjection(db, ws, sid, firstText, {
             hitTopK: resolved.hitTopK,
             titleMax: resolved.titleMax,
+            profileMax: resolved.profileMax,
           }, resolved.projectDir)
           if (injected) {
             const rewritten = [...decision.messages]

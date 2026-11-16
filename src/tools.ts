@@ -14,9 +14,26 @@ import { findSimilar, search, tokenize, type RankedHit } from './bm25.js'
 import { getDb, getDreamWorkspace, globalProjectMarker, isGlobalProject, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
 import { fillTemplate, keyedValue } from './prompt-loader.js'
 import { activeHomeDir, homeDirPresets, resolveHomeDir, switchHomeDir } from './home-dir.js'
+import { REFLECT_MARKER } from './reflect.js'
+import { DREAM_MARKER } from './dream.js'
 
 /** tools.md 键值取用（prompt 文案外置 v0.19.0）：缺键时 keyedValue throw。 */
 const T = (key: string): string => keyedValue('tools', key)
+/**
+ * 隐私倾向红线句（privacy.enabled=true 时拼进 memory_remember / memory_update 描述）：
+ * 要求模型不把密钥/Token 等敏感信息原文写进记忆。这是 prompt 级约束（模型可能不听、
+ * 认不出的凭据形态照样漏），不是写入闸门——产品取舍（默认全记 + 用户可开）由设置页
+ * hint 向用户说明。文案外置但单独 try/catch：实例 prompts 覆盖层可能是老版本、没有
+ * privacy.line 键（keyedValue 缺键 throw）——回退空串，绝不因文案缺失炸掉工具注册。
+ */
+function privacySuffix(privacy: boolean): string {
+  if (!privacy) return ''
+  try {
+    return `\n${keyedValue('tools', 'privacy.line')}`
+  } catch {
+    return ''
+  }
+}
 /** 框架词/报错文案（labels.md）：与工具描述同源，随语言包走。 */
 const L = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
 import { buildProjectSectionText, markProjectQueried, markWritten, readSeen, markAccessed, markSearched, setCurrentProject } from './inject.js'
@@ -188,10 +205,102 @@ export function similarity(a: string, b: string): number {
 
 const DEDUP_THRESHOLD = 0.8
 
-function rememberTool(dir: string): ToolDefinition {
+// ── editHistory_infoFrom（建议三：编辑史/出处审计列）────────────────────────────
+// 每次落库写入追加一条事件，分号分隔；列由 db.upgrade 补列、老数据 null。格式：
+//   场景-动作-会话短id-turn(n)        —— 随手记：写入在第 n 轮，出处=第 n 轮本身
+//   场景-动作-会话短id-turnRange(a,b) —— 反思/整理：写入在第 b 轮，素材=第 a..b-1 轮
+//   （b=处理轮本身，含头不含尾；a=上次同类标记所在轮+1，无标记=1）
+// 场景由当前轮内的插件标记消息判定（[meow-memory-reflect] / [meow-memory-dream]；
+// steer 指令帧无 source 字段，按标记文本匹配）。都不匹配=jot。事件流经
+// sessionEventsForEdit 兼容读取（ownEvents() 优先，宿主差异见函数注释）。会话短 id=剥 "session-" 前缀取前 8 位（dream 日志
+// shortSessionId 同款惯例；uuid 首段纯十六进制，不会吃进分隔符）。每个事件自带头部
+// 会话 id——跨会话编辑同一条记忆时出处不指错日志。拿不到坐标（无会话）不追加、
+// 绝不影响写入；cap 10，出生事件永远保留。
+
+/** 会话日志事件的最小形状（只认 type/user 文本，其他事件原样跳过）。 */
+type EditEvent = { type?: string; data?: { content?: Array<{ type?: string; text?: string }> } }
+
+/** user/message 事件的可见文本（steer 指令帧无 source，按标记文本判定）。 */
+function editUserTextOf(e: EditEvent): string {
+  const content = e.data?.content
+  if (!Array.isArray(content)) return ''
+  return content.map((b) => (b?.type === 'text' && typeof b.text === 'string' ? b.text : '')).join(' ')
+}
+
+/** 会话事件兼容读取（与 index.ts sessionEventsOf 同款语义，复制于此避免循环导入）：
+ *  部分宿主（0.1.7 rc.2 桌面版实测）的 agent.session 暴露 ownEvents() 方法而非
+ *  events 数组——直连 .events 会拿到空，轮次计数/场景判定全部失效（2026-11-16
+ *  桌面版实测教训：两次不同轮次的 update 都记成 turn(1)）。 */
+function sessionEventsForEdit(session: { events?: unknown; ownEvents?: unknown } | undefined | null): EditEvent[] {
+  const own = (session as { ownEvents?: unknown } | undefined)?.ownEvents
+  if (typeof own === 'function') {
+    const evs = (own as () => unknown).call(session)
+    if (Array.isArray(evs)) return evs as EditEvent[]
+  }
+  const evs = (session as { events?: unknown } | undefined)?.events
+  return Array.isArray(evs) ? (evs as EditEvent[]) : []
+}
+
+/** 会话短 id：剥 "session-" 前缀取前 8 位（与 dream 日志 shortSessionId 同款语义）。 */
+function editShortIdOf(sid: string): string {
+  return (sid.startsWith('session-') ? sid.slice(8) : sid).slice(0, 8)
+}
+
+/** 写入事件坐标：轮次自 session.events 数 turn/start；场景由当前轮内的标记消息判定；
+ *  reflect/dream 场景再扫当前轮之前的日志取上次同类标记所在轮（+1=素材起点）。
+ *  会话取 exec.agent.session.header.id（实际执行写入的会话，子代理=子代理自己的会话），
+ *  不用 sessionIdOf（它按既定惯例把子代理归属父窗口，那是 source_session 的语义）。 */
+function editContextOf(exec: ToolRunContext): { shortId: string; turn: number; fromTurn: number | null; scenario: 'jot' | 'reflect' | 'dream' } | null {
+  const header = (exec.agent as { session?: { header?: { id?: unknown } } } | undefined)?.session?.header
+  const sid = typeof header?.id === 'string' && header.id.length > 0 ? header.id : null
+  if (sid === null) return null
+  const events = sessionEventsForEdit((exec.agent as { session?: { events?: unknown; ownEvents?: unknown } }).session)
+  if (events.length === 0) return null // 事件流不可读 → 不追加（宁可没数据，不可错数；写入不受影响）
+  let turn = 0
+  let turnStartIdx = -1
+  for (let i = 0; i < events.length; i++) {
+    if (events[i]?.type === 'turn/start') { turn++; turnStartIdx = i }
+  }
+  // 场景：当前轮（最后一个 turn/start 之后）内的插件标记消息（dream 多组 steer 同轮）
+  let scenario: 'jot' | 'reflect' | 'dream' = 'jot'
+  for (let i = turnStartIdx + 1; i < events.length; i++) {
+    const text = editUserTextOf(events[i])
+    if (text.includes(DREAM_MARKER)) { scenario = 'dream'; break }
+    if (text.includes(REFLECT_MARKER)) { scenario = 'reflect'; break }
+  }
+  // reflect/dream 场景：素材起点 = 上次同类标记所在轮 + 1（无标记=1；含头不含尾）
+  let fromTurn: number | null = null
+  if (scenario !== 'jot') {
+    const marker = scenario === 'dream' ? DREAM_MARKER : REFLECT_MARKER
+    let markerTurn = 0
+    let t = 0
+    for (let i = 0; i < turnStartIdx; i++) {
+      if (events[i]?.type === 'turn/start') { t++ }
+      else if (editUserTextOf(events[i]).includes(marker)) markerTurn = t
+    }
+    fromTurn = markerTurn + 1
+  }
+  return { shortId: editShortIdOf(sid), turn: turn > 0 ? turn : 1, fromTurn, scenario }
+}
+
+/** 事件串：场景-动作-会话短id-位置。 */
+function editEventOf(ctx: NonNullable<ReturnType<typeof editContextOf>>, action: 'remember' | 'update' | 'archive' | 'stale'): string {
+  const loc = ctx.fromTurn !== null ? `turnRange(${ctx.fromTurn},${ctx.turn})` : `turn(${ctx.turn})`
+  return `${ctx.scenario}-${action}-${ctx.shortId}-${loc}`
+}
+
+/** 追加事件并 cap：超过 10 条时保留第 0 条（出生事件）+ 最近 9 条。 */
+function appendEditEvent(existing: string | null | undefined, event: string): string {
+  const events = typeof existing === 'string' && existing.trim().length > 0 ? existing.split('; ') : []
+  events.push(event)
+  if (events.length > 10) return [events[0], ...events.slice(-9)].join('; ')
+  return events.join('; ')
+}
+
+function rememberTool(dir: string, privacy: boolean): ToolDefinition {
   return {
     name: 'memory_remember',
-    description: T('memory_remember.description'),
+    description: T('memory_remember.description') + privacySuffix(privacy),
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -279,6 +388,7 @@ function rememberTool(dir: string): ToolDefinition {
       // 去重：同 level 找相似条目 → 合并更新。只认 active（#99）：archived/stale 是
       // 被 dream/用户有意降档的条目，新内容合进去会继承隐藏状态、注入检索都不可见
       // （=新记忆被吞）；想复活归档条目走 memory_update 显式操作。
+      const editCtx = editContextOf(exec)
       const existing = db.list(level, { status: 'active' })
       let merged: MemoryRow | undefined
       for (const r of existing) {
@@ -297,6 +407,8 @@ function rememberTool(dir: string): ToolDefinition {
         if (goal && level === 'topic') patch.goal = goal
         if (level === 'lesson' && corrected) patch.corrected = 1
         patch.keywords = keywords // 显式关键词才覆盖合并目标（能走到这里说明关键词非空）
+        // editHistory（建议三）：合并=内容被本会话本轮的话改写，出处事件追加进历史
+        if (editCtx) patch.editHistory = appendEditEvent(merged.editHistory_infoFrom, editEventOf(editCtx, 'remember'))
         db.update(level, merged.id, patch)
         // 写痕迹（v0.23.0）：合并落库也记入 written——压缩重注入第三块回放本会话写过的记忆。
         markWritten(workspace, source_session ?? 'unknown', [merged.id], dir)
@@ -322,6 +434,8 @@ function rememberTool(dir: string): ToolDefinition {
         corrected,
         keywords,
         source_session,
+        // editHistory（建议三）：出生事件（拿不到坐标则整列 null）
+        ...(editCtx ? { editHistory_infoFrom: editEventOf(editCtx, 'remember') } : {}),
       })
       // 写痕迹（v0.23.0）：新建落库记入 written——压缩重注入第三块回放本会话写过的记忆。
       markWritten(workspace, source_session ?? 'unknown', [row.id], dir)
@@ -661,15 +775,17 @@ function readTool(dir: string): ToolDefinition {
           corrected: { type: 'boolean' },
           created_at: { type: 'number' },
           updated_at: { type: 'number' },
+          editHistory_infoFrom: { type: 'string' },
         },
       },
       render: (_args, value) => {
-        const v = value as { found?: boolean; level?: unknown; title?: unknown; content?: unknown; status?: unknown; project?: unknown; goal?: unknown }
+        const v = value as { found?: boolean; level?: unknown; title?: unknown; content?: unknown; status?: unknown; project?: unknown; goal?: unknown; editHistory_infoFrom?: unknown }
         const hint = '如果你确实需要更多细节，可以直接去聊天记录里搜索相关关键词。'
         if (!v.found) return [{ type: 'text' as const, text: `未找到该记忆。${hint}` }]
         const parts = [`[${String(v.level ?? '')}] ${String(v.title ?? '')}（${String(v.status ?? '')}）`]
         if (v.project) parts.push(`项目：${String(v.project)}`)
         if (v.goal) parts.push(`目标：${String(v.goal)}`)
+        if (typeof v.editHistory_infoFrom === 'string' && v.editHistory_infoFrom.length > 0) parts.push(`editHistory: ${v.editHistory_infoFrom}`)
         parts.push(String(v.content ?? ''))
         parts.push(hint)
         return [{ type: 'text' as const, text: parts.join('\n') }]
@@ -701,6 +817,7 @@ function readTool(dir: string): ToolDefinition {
         corrected: row.corrected === 1,
         created_at: row.created_at,
         updated_at: row.updated_at,
+        ...(row.editHistory_infoFrom ? { editHistory_infoFrom: row.editHistory_infoFrom } : {}),
       }
     },
     presentCall(args: unknown): { card: 'generic'; title: string; kind: 'read' } {
@@ -710,10 +827,10 @@ function readTool(dir: string): ToolDefinition {
   }
 }
 
-function updateTool(dir: string): ToolDefinition {
+function updateTool(dir: string, privacy: boolean): ToolDefinition {
   return {
     name: 'memory_update',
-    description: T('memory_update.description'),
+    description: T('memory_update.description') + privacySuffix(privacy),
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -781,6 +898,13 @@ function updateTool(dir: string): ToolDefinition {
         // 字符串形态经通道兜底归一后同样接受（issue #24）。
         const kw = normalizeKeywords(parsed.keywords)
         if (kw.length > 0) patch.keywords = kw
+      }
+      // editHistory（建议三）：patch 非空才追加事件；动作=status 变更（archive/stale）
+      // 或字段 patch（update），由 patch 内容判定；空 patch（"不更新"语义）无事件。
+      const editCtx = editContextOf(exec)
+      if (editCtx && Object.keys(patch).length > 0) {
+        const action = patch.status === 'archived' ? 'archive' : patch.status === 'stale' ? 'stale' : 'update'
+        patch.editHistory = appendEditEvent(found.row.editHistory_infoFrom, editEventOf(editCtx, action))
       }
       // 记忆时间戳 = 最后更新时间：db.update 内部自动刷新 updated_at（任何 update 都刷新）。
       // patch 为空（如只想传 keywords:[] 表达"不更新"）→ 视为调用成功、无字段变化。
@@ -914,13 +1038,17 @@ function homeTool(): ToolDefinition {
   }
 }
 
-export function registerMemoryTools(register: (t: ToolDefinition) => void, dir = '.dsh-meow'): void {
+export function registerMemoryTools(
+  register: (t: ToolDefinition) => void,
+  dir = '.dsh-meow',
+  opts: { privacy?: boolean } = {},
+): void {
   // 门控判定器经 setMemoryToolGate 注入（apply 期设置；工具工厂签名保持不变）。
-  register(rememberTool(dir))
+  register(rememberTool(dir, opts.privacy === true))
   register(searchTool(dir))
   register(findSimilarTool(dir))
   register(readTool(dir))
-  register(updateTool(dir))
+  register(updateTool(dir, opts.privacy === true))
   register(projectTool(dir))
   register(homeTool())
 }

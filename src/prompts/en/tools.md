@@ -72,3 +72,7 @@
 - memory_home.description: View or switch the meow-memory global data directory (where instance-level data such as logs and the dream window ledger lives; the memory store itself sits inside each project and is unaffected). Call without parameters to get the current directory and the real locations of the three presets; switching automatically moves the old directory contents over (same-disk move / cross-disk copy). After a cross-disk copy the old directory is kept, not deleted - remind the user to delete it manually once verified; if several dsh instances share one directory, remind the user to update them together. Call this when the user wants to move memory data or logs off the system drive or to another location. A switch persists across restarts via a pointer file at $DSH_HOME/storages/meow-memory-home.json.
 - memory_home.param.target: Target location. Either a preset marker: default = system user home (the default), dsh-storage = meow-memory folder under the DSH home's storages, plugin-root = storage folder next to the plugin itself; or an absolute path. Omit to view the current state without changing anything.
 - memory_home.out.note: View/switch result: the current or new directory, how many files were moved, and what to do with the old directory.
+
+### privacy
+
+- privacy.line: Privacy rule: content/keywords/goal must not contain raw secrets (API keys, tokens, passwords); when a memory would contain one, omit that part and keep the rest of the memory as usual.

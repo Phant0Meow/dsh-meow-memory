@@ -72,3 +72,7 @@
 - memory_home.description: 查看/切换 meow-memory 的全局数据目录（日志、梦境窗口账本等实例级数据的存放位置，记忆库本体在每个项目内、不受影响）。不带参数调用=返回当前目录与三个预设的实际位置；切换时会自动把旧目录内容整体搬过去（同盘为移动、跨盘为复制），跨盘复制时旧目录保留不删，需提醒用户确认后手动删除；若用户本机跑着多个 dsh 实例共享同一目录，请提醒它们应同步修改。当用户表示想把记忆数据/日志挪出 C 盘、换到别的盘或目录时调用。切换结果写在稳定位置指针（$DSH_HOME/storages/meow-memory-home.json），跨重启仍生效。
 - memory_home.param.target: 目标位置。三选一传预设标记：default=系统用户主目录（默认）、dsh-storage=DSH 根目录 storages 下的 meow-memory、plugin-root=插件本体根目录下的 storage；或传一个绝对路径。不传=只查看当前状态，不做任何修改。
 - memory_home.out.note: 切换/查看结果：当前或新的目录位置、搬移的文件数、旧目录的处置提示。
+
+### privacy
+
+- privacy.line: 隐私红线：content/keywords/goal 不得包含密钥、Token、密码等敏感信息原文；涉及时省略该部分、其余照常记录。

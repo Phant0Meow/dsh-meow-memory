@@ -144,6 +144,12 @@ export interface MemoryRow {
   created_at: number
   updated_at: number // 记忆时间戳 = 最后更新时间（dream 封存或 memory_update 刷新）
   last_accessed_at: number | null
+  /** 编辑史（建议三）：每次落库写入追加一条事件，分号分隔。格式
+   *  `场景-动作-会话短id-turn(n)`（随手记，出处=第 n 轮）或
+   *  `场景-动作-会话短id-turnRange(a,b)`（反思/整理，素材=a..b-1 轮，b=处理轮本身）。
+   *  场景 jot=随手记 / reflect=反思 / dream=整理；动作 remember/update/archive/stale。
+   *  只做审计展示，不参与任何运行时判定；cap 10 保第 0 条；老数据 null。 */
+  editHistory_infoFrom: string | null
 }
 
 export interface MemoryPatch {
@@ -156,6 +162,8 @@ export interface MemoryPatch {
   project?: string | null
   subcategory?: ProjectSubcategory | null
   goal?: string | null
+  /** editHistory_infoFrom 整列写入（追加+cap 由调用方用 appendEditEvent 算好再传）。 */
+  editHistory?: string
 }
 
 /** 时间前缀 id：base36(毫秒,9位) + '-' + 26 位随机 = 36 字符，id 排序 ≈ 创建顺序。 */
@@ -175,7 +183,8 @@ const COMMON_COLS = `
   hit_count INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  last_accessed_at INTEGER
+  last_accessed_at INTEGER,
+  editHistory_infoFrom TEXT
 `
 
 /** level → 建表语句（差异列按层特化）。表名来自 LEVELS 枚举，不拼外部输入。 */
@@ -296,6 +305,10 @@ export class MemoryDb {
       if (level === 'topic' && !cols.has('project')) {
         this.db.exec('ALTER TABLE topic ADD COLUMN project TEXT')
       }
+      // editHistory_infoFrom（建议三）：编辑史审计列，老库补列、存量行 null。
+      if (!cols.has('editHistory_infoFrom')) {
+        this.db.exec(`ALTER TABLE ${level} ADD COLUMN editHistory_infoFrom TEXT`)
+      }
       // 旧 UUID（不以 9 位时间前缀开头）→ 按 created_at 重写 id
       const legacy = this.p(`SELECT id FROM ${level}`).all() as Array<{ id: string }>
       for (const { id } of legacy) {
@@ -367,15 +380,16 @@ export class MemoryDb {
       created_at: row.created_at ?? now,
       updated_at: row.updated_at ?? now,
       last_accessed_at: row.last_accessed_at ?? null,
+      editHistory_infoFrom: row.editHistory_infoFrom ?? null,
     }
     this.db
       .prepare(
-        `INSERT INTO ${full.level} (id, title, content, importance, keywords, status, source_session, hit_count, created_at, updated_at, last_accessed_at
+        `INSERT INTO ${full.level} (id, title, content, importance, keywords, status, source_session, hit_count, created_at, updated_at, last_accessed_at, editHistory_infoFrom
           ${full.level === 'project' ? ', project, subcategory' : ''}
           ${full.level === 'fact' || full.level === 'lesson' || full.level === 'rules' ? ', project' : ''}
           ${full.level === 'lesson' ? ', corrected' : ''}
           ${full.level === 'topic' ? ', goal, project' : ''}
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
           ${full.level === 'project' ? ', ?, ?' : ''}
           ${full.level === 'fact' || full.level === 'lesson' || full.level === 'rules' ? ', ?' : ''}
           ${full.level === 'lesson' ? ', ?' : ''}
@@ -394,6 +408,7 @@ export class MemoryDb {
         full.created_at,
         full.updated_at,
         full.last_accessed_at,
+        full.editHistory_infoFrom,
         ...(full.level === 'project' ? [full.project ?? '', full.subcategory] : []),
         ...(full.level === 'fact' || full.level === 'lesson' || full.level === 'rules' ? [full.project] : []),
         ...(full.level === 'lesson' ? [full.corrected] : []),
@@ -401,7 +416,6 @@ export class MemoryDb {
       )
     return full
   }
-
   /** 跨表定位（UUID 全局唯一，扫描全部表）。id 支持 8 位前缀匹配
    *  （快照/检索结果给的是截断 id；前缀碰撞时取第一个）。 */
   findById(id: string): { row: MemoryRow; level: Level } | undefined {
@@ -446,6 +460,7 @@ export class MemoryDb {
     }
     if (patch.subcategory !== undefined && level === 'project') push('subcategory', patch.subcategory)
     if (patch.goal !== undefined && level === 'topic') push('goal', patch.goal)
+    if (patch.editHistory !== undefined) push('editHistory_infoFrom', patch.editHistory)
     if (patch.project !== undefined && level === 'topic') push('project', patch.project)
     if (sets.length === 0) return false
     push('updated_at', Date.now()) // 记忆时间戳 = 最后更新时间（任何 update 都刷新）
@@ -825,6 +840,7 @@ export class MemoryDb {
       created_at: Number(r.created_at),
       updated_at: Number(r.updated_at),
       last_accessed_at: r.last_accessed_at == null ? null : Number(r.last_accessed_at),
+      editHistory_infoFrom: r.editHistory_infoFrom == null ? null : String(r.editHistory_infoFrom),
     }
   }
 }

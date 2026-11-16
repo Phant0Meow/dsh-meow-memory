@@ -93,6 +93,7 @@ const FIELDS: GroupSpec[] = [
     fields: [
       { key: 'hitTopK', label: 'settings.field.hitTopK.label', type: 'num', hint: 'settings.field.hitTopK.hint' },
       { key: 'titleMax', label: 'settings.field.titleMax.label', type: 'num', hint: 'settings.field.titleMax.hint' },
+      { key: 'profileMax', label: 'settings.field.profileMax.label', type: 'num', hint: 'settings.field.profileMax.hint' },
     ],
   },
   {
@@ -100,6 +101,12 @@ const FIELDS: GroupSpec[] = [
     fields: [
       { key: 'reflect', label: 'settings.field.reflect.label', type: 'bool', hint: 'settings.field.reflect.hint' },
       { key: 'reflectTurns', label: 'settings.field.reflectTurns.label', type: 'num', hint: 'settings.field.reflectTurns.hint' },
+    ],
+  },
+  {
+    title: 'settings.group.privacy',
+    fields: [
+      { key: 'enabled', sub: 'privacy', label: 'settings.field.privacyEnabled.label', type: 'bool', hint: 'settings.field.privacyEnabled.hint' },
     ],
   },
   {

@@ -223,6 +223,25 @@ check('update by prefix', db.update('topic', topicId.slice(0, 8), { status: 'act
   rmSync(wsT, { recursive: true, force: true })
 }
 
+// ── 隐私倾向：privacy.enabled=true 时 memory_remember / memory_update 描述追加红线句；
+//    默认（false/不传 opts）不追加，描述与既有行为逐字节一致 ──
+{
+  const mod = await import('./lib/index.js')
+  const withPrivacy = []
+  mod.registerMemoryTools((t) => withPrivacy.push(t), '.dsh-meow', { privacy: true })
+  const rememberOn = withPrivacy.find((t) => t.name === 'memory_remember')
+  const updateOn = withPrivacy.find((t) => t.name === 'memory_update')
+  const redLine = String(rememberOn?.description ?? '').includes('隐私红线')
+  check('privacy: on → remember 描述含红线句', redLine)
+  check('privacy: on → update 描述含红线句', String(updateOn?.description ?? '').includes('隐私红线'))
+  check('privacy: on → 红线句为独立一行（描述尾部 \\n 拼接）', String(rememberOn?.description ?? '').endsWith('其余照常记录。') && String(rememberOn?.description ?? '').includes('\n隐私红线'))
+  const without = []
+  mod.registerMemoryTools((t) => without.push(t), '.dsh-meow')
+  const rememberOff = without.find((t) => t.name === 'memory_remember')
+  check('privacy: off（默认）→ 描述不含红线句', !String(rememberOff?.description ?? '').includes('隐私红线'))
+  check('privacy: off → 工具注册数不变（opts 兼容旧两参调用）', without.length === 7)
+}
+
 // ── dream v2 数据层：时间前缀 id / 新列 / status 检索语义 / windows ────────
 check('newId time-prefixed', /^[0-9a-z]{9}-/.test(newId()) && newId().length === 36)
 const early = newId(Date.now() - 1000)
@@ -1246,6 +1265,126 @@ check('reflect no topic rules (topic moved to dream)', !txt.includes('目标句'
 const ws4 = mkdtempSync(join(tmpdir(), 'mm-empty-'))
 const db4 = new MemoryDb(memoryDbPath(ws4))
 check('no memory → null', buildInjection(db4, ws4, 'x', 'hi') === null)
+
+// ── profileMax：首轮画像条数上限（soul+user 合并 importance→updated_at→created_at 降序
+//    截 top N；rules 区不受影响；被截条目不记 injected；重注入同策略）──
+{
+  const wsP = mkdtempSync(join(tmpdir(), 'mm-profilemax-'))
+  const dbP = new MemoryDb(memoryDbPath(wsP))
+  dbP.insert({ level: 'rules', content: '全局准则（imp2）', project: '全局', importance: 2, created_at: 1000, updated_at: 1000 })
+  const u3 = dbP.insert({ level: 'user', content: 'U-imp3', importance: 3, created_at: 2000, updated_at: 2000 })
+  dbP.insert({ level: 'user', content: 'U-imp2-new', importance: 2, created_at: 4000, updated_at: 4000 })
+  dbP.insert({ level: 'user', content: 'U-imp2-old', importance: 2, created_at: 3000, updated_at: 3000 })
+  dbP.insert({ level: 'user', content: 'U-imp1', importance: 1, created_at: 5000, updated_at: 5000 })
+  const s4 = dbP.insert({ level: 'soul', content: 'S-imp4', importance: 4, created_at: 6000, updated_at: 6000 })
+  const s3 = dbP.insert({ level: 'soul', content: 'S-imp3-new', importance: 3, created_at: 7000, updated_at: 7000 })
+  // 合并排序：S-imp4 → U-imp3 → S-imp3-new → U-imp2-new → U-imp2-old → U-imp1
+  const cap3 = buildInjection(dbP, wsP, 's-pm', 'hi', { profileMax: 3 }, '.dsh-meow')
+  check('profileMax: capped injection produced', cap3 !== null)
+  if (cap3) {
+    check('profileMax: keeps top-3 by importance', cap3.text.includes('S-imp4') && cap3.text.includes('U-imp3') && cap3.text.includes('S-imp3-new'))
+    check('profileMax: trims the rest', !cap3.text.includes('U-imp2-new') && !cap3.text.includes('U-imp2-old') && !cap3.text.includes('U-imp1'))
+    check('profileMax: rules section unaffected', cap3.text.includes('全局准则（imp2）'))
+    check('profileMax: injectedIds = survivors + rules only', cap3.injectedIds.length === 4 && cap3.injectedIds.includes(s4.id) && cap3.injectedIds.includes(u3.id) && cap3.injectedIds.includes(s3.id) && !cap3.injectedIds.includes(dbP.list('user').find((r) => r.content === 'U-imp2-new')?.id ?? ''))
+  }
+  // 同重要性 updated_at 新→旧：cap=4 时第 4 名是 U-imp2-new（比 U-imp2-old 新），U-imp2-old 被截
+  const cap4 = buildInjection(dbP, wsP, 's-pm4', 'hi', { profileMax: 4 }, '.dsh-meow')
+  check('profileMax: tie broken by updated_at desc', cap4 !== null && cap4.text.includes('U-imp2-new') && !cap4.text.includes('U-imp2-old') && !cap4.text.includes('U-imp1'))
+  // 默认（不传 opts → profileMax=0）= 全量：六条画像 + 准则全在
+  const full = buildInjection(dbP, wsP, 's-pmfull', 'hi', {}, '.dsh-meow')
+  check('profileMax: default (0) injects all', full !== null && full.text.includes('U-imp1') && full.text.includes('S-imp4'))
+  // 重注入共用 buildInjectionBody：同策略
+  const reinj = buildReinjection(dbP, wsP, 's-pmr', [], { profileMax: 3 }, '.dsh-meow')
+  check('profileMax: reinjection shares the cap', reinj !== null && reinj.text.includes('S-imp4') && !reinj.text.includes('U-imp1'))
+  dbP.close()
+  rmSync(wsP, { recursive: true, force: true })
+}
+
+// ── editHistory_infoFrom（建议三）：编辑史/出处审计列 ──
+{
+  const wsE = mkdtempSync(join(tmpdir(), 'mm-edithist-'))
+  const dbE = new MemoryDb(memoryDbPath(wsE))
+  const modE = await import('./lib/index.js')
+  const registered = []
+  modE.registerMemoryTools((t) => registered.push(t), '.dsh-meow')
+  const byNameE = Object.fromEntries(registered.map((t) => [t.name, t]))
+  const sid = 'session-abcdef12-3333-4444-5555-666666666666'
+  const events = []
+  const pushTurn = (...texts) => {
+    events.push({ type: 'turn/start' })
+    for (const t of texts) events.push({ type: 'user/message', data: { content: [{ type: 'text', text: t }] } })
+  }
+  const execE = () => ({ agent: { session: { header: { id: sid, cwd: wsE }, events } } })
+  const remember = async (content) => byNameE.memory_remember.execute({ content, project: 'p', keywords: ['k'], importance: 2 }, execE())
+
+  // 第 1 轮随手新建
+  pushTurn('你好，记一下：部署端口 3081')
+  const r1 = await remember('部署端口是 3081')
+  check('editHistory: jot create turn(1)', dbE.findById(r1.id).row.editHistory_infoFrom === 'jot-remember-abcdef12-turn(1)', dbE.findById(r1.id).row.editHistory_infoFrom)
+
+  // 第 2 轮随手新建另一条
+  pushTurn('再来一条')
+  const r2 = await remember('猫猫的测试机是 iPhone 12')
+  check('editHistory: jot create turn(2)', dbE.findById(r2.id).row.editHistory_infoFrom === 'jot-remember-abcdef12-turn(2)', dbE.findById(r2.id).row.editHistory_infoFrom)
+
+  // 第 3 轮合并（同内容重写）→ 历史两事件
+  pushTurn('补充说明')
+  const r3 = await remember('部署端口是 3081')
+  check('editHistory: remember merge appends', r3.merged === true && dbE.findById(r1.id).row.editHistory_infoFrom === 'jot-remember-abcdef12-turn(1); jot-remember-abcdef12-turn(3)', dbE.findById(r1.id).row.editHistory_infoFrom)
+
+  // 第 4 轮反思新建（无前序 reflect 标记 → 素材起点 1）
+  pushTurn('[meow-memory-reflect] 反思任务')
+  const r4 = await remember('用户偏好简短回复')
+  check('editHistory: reflect create without prev marker', dbE.findById(r4.id).row.editHistory_infoFrom === 'reflect-remember-abcdef12-turnRange(1,4)', dbE.findById(r4.id).row.editHistory_infoFrom)
+
+  // 第 6 轮 dream 归档（无前序 dream 标记 → 素材起点 1；轮 5 为正常轮）
+  pushTurn('正常对话')
+  pushTurn('[meow-memory-dream] 整理任务')
+  const r5 = await byNameE.memory_update.execute({ id: r2.id, status: 'archived' }, execE())
+  check('editHistory: dream archive turnRange', r5.ok === true && dbE.findById(r2.id).row.editHistory_infoFrom === 'jot-remember-abcdef12-turn(2); dream-archive-abcdef12-turnRange(1,6)', dbE.findById(r2.id).row.editHistory_infoFrom)
+
+  // 第 7 轮 update 字段 patch → jot-update
+  pushTurn('再改一下')
+  const r6 = await byNameE.memory_update.execute({ id: r4.id, importance: 3 }, execE())
+  check('editHistory: jot update appends', dbE.findById(r4.id).row.editHistory_infoFrom === 'reflect-remember-abcdef12-turnRange(1,4); jot-update-abcdef12-turn(7)', dbE.findById(r4.id).row.editHistory_infoFrom)
+
+  // cap：对 r1 追加到第 12 事件 → 保留出生事件 + 最近 9 条
+  for (let i = 8; i <= 18; i++) {
+    pushTurn(`批量微调 ${i}`)
+    await byNameE.memory_update.execute({ id: r1.id, importance: 3 }, execE())
+  }
+  const hist1 = dbE.findById(r1.id).row.editHistory_infoFrom
+  check('editHistory: cap keeps first + last 9', hist1.startsWith('jot-remember-abcdef12-turn(1); ') && hist1.endsWith('jot-update-abcdef12-turn(18)') && hist1.split('; ').length === 10, hist1)
+
+  // 无会话 id → 不追加、写入成功
+  const rN = await byNameE.memory_remember.execute({ content: '无坐标条目', project: 'p', keywords: ['k'], importance: 1 }, { agent: { session: { header: { cwd: wsE } } } })
+  check('editHistory: no session → null + write ok', rN.ok === true && dbE.findById(rN.id).row.editHistory_infoFrom === null)
+
+  // memory_read 返回字段
+  const read = await byNameE.memory_read.execute({ id: r1.id }, execE())
+  check('editHistory: memory_read returns field', typeof read.editHistory_infoFrom === 'string' && read.editHistory_infoFrom.startsWith('jot-remember-abcdef12-turn(1); '), read.editHistory_infoFrom)
+
+  // 宿主形态差异：rc.2 桌面版暴露 ownEvents() 而非 events 数组（2026-11-16 实测教训——
+  // 直连 .events 拿到空，两次不同轮次都记成 turn(1)）
+  const ownEventsSid = 'session-ownevents1-2222-3333-4444-555555555555'
+  const ownEventsArr = []
+  const pushOwnTurn = (...texts) => {
+    ownEventsArr.push({ type: 'turn/start' })
+    for (const t of texts) ownEventsArr.push({ type: 'user/message', data: { content: [{ type: 'text', text: t }] } })
+  }
+  pushOwnTurn('第一轮')
+  pushOwnTurn('第二轮')
+  const execOwn = () => ({ agent: { session: { header: { id: ownEventsSid, cwd: wsE }, ownEvents: () => ownEventsArr } } })
+  const rOwn = await byNameE.memory_remember.execute({ content: '宿主形态差异条目 own-events-tag', project: 'p', keywords: ['k'], importance: 2 }, execOwn())
+  check('editHistory: ownEvents() host shape counts turns', dbE.findById(rOwn.id).row.editHistory_infoFrom === 'jot-remember-ownevent-turn(2)', dbE.findById(rOwn.id).row.editHistory_infoFrom)
+  // 事件流完全不可读 → 不追加、写入成功（宁可没数据不可错数）
+  const rNoEv = await byNameE.memory_remember.execute({ content: '不可读形态条目 no-events-tag', project: 'p', keywords: ['k'], importance: 2 }, { agent: { session: { header: { id: 'session-noevents01-2222-3333-4444-555555555555', cwd: wsE } } } })
+  check('editHistory: unreadable events → no event, write ok', rNoEv.ok === true && dbE.findById(rNoEv.id).row.editHistory_infoFrom === null)
+
+  dbE.close()
+  closeAllDbs()
+  rmSync(wsE, { recursive: true, force: true })
+}
 
 // ═══════════════════════ 部分 2：apply 级 ═══════════════════════
 
