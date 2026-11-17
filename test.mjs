@@ -671,6 +671,22 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   await d106b.handlers['session/event']({ id: wid106, header: { cwd: ws106 } }, { type: 'turn/start', time: Date.now() })
   await d106b.handlers['session/event']({ id: wid106, header: { cwd: ws106 } }, { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'error', error: { code: 'OTHER', message: 'boom' } } } })
   check('#106 non-transport failure still counts', d106.getDreamLease(wid106) === null && d106.recordDreamFailure(wid106, 1000) === 2)
+  d106.clearDreamFailure(wid106)
+  // #118：egress fuse（billion-context ACP）= context-window 类 → 计入封存预算 + 日志，
+  // 不再「释放不计数」无限重试（#110 旧语义被 #118 实测证伪）
+  d106.claimDream(wid106, 'o-118', 1000, LEASE)
+  await d106b.handlers['session/event']({ id: wid106, header: { cwd: ws106 } }, { type: 'turn/start', time: Date.now() })
+  await d106b.handlers['session/event']({ id: wid106, header: { cwd: ws106 } }, { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'error', error: { code: 'INVALID_REQUEST', message: 'outbound body measures ~1,894,659 tokens ... the body ITSELF exceeds the window ... 错误码 egress_window_fuse' } } } })
+  check('#118 egress-fuse failure counts toward seal budget', d106.getDreamLease(wid106) === null && d106.recordDreamFailure(wid106, 1000) === 2)
+  d106.clearDreamFailure(wid106)
+  // #118：三次 egress-fuse 连续失败 → 止损封存（last_dream_time 落章）
+  d106.claimDream(wid106, 'o-118b', 1000, LEASE)
+  for (let i = 0; i < 3; i++) {
+    await d106b.handlers['session/event']({ id: wid106, header: { cwd: ws106 } }, { type: 'turn/start', time: Date.now() })
+    await d106b.handlers['session/event']({ id: wid106, header: { cwd: ws106 } }, { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'error', error: { code: 'INVALID_REQUEST', message: 'outbound body measures ... egress_window_fuse' } } } })
+    if (i < 2) d106.claimDream(wid106, 'o-118b', 1000, LEASE) // 每次失败后下个 sweep 重抢
+  }
+  check('#118 egress-fuse seals after 3 strikes (stop-loss)', d106.getWindow(wid106)?.last_dream_time !== null && d106.getDreamLease(wid106) === null, JSON.stringify(d106.getWindow(wid106)))
   d106.close()
   rmSync(ws106, { recursive: true, force: true })
 }
@@ -2632,7 +2648,8 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
   await applyGateOff(dCwCtx.ctx, { enabled: true, projectDir: '.dsh-meow' })
   await dCwCtx.handlers['session/event']({ id: widCw, header: { cwd: wsCw } }, { type: 'turn/start', time: Date.now() })
   await dCwCtx.handlers['session/event']({ id: widCw, header: { cwd: wsCw } }, { type: 'turn/end', time: Date.now(), data: { reason: { kind: 'error', error: { code: 'INVALID_REQUEST', message: '400: litellm.ContextWindowExceededError: prompt tokens exceed' } } } })
-  check('#110 context-window failure releases lease without burning budget', dCw.getDreamLease(widCw) === null && dCw.recordDreamFailure(widCw, 1000) === 1)
+  // 新语义：handler 已计入 1 次（旧语义释放不计数=0，#118 改为止损计数），探测调用返回 2
+  check('#110/#118 context-window failure counts toward seal budget (stop-loss replaces release-forever)', dCw.getDreamLease(widCw) === null && dCw.recordDreamFailure(widCw, 1000) === 2)
   dCw.close()
   rmSync(wsCw, { recursive: true, force: true })
 }

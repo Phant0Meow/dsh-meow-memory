@@ -173,6 +173,11 @@ Prompt copy is data (one directory per language under `src/prompts/`, hot-read a
 
 ---
 
+## Source-install pitfalls (no git / prepare needs node on PATH)
+
+- `pnpm add github:...` requires git on the machine (`git ls-remote`); without it pnpm fails with `ERR_PNPM_GIT_RESOLVE_FAILED` — download the source zip and build locally instead.
+- The `prepare` script invokes `node` by name: when the DSH-bundled Node is not on PATH, it fails with `'node' is not recognized` and pnpm exits 1 even though dependencies installed fine — run `node build.mjs` once with the absolute path to produce `lib/`.
+
 ## See also
 
 - [Tool reference](tool-reference.md) — the seven tools' parameters and returns

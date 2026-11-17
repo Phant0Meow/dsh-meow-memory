@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.33.1 (2026-11-18)
+
+### 修复：宿主会话事件流兼容 + 失败响一次（#117）
+
+- 0.2.x 宿主移除了 `session.events` getter；访问链硬化为 `snapshotEvents() → ownEvents() → events`（每步 try/catch，rc.3 拍板 API 优先，turn 计数跨 fork/恢复更准）。
+- #117 实测教训：静默失效只有查库才能发现——事件流不可读时每进程一次性 `console.warn` + 工作区 `.dsh-meow/edit-diag.log` 落一行 probe（agent/headerId/cwd/三访问器类型探针），宿主漂移从此可从日志直接定位。
+
+### 修复：dream 长会话委托 413 的止损与还原（#118）
+
+- 识别扩展：context-window 类失败新增 egress fuse 形态（`egress_window_fuse` / "body ITSELF exceeds" / "outbound body measures"，billion-context ACP 实测），与 litellm 的 `CONTEXT_WINDOW_EXCEEDED` 统一归为**持续性环境失败**。
+- 语义修正（推翻 #110 的「释放不计数」）：持续性环境失败计入封存预算（3 次止损封存）——#118 实测「释放不计数」= 每个 sweep 无限重试 + 会话卡死在 delegate 模型上；TRANSPORT/网络类维持「释放不计数」（真瞬态）。
+- 还原主模型：此类失败立即把会话从 delegate 路由 select 回主模型（新增 `restoreMainModelFor`，经 dream.ts 的 `getLiveAgent` 查 live agent）——不还原则后续普通轮全部 413（「会话原地卡死」根因）。
+
+### 修复：插件禁用→启用后工具重复注册（#116 Bug1）
+
+- 工具/路由/命令注销挂 `ctx.effect`（fiber dispose 必然解卷，super-injector 热重载契约）——`ctx.on('dispose')` 在 rc.3 plugin_manager 的 disable→enable 路径上不保证触发，实测禁用后工具残留注册、再启用撞 "already registered" 整插件 failed。`ctx.on('dispose')` 保留双保险（注销幂等）。
+- Bug2（memory_remember 报 TDZ）判定为 Bug1 半死状态的连锁（新旧作用域混杂），无独立复现路径，随 Bug1 修复请报告方复测。
+- 附：FAQ 补源码安装两坑（无 git 走 zip、DSH 内置 Node 不在 PATH 时手动 build）。
+
 ## v0.33.0 (2026-11-16)
 
 ### 新增：隐私倾向 privacy.enabled（大肥鱼三条建议 ①）

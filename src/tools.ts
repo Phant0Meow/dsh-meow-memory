@@ -9,7 +9,8 @@
  */
 
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { isAbsolute, resolve } from 'node:path'
+import { appendFileSync } from 'node:fs'
+import { isAbsolute, join, resolve } from 'node:path'
 import { findSimilar, search, tokenize, type RankedHit } from './bm25.js'
 import { getDb, getDreamWorkspace, globalProjectMarker, isGlobalProject, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
 import { fillTemplate, keyedValue } from './prompt-loader.js'
@@ -206,6 +207,8 @@ export function similarity(a: string, b: string): number {
 const DEDUP_THRESHOLD = 0.8
 
 // ── editHistory_infoFrom（建议三：编辑史/出处审计列）────────────────────────────
+// #117 诊断标志：事件流不可读时每进程只响一次（console.warn + edit-diag.log）。
+let editDiagLogged = false
 // 每次落库写入追加一条事件，分号分隔；列由 db.upgrade 补列、老数据 null。格式：
 //   场景-动作-会话短id-turn(n)        —— 随手记：写入在第 n 轮，出处=第 n 轮本身
 //   场景-动作-会话短id-turnRange(a,b) —— 反思/整理：写入在第 b 轮，素材=第 a..b-1 轮
@@ -227,18 +230,22 @@ function editUserTextOf(e: EditEvent): string {
   return content.map((b) => (b?.type === 'text' && typeof b.text === 'string' ? b.text : '')).join(' ')
 }
 
-/** 会话事件兼容读取（与 index.ts sessionEventsOf 同款语义，复制于此避免循环导入）：
- *  部分宿主（0.1.7 rc.2 桌面版实测）的 agent.session 暴露 ownEvents() 方法而非
- *  events 数组——直连 .events 会拿到空，轮次计数/场景判定全部失效（2026-11-16
- *  桌面版实测教训：两次不同轮次的 update 都记成 turn(1)）。 */
-function sessionEventsForEdit(session: { events?: unknown; ownEvents?: unknown } | undefined | null): EditEvent[] {
-  const own = (session as { ownEvents?: unknown } | undefined)?.ownEvents
-  if (typeof own === 'function') {
-    const evs = (own as () => unknown).call(session)
-    if (Array.isArray(evs)) return evs as EditEvent[]
+/** 会话事件兼容读取（rc.2/rc.3 内核包实测）：0.2.x 移除了 events getter，rc.3 拍板的
+ *  同步读 API 是 snapshotEvents()（全量含 seed，turn 计数跨 fork/恢复更正确），ownEvents()
+ *  已标废弃但仍在。访问链 snapshotEvents() → ownEvents() → events，每步 try/catch——
+ *  宿主 shim 可能抛、可能包一层代理。全部失败返回 []，由调用方决定降级（宁可没数据
+ *  不可错数，见 editContextOf）。 */
+function sessionEventsForEdit(session: { events?: unknown; ownEvents?: unknown; snapshotEvents?: unknown } | undefined | null): EditEvent[] {
+  const tryCall = (fn: unknown): unknown => {
+    try { return typeof fn === 'function' ? (fn as () => unknown).call(session) : undefined } catch { return undefined }
   }
+  const snap = tryCall((session as { snapshotEvents?: unknown } | undefined)?.snapshotEvents)
+  if (Array.isArray(snap) && snap.length > 0) return snap as EditEvent[]
+  const own = tryCall((session as { ownEvents?: unknown } | undefined)?.ownEvents)
+  if (Array.isArray(own) && own.length > 0) return own as EditEvent[]
   const evs = (session as { events?: unknown } | undefined)?.events
-  return Array.isArray(evs) ? (evs as EditEvent[]) : []
+  if (Array.isArray(evs) && evs.length > 0) return evs as EditEvent[]
+  return []
 }
 
 /** 会话短 id：剥 "session-" 前缀取前 8 位（与 dream 日志 shortSessionId 同款语义）。 */
@@ -250,12 +257,35 @@ function editShortIdOf(sid: string): string {
  *  reflect/dream 场景再扫当前轮之前的日志取上次同类标记所在轮（+1=素材起点）。
  *  会话取 exec.agent.session.header.id（实际执行写入的会话，子代理=子代理自己的会话），
  *  不用 sessionIdOf（它按既定惯例把子代理归属父窗口，那是 source_session 的语义）。 */
-function editContextOf(exec: ToolRunContext): { shortId: string; turn: number; fromTurn: number | null; scenario: 'jot' | 'reflect' | 'dream' } | null {
+function editContextOf(exec: ToolRunContext, workspace: string, dir: string): { shortId: string; turn: number; fromTurn: number | null; scenario: 'jot' | 'reflect' | 'dream' } | null {
   const header = (exec.agent as { session?: { header?: { id?: unknown } } } | undefined)?.session?.header
   const sid = typeof header?.id === 'string' && header.id.length > 0 ? header.id : null
   if (sid === null) return null
-  const events = sessionEventsForEdit((exec.agent as { session?: { events?: unknown; ownEvents?: unknown } }).session)
-  if (events.length === 0) return null // 事件流不可读 → 不追加（宁可没数据，不可错数；写入不受影响）
+  const events = sessionEventsForEdit((exec.agent as { session?: { events?: unknown; ownEvents?: unknown; snapshotEvents?: unknown } }).session)
+  if (events.length === 0) {
+    // 事件流不可读 → editHistory 停止记录（宁可没数据不可错数；写入不受影响）。
+    // #117 教训：静默失效只有查库才能发现——每进程一次性响诊断，带探针结果，
+    // 宿主漂移（shim 改形状/换会话实现）从此可从日志直接定位。
+    if (!editDiagLogged) {
+      editDiagLogged = true
+      const session = (exec.agent as { session?: Record<string, unknown> } | undefined)?.session
+      const probe = {
+        agent: exec.agent !== undefined,
+        session: session !== undefined,
+        headerId: typeof (session?.header as { id?: unknown } | undefined)?.id === 'string' ? 'string' : typeof session?.header?.id,
+        cwd: typeof session?.header?.cwd,
+        snapshotEvents: typeof session?.snapshotEvents,
+        ownEvents: typeof session?.ownEvents,
+        events: typeof session?.events,
+      }
+      const line = `[meow-memory] editHistory 停止记录：会话事件流不可读（每进程一次性诊断）probe=${JSON.stringify(probe)}`
+      console.warn(line)
+      try {
+        if (workspace) appendFileSync(join(workspace, dir, 'edit-diag.log'), `[${new Date().toISOString()}] ${line}\n`)
+      } catch { /* 日志失败不阻塞 */ }
+    }
+    return null
+  }
   let turn = 0
   let turnStartIdx = -1
   for (let i = 0; i < events.length; i++) {
@@ -388,7 +418,7 @@ function rememberTool(dir: string, privacy: boolean): ToolDefinition {
       // 去重：同 level 找相似条目 → 合并更新。只认 active（#99）：archived/stale 是
       // 被 dream/用户有意降档的条目，新内容合进去会继承隐藏状态、注入检索都不可见
       // （=新记忆被吞）；想复活归档条目走 memory_update 显式操作。
-      const editCtx = editContextOf(exec)
+      const editCtx = editContextOf(exec, workspace, dir)
       const existing = db.list(level, { status: 'active' })
       let merged: MemoryRow | undefined
       for (const r of existing) {
@@ -901,7 +931,7 @@ function updateTool(dir: string, privacy: boolean): ToolDefinition {
       }
       // editHistory（建议三）：patch 非空才追加事件；动作=status 变更（archive/stale）
       // 或字段 patch（update），由 patch 内容判定；空 patch（"不更新"语义）无事件。
-      const editCtx = editContextOf(exec)
+      const editCtx = editContextOf(exec, workspace, dir)
       if (editCtx && Object.keys(patch).length > 0) {
         const action = patch.status === 'archived' ? 'archive' : patch.status === 'stale' ? 'stale' : 'update'
         patch.editHistory = appendEditEvent(found.row.editHistory_infoFrom, editEventOf(editCtx, action))

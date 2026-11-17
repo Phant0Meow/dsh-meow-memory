@@ -240,6 +240,11 @@ export const DREAM_MAX_ATTEMPTS = 3
 
 const liveAgents = new Map<string, unknown>() // sessionId -> 顶层 agent（live 引用）
 
+/** 按 session id 取 live agent（#118：session/event 的 turn/end error 分支要用它还原
+ *  主模型——该监听器只拿得到 sid，拿不到 agent 对象）。 */
+export function getLiveAgent(sessionId: string): unknown {
+  return liveAgents.get(sessionId)
+}
 export function registerLiveAgent(agent: { session?: { header?: { id?: string; parentSession?: unknown } } }): void {
   const id = agent.session?.header?.id
   if (typeof id === 'string' && id.length > 0) liveAgents.set(id, agent)

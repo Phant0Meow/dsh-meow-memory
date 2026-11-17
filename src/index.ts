@@ -41,6 +41,7 @@ import {
   dreamTool,
   disposeDreamHeartbeats,
   handleMemoryTurnFailure,
+  getLiveAgent,
   noteActivity,
   registerLiveAgent,
   scheduleDream,
@@ -624,12 +625,37 @@ function userSelectedAfterOverride(events: readonly unknown[], route: ModelRoute
 
 /** 最近一个 turn/end 的 reason.kind（aborted/interrupted 表示用户停止，不反思不推进）。 */
 function lastTurnEndReason(events: readonly unknown[]): string | null {
-  for (let i = events.length - 1; i >= 0; i--) {
+  for (let i = events.length - 1; i >=0; i--) {
     const e = events[i] as { type?: string; data?: { reason?: { kind?: string } } }
     if (e?.type === 'turn/start') break
     if (e?.type === 'turn/end' && typeof e.data?.reason?.kind === 'string') return e.data.reason.kind
   }
   return null
+}
+
+/** 当前 turn 的 turn/end error 详情（code/message）。turn-stopping 事件不携带错误详情，
+ *  turn-stopping 的 dream error 分支要用它做 #118 分类（从日志回扫，同 lastTurnEndReason 口径）。 */
+function lastTurnErrorInfo(events: readonly unknown[]): { code: string; message: string } | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i] as { type?: string; data?: { reason?: { kind?: string; error?: { code?: unknown; message?: unknown } } } }
+    if (e?.type === 'turn/start') break
+    if (e?.type === 'turn/end' && e.data?.reason?.kind === 'error') {
+      return {
+        code: String(e.data.reason.error?.code ?? ''),
+        message: String(e.data.reason.error?.message ?? ''),
+      }
+    }
+  }
+  return null
+}
+
+/** #118：context-window / egress-fuse 类失败——delegate 小窗口模型 + 长会话的**确定性**
+ *  失败（重试必然复现）。形态：code=CONTEXT_WINDOW_EXCEEDED（litellm，#110），或文案
+ *  含 context window / egress_window_fuse / "the body ITSELF exceeds the window"
+ *  （billion-context ACP egress fuse，#118 实测）。 */
+function isContextWindowError(code: string, message: string): boolean {
+  return code === 'CONTEXT_WINDOW_EXCEEDED'
+    || /contextwindow|context window|egress_window_fuse|body itself exceeds|outbound body measures/i.test(message)
 }
 
 /** apply 包装：错误落盘（homedir/.dsh-meow/apply-error.log），排查 fiber 启动失败。 */
@@ -1427,16 +1453,24 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           // message 正则兜底老宿主可能不填 code 的形状。
           const errCode = String((event.data as { reason?: { error?: { code?: unknown } } })?.reason?.error?.code ?? '')
           const errMsg = String((event.data as { reason?: { error?: { message?: unknown } } })?.reason?.error?.message ?? '')
-          // #110 复测问题 2：delegate 到小 contextWindow 模型后长会话必然 400
-          // （litellm ContextWindowExceededError）——同样是环境性失败（会话大小 vs
-          // 目标模型窗口），烧封存预算无意义且重试必然复现。释放租约 + 一条可行动
-          // 的日志（跳过 delegate 或手动 /dream 换主模型跑）。
-          const contextWindowExceeded = errCode === 'CONTEXT_WINDOW_EXCEEDED' || /contextwindow|context window/i.test(errMsg)
-          if (errCode === 'TRANSPORT' || contextWindowExceeded || /transport|network|connection|ECONN/i.test(errMsg)) {
+          const cwFail = isContextWindowError(errCode, errMsg)
+          if (errCode === 'TRANSPORT' || (!cwFail && /transport|network|connection|ECONN/i.test(errMsg))) {
+            // TRANSPORT/网络类（#106）：瞬态——释放租约不计数，下个 sweep 自动重试
             try {
               getDb(cwd, resolved.projectDir).releaseDream(sid)
-              appendFileSync(join(cwd, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] dream ${contextWindowExceeded ? 'context-window-fail' : 'transport-fail'} sid=${shortSessionId(sid)} -> released (not counted, #106/#110)\n`)
+              appendFileSync(join(cwd, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] dream transport-fail sid=${shortSessionId(sid)} -> released (not counted, #106)\n`)
             } catch { /* 释放失败不阻塞 */ }
+            broadcast.broadcast(sid, 'active')
+          } else if (cwFail) {
+            // #118：context-window/egress-fuse = 持续性环境失败（重试必然复现）。
+            // #110 曾定「释放不计数」，#118 实测那是无限重试循环 + 会话卡死在 delegate
+            // 模型上——改为计入封存预算（DREAM_MAX_ATTEMPTS 次止损封存），并立即还原
+            // 主模型（不还原则普通轮全部 413，「原地卡死」）。
+            const restored = restoreMainModelFor(sid)
+            const outcome = handleMemoryTurnFailure(getDb(cwd, resolved.projectDir), sid, cwd, resolved.projectDir)
+            try {
+              appendFileSync(join(cwd, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] dream context-window-fail sid=${shortSessionId(sid)} restored=${restored} outcome=${outcome} (#118)\n`)
+            } catch { /* 日志失败不阻塞 */ }
             broadcast.broadcast(sid, 'active')
           } else {
             const outcome = handleMemoryTurnFailure(getDb(cwd, resolved.projectDir), sid, cwd, resolved.projectDir)
@@ -1732,9 +1766,17 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     }
     if (dreamTurn) {
       if (endReason === 'error') {
-        // steer 模式 dream 轮执行失败（LLM/网络瞬态故障，非用户中止）：释放租约不封存，
-        // 下个检查周期自动重试（与 delegate 路径 done 回调的 error 分支同语义，
-        // 2026-09-05 教训：封存会让一次断网永久吞掉窗口的 dream）。
+        // steer 模式 dream 轮执行失败，按错误类别分流（#118）：
+        // - TRANSPORT/网络类 = 瞬态：释放租约不计数，下个 sweep 自动重试（#106，
+        //   2026-09-05 教训：断网封存会让一次故障永久吞掉窗口的 dream）；
+        // - context-window/egress-fuse 类 = 持续性环境失败：计入封存预算（3 次止损），
+        //   与 session/event error 分支同口径——双路径谁先到谁计数，另一方租约已放
+        //   返回 'none'，恰好计一次。主模型还原在上方 #110 收尾块已完成。
+        const err = lastTurnErrorInfo(sessionEventsOf(agent.session))
+        if (wsTs && sidTs && err !== null && isContextWindowError(err.code, err.message)) {
+          try { handleMemoryTurnFailure(getDb(wsTs, resolved.projectDir), sidTs, wsTs, resolved.projectDir) } catch { /* 兜底 */ }
+          return
+        }
         try {
           if (wsTs && sidTs) getDb(wsTs, resolved.projectDir).releaseDream(sidTs)
         } catch { /* 释放失败不阻塞（租约 30min 过期自愈兜底） */ }
@@ -1830,6 +1872,30 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       if (oldest === undefined) break
       delegateRestore.delete(oldest)
     }
+  }
+  /** #118：把会话从 delegate 路由还原回主模型。session/event 的 turn/end error 分支用
+   *  ——turn-stopping 不发射（首步失败）或发射时错误详情不可达，会话被留在 delegate
+   *  模型上，后续普通轮同样 413（#118 实测「会话原地卡死」根因）。与 turnStoppingCore
+   *  的 #110 收尾还原同款守卫：current=delegate 路由才还原；用户轮内改选过则不动。 */
+  const restoreMainModelFor = (sid: string): boolean => {
+    const agent = getLiveAgent(sid) as { model?: { current?: () => ModelRoute | undefined; select?: (s: ModelRoute) => void } } | undefined
+    if (agent === undefined || typeof agent.model?.select !== 'function' || typeof agent.model?.current !== 'function') return false
+    try {
+      const remembered = delegateRestore.get(sid)
+      if (remembered === undefined) return false
+      const cur = mainRouteOf((agent.model as { current: () => ModelRoute | undefined }).current() ?? {})
+      if (cur.provider === remembered.route.provider && cur.model === remembered.route.model) {
+        ;(agent.model as { select: (s: ModelRoute) => void }).select({
+          provider: remembered.main.provider,
+          model: remembered.main.model,
+          ...(remembered.main.reasoningEffort === undefined ? {} : { reasoningEffort: remembered.main.reasoningEffort }),
+        })
+        delegateRestore.delete(sid)
+        ctx.logger.info(`meow-memory: restore main model ${remembered.main.provider}/${remembered.main.model} after memory-turn failure (#118)`)
+        return true
+      }
+      return false // cur ≠ delegate 路由 = 用户轮内改选过：不还原（#71 守卫同款）
+    } catch { return false }
   }
   if (resolved.delegate.modelSpec !== undefined) {
     const spec = resolved.delegate.modelSpec
@@ -2102,28 +2168,31 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   }
   tryRegisterDreamCommand(0)
 
-  ctx.on('dispose', () => {
+  // #116 Bug1：插件禁用/热重载时**注销必须发生**——ctx.on('dispose') 在 rc.3
+  // plugin_manager 的 disable→enable 路径上不保证触发（实测：禁用后工具残留注册、
+  // 再启用撞 "already registered" 整插件 fiber failed，重启才能恢复）。ctx.effect 的
+  // 解卷与 fiber 生命周期绑定（route/command 注册早已用同款契约），不受事件时序竞态
+  // 影响。两处都保留：注销幂等，谁先触发谁生效。
+  const drainLifecycleDisposers = (): void => {
     for (const dispose of toolDisposers) {
       try {
         dispose()
-      } catch {
-        /* 注销失败不阻塞 */
-      }
+      } catch { /* 注销失败不阻塞 */ }
     }
     for (const dispose of routeDisposers) {
       try {
         dispose()
-      } catch {
-        /* 注销失败不阻塞 */
-      }
+      } catch { /* 注销失败不阻塞 */ }
     }
     for (const dispose of commandDisposers) {
       try {
         dispose()
-      } catch {
-        /* 注销失败不阻塞 */
-      }
+      } catch { /* 注销失败不阻塞 */ }
     }
+  }
+  ctx.effect(() => drainLifecycleDisposers)
+  ctx.on('dispose', () => {
+    drainLifecycleDisposers()
     clearTimeout(routeTimer)
     clearTimeout(commandTimer)
     stopDream()
