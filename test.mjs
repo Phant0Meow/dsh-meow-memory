@@ -2311,7 +2311,227 @@ check('fork session (parentSession without origin) still injects', decisionFork.
   decisionFork.messages[0].content[0].text.includes('===== 长期记忆 =====') &&
   decisionFork.messages[1] === forkMsg && decisionFork.messages[1].content[0].text === 'fork 会话的首条消息')
 
+// ── #120 整理轮步数硬上限（pre-step 闸门）────────────────────────────────────
+{
+  const wsCap = mkdtempSync(join(tmpdir(), 'mm-step-cap-'))
+  const dbCap = getDb(wsCap, '.dsh-meow')
+  const capDebug = join(wsCap, '.dsh-meow', 'dream-debug.log')
+  const capAgent = { session: { id: 's-cap', header: { cwd: wsCap, id: 's-cap' } }, steer: () => {} }
+  const capSignal = () => new AbortController().signal
+  // 预置活跃 dream 租约：硬熔断时 handleMemoryTurnFailure 计数 + 释放
+  dbCap.claimDream('s-cap', 'cap-owner', Date.now(), 30 * 60_000)
+  check('#120 前置：租约已 claim', dbCap.getDreamLease('s-cap') !== null)
+
+  const capRun = async () => preStep(
+    { agent: capAgent, signal: capSignal() },
+    async () => ({ kind: 'enter', messages: [] }),
+  )
+  const capOutcome = async () => (await capRun().then(() => 'ok', (e) => `threw: ${String(e?.message ?? e).slice(0, 40)}`))
+
+  // 组预算从 marker 落盘起算：turn/start 重置 → marker 指令消息 → isPluginTurn=true + 计数清零
+  handlers['session/event'](capAgent.session, { type: 'turn/start', data: {} })
+  handlers['session/event'](capAgent.session, { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-dream] 整理任务' }] } })
+
+  // 前 30 步全部放行且无提醒注入（最后一步的返回值顺带验证）
+  let capThrew = false
+  let capLast = null
+  for (let i = 1; i <= 30; i++) {
+    capLast = await capRun().then(
+      (r) => r,
+      (e) => `threw: ${String(e?.message ?? e)}`,
+    )
+    if (typeof capLast === 'string') { capThrew = true; break }
+  }
+  check('#120 前 30 步全部放行', capThrew === false)
+  check('#120 前 30 步无提醒注入', capLast !== null && typeof capLast !== 'string' && capLast.messages.length === 0)
+
+  // 第 31 步：放行 + request-scoped 收尾提醒注入
+  const step31 = await preStep(
+    { agent: capAgent, signal: capSignal() },
+    async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '继续整理' }] }] }),
+  )
+  check('#120 第 31 步注入收尾提醒', step31.messages.length === 2 && step31.messages[1].content[0].text.includes('步上限') && step31.messages[1].source.kind === 'plugin:meow-memory', JSON.stringify(step31.messages.map((m) => m.content?.[0]?.text)))
+  check('#120 提醒日志落 dream-debug.log', existsSync(capDebug) && readFileSync(capDebug, 'utf8').includes('step-cap steer'))
+
+  // 32–36 步放行（GRACE 窗口），36 之后硬熔断
+  let capGraceOk = true
+  for (let i = 32; i <= 36; i++) {
+    const r = await capOutcome()
+    if (r !== 'ok') { capGraceOk = false; break }
+  }
+  check('#120 GRACE 窗口（32–36）放行', capGraceOk === true)
+  let nextCalls = 0
+  const capAbort = await preStep(
+    { agent: capAgent, signal: capSignal() },
+    async () => { nextCalls++; return { kind: 'enter', messages: [] } },
+  ).then(() => 'ok', (e) => `threw: ${String(e?.message ?? e).slice(0, 200)}`)
+  check('#120 第 37 步硬熔断抛错', capAbort.startsWith('threw') && capAbort.includes('步数硬上限'), capAbort)
+  check('#120 熔断时 next() 未被调用（本步请求未发生）', nextCalls === 0)
+  check('#120 熔断计入失败并释放租约', dbCap.getDreamLease('s-cap') === null)
+  check('#120 熔断日志落 dream-debug.log', readFileSync(capDebug, 'utf8').includes('step-cap abort'))
+
+  // 熔断闩：后续 pre-step 继续拒绝（防宿主不因抛错收轮时循环重启预算）
+  const capLatch = await capOutcome()
+  check('#120 熔断闩：后续步继续拒绝', capLatch.startsWith('threw') && capLatch.includes('步数硬上限'), capLatch)
+
+  // marker 消息再次落盘 = 组边界 → 预算重置，放行恢复
+  handlers['session/event'](capAgent.session, { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-dream] 下一组' }] } })
+  check('#120 marker 重置后放行恢复', (await capOutcome()) === 'ok')
+
+  // turn/start 也重置：正常轮零影响（含 kind='user' 引用 marker 文本的安全检查）
+  handlers['session/event'](capAgent.session, { type: 'turn/start', data: {} })
+  handlers['session/event'](capAgent.session, { type: 'user/message', data: { content: [{ type: 'text', text: '[meow-memory-dream] 用户引用', }], source: { kind: 'user' } } })
+  let capNormalOk = true
+  for (let i = 0; i < 40; i++) {
+    if ((await capOutcome()) !== 'ok') { capNormalOk = false; break }
+  }
+  check('#120 普通轮（用户消息引用 marker 文本）不计数不熔断', capNormalOk === true)
+
+  closeAllDbs() // Windows 文件锁
+  rmSync(wsCap, { recursive: true, force: true })
+}
+
+// ── #123 id 回执完整化 + 读路径歧义守卫 ─────────────────────────────────────
+{
+  const ws123 = mkdtempSync(join(tmpdir(), 'mm-id123-'))
+  const db123 = new MemoryDb(memoryDbPath(ws123))
+  const mod123 = await import('./lib/index.js')
+  const registered123 = []
+  mod123.registerMemoryTools((t) => registered123.push(t), '.dsh-meow')
+  const byName123 = Object.fromEntries(registered123.map((t) => [t.name, t]))
+  const sid123 = 'session-abc12345-1111-2222-3333-444444444444'
+  const exec123 = () => ({ agent: { session: { header: { id: sid123, cwd: ws123 } } } })
+
+  // 两条共享 8 位前缀的条目（#123 报告人本机真实碰撞形态：22ms 内连续写入）
+  const idA = '0mwq4qep5-577a2109e8884b819ad9ba847a'
+  const idB = '0mwq4qepr-95f99c961f4b440e93990dc6a6'
+  const ins123 = 'INSERT INTO fact (id, title, content, importance, keywords, status, source_session, created_at, updated_at, project) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  db123.db.prepare(ins123).run(idA, null, 'A 的内容：dsh-plugin-mesh 委派说明', 2, '[]', 'active', null, 1000, 1000, null)
+  db123.db.prepare(ins123).run(idB, null, 'B 的内容：mesh_run 异步语义', 2, '[]', 'active', null, 1000, 1002, null)
+
+  // 回执给完整 id（E2：remember 回执不再截断）
+  const r123 = await byName123.memory_remember.execute({ content: 'meow 记忆条目 C', project: 'p', keywords: ['k'], importance: 2 }, exec123())
+  check('#123 remember 返回完整 id', typeof r123.id === 'string' && r123.id.length === 36, r123.id)
+  const render123 = byName123.memory_remember.output.render([], r123)
+  check('#123 remember 渲染含完整 id', typeof render123[0]?.text === 'string' && render123[0].text.includes(r123.id))
+
+  // E4：读歧义 → 只回候选完整 id，不猜内容（本次最危险的静默错读）
+  const read123 = await byName123.memory_read.execute({ id: '0mwq4qep' }, exec123())
+  check('#123 读歧义返回候选列表', read123.found === true && Array.isArray(read123.ambiguous) && read123.ambiguous.length === 2 && read123.ambiguous.every((a) => a.id.length === 36))
+  check('#123 读歧义不含猜测内容', read123.content === undefined && read123.id === undefined)
+  const readRender123 = byName123.memory_read.output.render([], read123)
+  check('#123 读歧义渲染列候选完整 id 且不含内容', typeof readRender123[0]?.text === 'string'
+    && readRender123[0].text.includes(idA) && readRender123[0].text.includes(idB) && !readRender123[0].text.includes('A 的内容'), readRender123[0]?.text?.slice(0, 80))
+
+  // 完整 id 读 → 正常返回
+  const readFull123 = await byName123.memory_read.execute({ id: idA }, exec123())
+  check('#123 完整 id 读正常返回', readFull123.found === true && readFull123.id === idA && readFull123.content.includes('A 的内容'))
+
+  // E5：update 歧义报错列全部候选完整 id（打破「守卫要求完整 id 但没人给完整 id」的死结）
+  let updErr123 = null
+  try { await byName123.memory_update.execute({ id: '0mwq4qep', importance: 3 }, exec123()) } catch (e) { updErr123 = e }
+  check('#123 update 歧义报错列完整 id', updErr123 !== null && String(updErr123.message).includes(idA) && String(updErr123.message).includes(idB), String(updErr123?.message ?? '').slice(0, 120))
+
+  // find_similar 同守卫
+  let fsErr123 = null
+  try { await byName123.memory_find_similar.execute({ id: '0mwq4qep' }, exec123()) } catch (e) { fsErr123 = e }
+  check('#123 find_similar 歧义报错列完整 id', fsErr123 !== null && String(fsErr123.message).includes(idA) && String(fsErr123.message).includes(idB), String(fsErr123?.message ?? '').slice(0, 120))
+
+  // find_similar 完整 id 正常路径
+  const fs123r = await byName123.memory_find_similar.execute({ id: idA, k: 1 }, exec123())
+  check('#123 find_similar 完整 id 正常返回', Array.isArray(fs123r.hits) && fs123r.hits.every((h) => h.id.length === 36))
+
+  // search 渲染完整 id（回归确认：search 一直是完整 id，保持不变）
+  const sr123 = byName123.memory_search.output.render([], { hits: [{ id: idA, level: 'fact', content: '内容预览', updated_at: Date.now(), project: null }] })
+  check('#123 search 渲染完整 id（回归）', sr123.some((b) => typeof b.text === 'string' && b.text.includes(idA)))
+
+  closeAllDbs() // Windows 文件锁
+  db123.close()
+  rmSync(ws123, { recursive: true, force: true })
+}
+
+// ── #122 中文命中链路准入（宁缺毋滥）────────────────────────────────────────
+{
+  const ws122 = mkdtempSync(join(tmpdir(), 'mm-hit122-'))
+  const db122 = new MemoryDb(memoryDbPath(ws122))
+  db122.insert({ level: 'fact', content: '渲染函数的坐标旋转实现说明', project: null, keywords: ['棋子本体', '旋转'], importance: 1 })
+  db122.insert({ level: 'fact', content: '间距参数说明', project: null, keywords: ['15', '间距'], importance: 1 })
+  db122.insert({ level: 'fact', content: '口径规则说明', project: null, keywords: ['拍板', '细说'], importance: 1 })
+  db122.insert({ level: 'fact', content: '权限配置说明', project: null, keywords: ['自己建房', '权限'], importance: 1 })
+
+  // 复现 1：跨词假 bigram（格子本身×棋子本体→「子本」），期望不命中
+  const c1 = buildHitInjection(db122, ws122, 's122-1', '格子本身要不要改', { hitTopK: 3 }, '.dsh-meow')
+  check('#122 跨词假 bigram 不命中', c1 === null, JSON.stringify(c1))
+
+  // 复现 2：纯数字 token（15）不参与命中
+  const c2 = buildHitInjection(db122, ws122, 's122-2', '改成15', { hitTopK: 3 }, '.dsh-meow')
+  check('#122 纯数字不命中', c2 === null, JSON.stringify(c2))
+
+  // 复现 3：领域流程词（拍板/细说）内置表不拦（keyword 双词全命中走 ≥2 通道）→ 配置扩展拦截
+  const c3a = buildHitInjection(db122, ws122, 's122-3', '剩下的详细说明让我拍板', { hitTopK: 3 }, '.dsh-meow')
+  check('#122 内置表不拦领域词（≥2 交集放行）', c3a !== null, JSON.stringify(c3a))
+  const c3b = buildHitInjection(db122, ws122, 's122-3b', '剩下的详细说明让我拍板', { hitTopK: 3, hitStopwords: ['拍板', '细说'] }, '.dsh-meow')
+  check('#122 hitStopwords 配置拦下领域流程词', c3b === null, JSON.stringify(c3b))
+
+  // 报告人实例 2：自己（功能词）+ 数字碎片（3/2）——无任何有效交集
+  const c4 = buildHitInjection(db122, ws122, 's122-4', '往自己象限平移一点点', { hitTopK: 3 }, '.dsh-meow')
+  check('#122 功能词/数字碎片不命中', c4 === null, JSON.stringify(c4))
+
+  // 正向回归：真话题多 token 交集仍命中
+  const ok1 = buildHitInjection(db122, ws122, 's122-ok1', '棋子本体旋转怎么调整', { hitTopK: 3 }, '.dsh-meow')
+  check('#122 真话题多 token 仍命中', ok1 !== null && ok1.injectedIds.length === 1, JSON.stringify(ok1))
+
+  // 正向回归：2 字关键词全词命中（唯一 token = 完整关键词词项）
+  const ok2 = buildHitInjection(db122, ws122, 's122-ok2', '旋转要调整一下', { hitTopK: 3 }, '.dsh-meow')
+  check('#122 2 字关键词全词命中保留', ok2 !== null && ok2.injectedIds.length === 1, JSON.stringify(ok2))
+
+  // #103 回归：单字符关键词不被 "A，A3" 命中
+  const c103 = buildHitInjection(db122, ws122, 's122-103', 'A，A3', { hitTopK: 3 }, '.dsh-meow')
+  check('#103 回归：单字符不命中', c103 === null, JSON.stringify(c103))
+
+  db122.close()
+  rmSync(ws122, { recursive: true, force: true })
+}
+
+// ── #121 全新工作区首条消息误报「外部记忆库」 ────────────────────────────────
+{
+  const ws121 = mkdtempSync(join(tmpdir(), 'mm-freshws-'))
+  const home121 = mkdtempSync(join(tmpdir(), 'mm-freshws-home-'))
+  enableWorkspaceTrust(home121)
+  try {
+    const m121 = await import('./lib/index.js')
+    const agent121 = { session: { header: { cwd: ws121, id: 's-121' } }, steer: () => {} }
+    const d121 = await preStep(
+      { agent: agent121, messages: [{ content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }], turn: 1, step: 1, signal: new AbortController().signal },
+      async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }] }),
+    )
+    const d121Json = JSON.stringify(d121.messages)
+    check('#121 全新工作区不误报外部库', !d121Json.includes('外部记忆库'), d121Json.slice(0, 80))
+    check('#121 空库 first-create notice 正常注入', d121Json.includes('memory.db'), d121Json.slice(0, 80))
+    check('#121 建库即信任（created-empty）', m121.isTrustedWorkspace(ws121) === true)
+    check('#121 全新工作区不写 noticedAt', m121.hasExternalNoticeShown(ws121) === false)
+
+    // 对照：目录存在但只预置 PROJECT.md → 信任门仍触发（#64 意图保持）
+    const ws121b = mkdtempSync(join(tmpdir(), 'mm-freshws-b-'))
+    mkdirSync(join(ws121b, '.dsh-meow'))
+    writeFileSync(join(ws121b, '.dsh-meow', 'PROJECT.md'), '预置内容')
+    const agent121b = { session: { header: { cwd: ws121b, id: 's-121b' } }, steer: () => {} }
+    const d121b = await preStep(
+      { agent: agent121b, messages: [{ content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }], turn: 1, step: 1, signal: new AbortController().signal },
+      async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }] }),
+    )
+    check('#121 只预置 PROJECT.md 仍触发信任门', JSON.stringify(d121b.messages).includes('外部记忆库') && JSON.stringify(d121b.messages).includes('/meow-trust'))
+    rmSync(ws121b, { recursive: true, force: true })
+  } finally {
+    disableWorkspaceTrust()
+    closeAllDbs()
+    rmSync(ws121, { recursive: true, force: true })
+    rmSync(home121, { recursive: true, force: true })
+  }
+}
+
 // turn-stopping 反思（单任务内连续工具 step ≥7 才触发——用户拍板语义）
+
 const stopping = handlers['agent/turn-stopping']
 check('turn-stopping registered', typeof stopping === 'function')
 

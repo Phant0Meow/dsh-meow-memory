@@ -416,8 +416,10 @@ export class MemoryDb {
       )
     return full
   }
-  /** 跨表定位（UUID 全局唯一，扫描全部表）。id 支持 8 位前缀匹配
-   *  （快照/检索结果给的是截断 id；前缀碰撞时取第一个）。 */
+  /** 跨表定位（UUID 全局唯一，扫描全部表）。id 支持前缀匹配——短 id 是**模型截断
+   *  输出**的容错通道（#123 澄清：检索/注入/回执给的都是完整 id，不存在「设计上的
+   *  截断 id」）；**前缀命中多条时静默取第一条**，只配首条即正确的展示场景，
+   *  写路径与读取必须走 findByIdAll 做歧义守卫（#62/#123）。 */
   findById(id: string): { row: MemoryRow; level: Level } | undefined {
     const prefix = id.length < 36
     for (const level of LEVELS) {

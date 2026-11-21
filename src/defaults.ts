@@ -24,6 +24,8 @@ export const CONFIG_DEFAULTS = {
   enabled: true,
   projectDir: '.dsh-meow',
   hitTopK: 2,
+  /** #122：命中链路停用词扩展（领域流程词）。设置页暂无列表编辑器，经 cordis.patch.yml 配置。 */
+  hitStopwords: [],
   titleMax: 40,
   /** 首轮画像条数上限（soul+user 合并池按 importance→新近度截 top N；0=全量）。 */
   profileMax: 0,

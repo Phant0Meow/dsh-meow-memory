@@ -372,7 +372,7 @@ function rememberTool(dir: string, privacy: boolean): ToolDefinition {
         const head = v.merged ? '✅ 已合并到已有条目' : '✅ 记忆已写入'
         return [{
           type: 'text' as const,
-          text: `${head}（${String(v.level ?? 'fact')}${typeof v.id === 'string' ? `，id=${v.id.slice(0, 8)}` : ''}）。${proj}${kw}无需重复调用本工具。`,
+          text: `${head}（${String(v.level ?? 'fact')}${typeof v.id === 'string' ? `，id=${v.id}` : ''}）。${proj}${kw}无需重复调用本工具。`,
         }]
       },
     },
@@ -721,7 +721,7 @@ function findSimilarTool(dir: string): ToolDefinition {
         const v = value as { hits?: Array<{ id?: string; level?: string; title?: string; content?: string; similarity?: number }> }
         return (v.hits ?? []).map((h) => ({
           type: 'text' as const,
-          text: `[${String(h.level ?? '')} ${String(h.id ?? '').slice(0, 12)}] 相似度 ${Number(h.similarity ?? 0).toFixed(3)} ${String(h.title ?? '')} ${String(h.content ?? '').slice(0, 80)}`,
+          text: `[${String(h.level ?? '')} ${String(h.id ?? '')}] 相似度 ${Number(h.similarity ?? 0).toFixed(3)} ${String(h.title ?? '')} ${String(h.content ?? '').slice(0, 80)}`,
         }))
       },
     },
@@ -733,8 +733,14 @@ function findSimilarTool(dir: string): ToolDefinition {
       const workspace = workspaceOf(exec)
       if (!workspace) throw new Error('memory_find_similar: 无法确定工作区（会话无 cwd）——记忆工具需在有工作区 cwd 的会话内调用，外部/无会话调用链不受支持（#94）')
       const db = getDb(workspace, dir)
-      const found = db.findById(id)
-      if (!found) throw new Error(`memory_find_similar: 未找到记忆 ${id.slice(0, 12)}`)
+      // #123：读路径歧义守卫（与 memory_update 同语义）——findById 前缀碰撞静默取
+      // 首条（fact 排在 lesson 前，实测读错且不报错）。多命中 → 报错列全部候选完整 id。
+      const matches = db.findByIdAll(id)
+      if (matches.length === 0) throw new Error(`memory_find_similar: 未找到记忆 ${id.slice(0, 12)}`)
+      if (matches.length > 1) {
+        throw new Error(`memory_find_similar: 短 id "${id}" 唯一性不足，命中 ${matches.length} 条（${matches.map((m) => `${m.level}:${m.row.id}`).join('；')}），请改用完整 id`)
+      }
+      const found = matches[0]
       const sessionId = sessionIdOf(exec)
       const seen = readSeen(workspace, sessionId ?? 'unknown', dir)
       const kRaw = coerceNumber(parsed.k)
@@ -793,6 +799,19 @@ function readTool(dir: string): ToolDefinition {
         required: ['found'],
         properties: {
           found: { type: 'boolean' },
+          ambiguous: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['id', 'level'],
+              properties: {
+                id: { type: 'string' },
+                level: { type: 'string' },
+                title: { type: 'string' },
+              },
+            },
+          },
           id: { type: 'string' },
           level: { type: 'string' },
           title: { type: 'string' },
@@ -809,9 +828,14 @@ function readTool(dir: string): ToolDefinition {
         },
       },
       render: (_args, value) => {
-        const v = value as { found?: boolean; level?: unknown; title?: unknown; content?: unknown; status?: unknown; project?: unknown; goal?: unknown; editHistory_infoFrom?: unknown }
+        const v = value as { found?: boolean; ambiguous?: Array<{ id?: string; level?: string; title?: string }>; level?: unknown; title?: unknown; content?: unknown; status?: unknown; project?: unknown; goal?: unknown; editHistory_infoFrom?: unknown }
         const hint = '如果你确实需要更多细节，可以直接去聊天记录里搜索相关关键词。'
         if (!v.found) return [{ type: 'text' as const, text: `未找到该记忆。${hint}` }]
+        if (Array.isArray(v.ambiguous) && v.ambiguous.length > 0) {
+          // #123：短 id 前缀碰撞时不猜内容（读错且不报错是本次最危险的一点）——只回
+          // 全部候选完整 id，模型改用完整 id 重读（不必再跑 search）。
+          return [{ type: 'text' as const, text: `短 id 命中 ${v.ambiguous.length} 条记忆（前缀碰撞），本回执不含猜测内容——请改用以下完整 id 重读：${v.ambiguous.map((a) => `[${String(a.level ?? '')}:${String(a.id ?? '')}]`).join('、')}` }]
+        }
         const parts = [`[${String(v.level ?? '')}] ${String(v.title ?? '')}（${String(v.status ?? '')}）`]
         if (v.project) parts.push(`项目：${String(v.project)}`)
         if (v.goal) parts.push(`目标：${String(v.goal)}`)
@@ -828,9 +852,19 @@ function readTool(dir: string): ToolDefinition {
       if (!id) throw new Error('memory_read: id 不能为空')
       const workspace = workspaceOf(exec)
       if (!workspace) throw new Error('memory_read: 无法确定工作区（会话无 cwd）——记忆工具需在有工作区 cwd 的会话内调用，外部/无会话调用链不受支持（#94）')
-      const found = getDb(workspace, dir).findById(id)
-      if (!found) return { found: false }
-      const { row } = found
+      const db = getDb(workspace, dir)
+      // #123 读路径歧义处理：findById 前缀碰撞静默取首条（fact 排在 lesson 前，实测
+      // 读错且不报错）是 #123 最危险的一点。多命中 → 不猜内容：只回全部候选完整 id
+      //（模型改用完整 id 重读，不必再跑 search）；单命中/完整 id → 原样返回。
+      const matches = db.findByIdAll(id)
+      if (matches.length === 0) return { found: false }
+      if (matches.length > 1) {
+        return {
+          found: true,
+          ambiguous: matches.map((m) => ({ id: m.row.id, level: m.level, title: m.row.title ?? '' })),
+        }
+      }
+      const { row } = matches[0]
       // 查阅留痕（v0.17.0）：dream 第一轮清单的"查阅过"源（memory_project 全景不标记，第三轮专门复查）。
       markAccessed(workspace, sessionIdOf(exec) ?? 'unknown', [row.id], dir)
       return {
@@ -888,7 +922,7 @@ function updateTool(dir: string, privacy: boolean): ToolDefinition {
       },
       render: (_args, value) => {
         const v = value as { ok?: boolean; level?: unknown; id?: unknown }
-        return [{ type: 'text' as const, text: v.ok ? `✅ 已更新（${String(v.level ?? '')} ${String(v.id ?? '').slice(0, 8)}）。` : '更新失败：未找到该记忆。' }]
+        return [{ type: 'text' as const, text: v.ok ? `✅ 已更新（${String(v.level ?? '')} ${String(v.id ?? '')}）。` : '更新失败：未找到该记忆。' }]
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
@@ -905,7 +939,7 @@ function updateTool(dir: string, privacy: boolean): ToolDefinition {
       const matches = db.findByIdAll(id)
       if (matches.length > 1) {
         const list = matches
-          .map((m) => `${m.level}:${m.row.id.slice(0, 8)} ${m.row.title || m.row.content.slice(0, 40)}`)
+          .map((m) => `${m.level}:${m.row.id} ${m.row.title || m.row.content.slice(0, 40)}`)
           .join('；')
         throw new Error(`memory_update: 短 id "${id}" 命中 ${matches.length} 条（${list}），请改用完整 id`)
       }
@@ -945,7 +979,7 @@ function updateTool(dir: string, privacy: boolean): ToolDefinition {
     },
     presentCall(args: unknown): { card: 'generic'; title: string; kind: 'write' } {
       const parsed = args as { id?: unknown; status?: unknown }
-      return { card: 'generic', title: `memory_update: ${String(parsed.id ?? '').slice(0, 8)}${parsed.status ? ` → ${String(parsed.status)}` : ''}`, kind: 'write' }
+      return { card: 'generic', title: `memory_update: ${String(parsed.id ?? '').slice(0, 12)}${parsed.status ? ` → ${String(parsed.status)}` : ''}`, kind: 'write' }
     },
   }
 }

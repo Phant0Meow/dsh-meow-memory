@@ -119,6 +119,30 @@ function normalizeEn(tokens: string[]): string[] {
   return out
 }
 
+// ── #122 中文命中链路准入 ────────────────────────────────────────────────────
+// 命中链路（keywordHitScore）与检索（memory_search/findSimilar）共用 tokenize——
+// 过滤器只挂命中链路两侧，检索语义一字不动。中文 bigram 恒为 2 字符，#103 的
+// length>=2 对中文恒真：任意两句 20 字以上的中文，两字交集是必然事件；raw>0 即入
+// 候选 + 无最低分阈值 = 「必有命中」。#122 实测 91% 命中是字面碎片，命中链路需要
+// 「宁缺毋滥」。命中链路专用过滤（两侧同滤）：
+// 1. 纯数字 token（版本号/参数，不是话题）；
+// 2. 中文高频功能词——对称 EN_STOPWORDS 的**最小保守集**：只收无歧义功能词，
+//    领域流程词（如「拍板」「测试」）经 hitStopwords 配置扩展，不硬编码领域词。
+const ZH_HIT_STOPWORDS = new Set<string>([
+  '自己', '什么', '有点', '不是', '还是', '还有', '已经', '这个', '那个', '现在',
+  '然后', '所以', '但是', '如果', '可以', '需要', '怎么', '继续', '时候', '地方',
+  '没有', '就是', '只是', '只有', '关于', '因为', '应该', '可能', '一下', '一点',
+  '直接', '开始', '最后', '接着', '其他', '其它', '当前', '以及', '并且', '或者',
+  '两个', '我们', '你们', '他们', '她们', '它们',
+])
+
+/** #122 命中链路专用过滤器：长度 <2（#103）∪ 1-2 位纯数字（参数/数量词，不是话题；
+ *  ≥3 位是端口/版本/型号等标识符，保留）∪ 中文功能词 ∪ 配置扩展。 */
+function makeHitKeep(stopwords: ReadonlySet<string>): (ts: string[]) => string[] {
+  return (ts: string[]): string[] =>
+    ts.filter((t) => t.length >= 2 && !/^\d{1,2}$/.test(t) && !ZH_HIT_STOPWORDS.has(t) && !stopwords.has(t))
+}
+
 // Porter stemmer（Porter 1980 原始算法，零依赖移植）。词干只用于匹配，不入库、不展示，
 // 所以"cach"这类非词形态无所谓——两侧同函数即可命中。
 const PORTER_STEP2: Record<string, string> = {
@@ -240,10 +264,12 @@ export interface RankedHit {
 
 export interface SearchOptions {
   k?: number
-  /** 相对当前时间；null 表示不衰减（测试/手动检索可关）。 */
+  /** 相对当前时间；null 表示不衰减（测试/手动检索不受影响）。 */
   now?: number | null
   /** 附带每条命中的分项得分（#51 可解释检索）：只加字段，不改排序。 */
   explain?: boolean
+  /** #122：命中链路停用词扩展（内置中文功能词表拦不住的领域流程词，如「拍板」「测试」）。 */
+  stopwords?: string[]
 }
 
 /**
@@ -329,18 +355,16 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
 export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions = {}): RankedHit[] {
   const k = opts.k ?? 2
   const now = opts.now === undefined ? Date.now() : opts.now
-  // #103：过滤单字符 token。tokenize 按字符类别切分，"10.11"→"10"/"."/“11"、URL 的
-  // "?spm_id_from=333.1391.0.0" 切出 "."/"_"/"0" 这类单字符碎片——raw>0 即入候选、
-  // 无最低分阈值，任何带 URL/版本号的消息必然撞上含点号/下划线关键词的记忆。
-  // CJK bigram 恒 ≥2 字符不受影响；英文单词字母被剪掉的只有 "a"/"I" 这类停用词级碎片。
-  const keep = (ts: string[]): string[] => ts.filter((t) => t.length >= 2)
-  const q = keep(tokenize(query))
+  const hitKeep = makeHitKeep(new Set(opts.stopwords ?? []))
+  // #103：过滤单字符 token（en 碎片）；#122：命中链路再滤纯数字 + 中文功能词
+  //（两侧同滤：query 侧防字面碎片撞库，doc 侧防数字/功能词关键词占分母与假词项）。
+  const q = hitKeep(tokenize(query))
   if (q.length === 0 || docs.length === 0) return []
   const qTf = new Map<string, number>()
   for (const t of q) qTf.set(t, (qTf.get(t) ?? 0) + 1)
 
   const n = docs.length
-  const docToks = docs.map((d) => keep(tokenize([d.content, d.title ?? ''].join(' '))))
+  const docToks = docs.map((d) => hitKeep(tokenize([d.content, d.title ?? ''].join(' '))))
   const df = new Map<string, number>()
   const tf: Array<Map<string, number>> = []
   for (const toks of docToks) {
@@ -367,12 +391,22 @@ export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions 
   })
   const maxRaw = Math.max(...raw)
   const out: RankedHit[] = []
+  const qLen = q.length
   for (let di = 0; di < docs.length; di++) {
     if (raw[di] <= 0) continue
-    const len = docToks[di].length
+    // #122 准入门槛：「宁缺毋滥」——≥2 个多不同 token 命中；唯一 token 命中需是「强信号」：
+    // 该 token 是记忆关键词的完整词项（2 字关键词全词命中，如「旋转」），或 token 本身
+    // ≥3 字符（端口 3081/版本 10.11 拆出的 3 位数字段/英文标识符 ABBrobot——无关键词
+    // 旧条目回退全文匹配时，标识符是唯一的强信号）。跨词假 bigram（格子本身×棋子本体
+    // →「子本」，df=1、idf 极高也拦不住）与 1-2 位数字、功能词的单命中全部拦下；
+    // 多字关键词全匹配自带 ≥2 个 bigram，走 ≥2 overlap 通道。
     let overlap = 0
-    for (const t of qTf.keys()) if (tf[di].has(t)) overlap++
-    const coverage = len > 0 ? overlap / len : 0
+    let onlyToken = ''
+    for (const t of qTf.keys()) if (tf[di].has(t)) { overlap++; onlyToken = t }
+    const strongSingle = onlyToken.length >= 3 || (docs[di].keywords ?? []).includes(onlyToken)
+    if (overlap < 2 && !strongSingle) continue
+    const len = docToks[di].length
+    const coverage = len > 0 ? overlap / Math.min(len, qLen) : 0
     let w = 1
     if (now !== null && docs[di].importance < 3 && !(raw[di] >= 0.85 * maxRaw)) {
       w = recencyWeight(now - (docs[di].last_accessed_at ?? docs[di].updated_at)) // #91 同 search：按最后使用时间衰减

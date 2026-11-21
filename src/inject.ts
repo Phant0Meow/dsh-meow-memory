@@ -23,6 +23,8 @@ export interface InjectOptions {
   titleMax: number
   /** 首轮画像条数上限（soul+user 合并池截 top N；0=全量）。 */
   profileMax: number
+  /** #122：命中链路停用词扩展（内置中文功能词表拦不住的领域流程词，如「拍板」「测试」）。 */
+  hitStopwords?: string[]
 }
 
 const DEFAULT_OPTS: InjectOptions = { hitTopK: 2, titleMax: 40, profileMax: 0 }
@@ -587,7 +589,7 @@ function hitQuery(
     content: d.keywords.length > 0 ? d.keywords.join(' ') : d.content.slice(0, 100),
   }))
   // 命中专用打分：交集×覆盖率×艾宾浩斯(updated_at)×importance×title 加成（艾宾浩斯开着）。
-  const hits = keywordHitScore(query, docs, { k: o.hitTopK })
+  const hits = keywordHitScore(query, docs, { k: o.hitTopK, stopwords: o.hitStopwords })
   const byId = new Map(hitRows.map((r) => [r.id, r]))
   // 展示/注入用原文 content（docs 的 content 只是 keywords 匹配面，不能当正文）。
   // 已注入的进入本函数前就排掉了（#67），这里不再二次过滤。

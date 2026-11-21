@@ -230,6 +230,10 @@ const config = z.object({
   homeDirPresets: z.dict(z.string()).default(homeDirPresetsDefault()),
   /** 关键词命中条数上限（fact/lesson/rules/topic 短条目，每条用户消息命中注入）。 */
   hitTopK: z.number().min(0).max(10).default(2),
+  /** #122：命中链路停用词扩展——内置中文功能词表之外，用户可追加领域流程词
+   *  （如「拍板」「测试」这类高频但无检索意义的词）。仅作用于命中注入链路，
+   *  memory_search/find_similar 检索不受影响。 */
+  hitStopwords: z.array(z.string().min(1)).max(200).default([]),
   /** 导引标题截断长度。 */
   titleMax: z.number().min(10).max(200).default(40),
   /** 首轮画像条数上限（soul+user 合并池按 importance 降序、同重要性按更新时间新→旧
@@ -449,6 +453,8 @@ interface ResolvedConfig {
   /** 原样透传（'default'|'dsh-storage'|'plugin-root'|绝对路径|undefined）；绝对路径化在 resolveHomeDir。 */
   homeDir: string | undefined
   hitTopK: number
+  /** #122：命中链路停用词扩展（领域流程词）。注入期消费（buildHitInjection）。 */
+  hitStopwords: string[]
   titleMax: number
   /** 首轮画像条数上限（soul+user 合并池截 top N；0=全量）。注入期消费（首轮+重注入）。 */
   profileMax: number
@@ -478,6 +484,7 @@ function resolveConfig(config: unknown): ResolvedConfig {
     projectDir: c.projectDir ?? '.dsh-meow',
     homeDir: typeof c.homeDir === 'string' ? c.homeDir : undefined,
     hitTopK: c.hitTopK ?? 2,
+    hitStopwords: c.hitStopwords ?? [],
     titleMax: c.titleMax ?? 40,
     // 手编 settings.yaml 不经 zod/设置页校验——这里兜底防御（非有限数字/负数回落全量）。
     profileMax: typeof c.profileMax === 'number' && Number.isFinite(c.profileMax)
@@ -769,7 +776,7 @@ const SETTINGS_SOURCE_WAIT_MS = 250
 // 注册期消费的字段（projectDir/homeDir/enabled/delegate.modelSpec + setPromptLang 的
 // 启动调用）保持冻结：热改需要 dispose+重入，设置页按「需重载」语义对待（#26 同口径）。
 
-const LIVE_CONFIG_KEYS = ['hitTopK', 'titleMax', 'reflect', 'reflectTurns', 'autoMigrate', 'promptLang', 'disabledWorkspaces'] as const
+const LIVE_CONFIG_KEYS = ['hitTopK', 'hitStopwords', 'titleMax', 'reflect', 'reflectTurns', 'autoMigrate', 'promptLang', 'disabledWorkspaces'] as const
 const LIVE_DREAM_KEYS = ['enabled', 'idleMinutes', 'suppressWindows', 'suppressLeadMinutes', 'checkMinutes', 'timeZone', 'rulesReviewDays'] as const
 
 /** 工作区是否在停用名单（归一后精确匹配）。导出供测试直调。 */
@@ -1368,6 +1375,21 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   const lastWindowWrite = new Map<string, number>()
   const isPluginTurn = new Map<string, boolean>() // sid -> 本 turn 是否为 meow-memory 插件轮
   const turnHadMessage = new Map<string, boolean>() // sid -> 本 turn 是否出现过任何 user/message（#36 裸轮判定：dream 任务被 claim 后未及落盘就装配崩溃的轮，全程零消息）
+
+  // ── #120 整理轮步数硬上限 ──────────────────────────────────────────────────
+  // 模型退化循环（#120：单 turn 6632 步 / 同一 memory_update 重复 5627 次，心跳盲续租
+  // 6h 才被租约过期拦下）——宿主 agent-loop 没有步数上限，唯一止损点在本插件。闸门语义：
+  // - 计数挂 isPluginTurn（dream/reflect 指令轮才计数），每步请求前 +1；
+  // - 每条 marker 指令消息落盘时清零 = **每组重置预算**（组边界重置，不误伤合法大组：
+  //   合规模型收到超限提醒即优雅收尾，下一组拿到全新预算，dream 照常推进）；
+  // - 超限第 1 步（cap+1）：request-scoped 注入「立即收尾」指令给合规模型台阶（不落
+  //   会话日志、不计失败）；
+  // - 再超 GRACE 步仍持续调用工具：拒绝执行该步（pre-step 抛错 = turn error 收尾），
+  //   并按插件轮失败计入封存预算（handleMemoryTurnFailure，3 次止损，#120 建议一）。
+  const PLUGIN_TURN_STEP_CAP = 30
+  const PLUGIN_TURN_STEP_CAP_GRACE = 6
+  const pluginTurnSteps = new Map<string, number>() // sid -> 本组已计步数（超限不删，等 marker/turn-start 重置）
+  const pluginTurnCapAbort = new Map<string, boolean>() // sid -> 本组已硬熔断（日志去重用）
   ctx.on('session/event', (session: { id?: string; header?: SessionHeaderLike }, event: { time?: number; type?: string; data?: unknown }) => {
     perfEvent()
     noteActivity()
@@ -1399,6 +1421,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       if (t === 'turn/start') {
         isPluginTurn.set(sid, false) // 新轮重置
         turnHadMessage.set(sid, false) // 新轮重置（#36 裸轮判定基线）
+        pluginTurnSteps.delete(sid) // #120：新轮步数预算重置
+        pluginTurnCapAbort.delete(sid)
         return
       }
       if (t === 'user/message') {
@@ -1428,6 +1452,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
             msgText.includes(REFLECT_DONE_DELEGATE_MARKER)
           ) {
             isPluginTurn.set(sid, true) // 反思/dream 指令轮或打点
+            pluginTurnSteps.delete(sid) // #120：marker 指令消息落盘 = 组边界 → 步数预算重置
+            pluginTurnCapAbort.delete(sid)
             return // 不刷新活跃度
           }
         }
@@ -1515,7 +1541,62 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 自身的错误原样上抛（abort 语义在内），只有本插件自己的注入/检索失败才吞掉
   // （放弃本轮注入、放行原始 decision，与本插件其余路径的 fail-open 同风格）。
   ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
+    // ── #120 整理轮步数闸门（先于 next()：本步尚未执行）─────────────────────
+    // 注入链 fail-open 吞错不影响这里——熔断必须穿透 fail-open，所以闸门放在包装器
+    // 顶层、try/catch 之外。熔断时 next() 不调：本步请求不发生，turn 以 error 收尾。
+    const capSid = (agent as { session?: { header?: { id?: string } } } | undefined)?.session?.header?.id
+    const capWs = typeof capSid === 'string' ? workspaceOfAgent(agent) : null
+    const capActive = typeof capSid === 'string'
+      && signal?.aborted !== true
+      && (agent as { session?: { header?: { origin?: string } } } | undefined)?.session?.header?.origin !== 'subagent'
+      && isPluginTurn.get(capSid) === true
+    let capN = 0
+    if (capActive) {
+      // 熔断闩：本组已硬熔断后（宿主理论上会因抛错结束 turn）若 pre-step 再次到达，
+      // 继续拒绝每一步，不给退化循环重启预算的机会（重置只走 marker/turn-start）。
+      if (pluginTurnCapAbort.get(capSid) === true) {
+        throw new Error(`[meow-memory] 整理轮步数硬上限触发（${PLUGIN_TURN_STEP_CAP}+${PLUGIN_TURN_STEP_CAP_GRACE} 步）——提醒收尾后仍持续调用工具，判定模型退化循环，熔断本轮 (#120)`)
+      }
+      capN = (pluginTurnSteps.get(capSid) ?? 0) + 1
+      pluginTurnSteps.set(capSid, capN)
+      if (capN > PLUGIN_TURN_STEP_CAP + PLUGIN_TURN_STEP_CAP_GRACE) {
+        // 硬熔断：第 cap+1 步已 request-scoped 提醒收尾，再超 GRACE 步仍持续调用工具
+        // → 拒绝执行本步（turn error 收尾）。失败计数走 handleMemoryTurnFailure
+        //（3 次止损封存）；抛错后宿主 turn/end error 分支会再调一次，无租约时 'none' 幂等。
+        pluginTurnSteps.delete(capSid)
+        pluginTurnCapAbort.set(capSid, true)
+        let outcome: string = 'none'
+        if (typeof capWs === 'string' && capWs.length > 0) {
+          try { outcome = handleMemoryTurnFailure(getDb(capWs, resolved.projectDir), capSid, capWs, resolved.projectDir) } catch { /* 计数失败不阻塞熔断 */ }
+          try {
+            appendFileSync(join(capWs, resolved.projectDir, 'dream-debug.log'),
+              `[${new Date().toISOString()}] dream step-cap abort sid=${shortSessionId(capSid)} steps=${PLUGIN_TURN_STEP_CAP}+${PLUGIN_TURN_STEP_CAP_GRACE} outcome=${outcome} (#120)\n`)
+          } catch { /* 日志失败不阻塞 */ }
+          broadcast.broadcast(capSid, 'active') // 摘掉 dreaming 呼吸灯（封存/重试状态由后续 sweep 表达）
+        }
+        ctx.logger.warn(`[meow-memory] 整理轮步数硬上限触发（${PLUGIN_TURN_STEP_CAP}+${PLUGIN_TURN_STEP_CAP_GRACE} 步）——提醒收尾后仍持续调用工具，判定模型退化循环，熔断本轮 (#120)`)
+        throw new Error(`[meow-memory] 整理轮步数硬上限触发（${PLUGIN_TURN_STEP_CAP}+${PLUGIN_TURN_STEP_CAP_GRACE} 步）——提醒收尾后仍持续调用工具，判定模型退化循环，熔断本轮 (#120)`)
+      }
+    }
     const decision = await next()
+    if (capActive && capN === PLUGIN_TURN_STEP_CAP + 1) {
+      // 超限提醒（只在恰好第 cap+1 步注入一次；marker 重置后新组可再次触发）：
+      // request-scoped 注入「立即收尾」指令（不落会话日志、不落库、不动计数）。
+      // 合规模型本步即收尾 → dream 正常推进下一组；退化模型无视提醒 → GRACE 步后硬熔断。
+      try {
+        if (typeof capWs === 'string' && capWs.length > 0) {
+          appendFileSync(join(capWs, resolved.projectDir, 'dream-debug.log'),
+            `[${new Date().toISOString()}] dream step-cap steer sid=${shortSessionId(capSid)} step=${PLUGIN_TURN_STEP_CAP + 1}\n`)
+        }
+      } catch { /* 日志失败不阻塞 */ }
+      if (decision?.kind === 'enter' && Array.isArray(decision.messages)) {
+        const wrapUp = createUserMessage({
+          content: [{ type: 'text', text: `（meow-memory 整理轮已达 ${PLUGIN_TURN_STEP_CAP} 步上限：请立即停止调用工具，直接给出一句简短收尾文本并结束本轮。）` }],
+          source: PLUGIN_SOURCE,
+        })
+        return { ...decision, messages: [...decision.messages, wrapUp] } as typeof decision
+      }
+    }
     try {
       // preStepInject 内部把 decision 当透传黑盒（any）；出口 cast 回宿主形状。
       return (await preStepInject({ agent, signal }, decision)) as typeof decision
@@ -1549,7 +1630,12 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     // 读库、不算注入），给出 /meow-trust 恢复方式。信任是活检查：/meow-trust 后
     // 下一轮即恢复正常注入，无需重启。提示记账在全局注册表（工作区文件可预置，
     // 不能当标记）。
-    if (ws !== null && isUntrustedMemoryWorkspace(ws)) {
+    // #121：目录完全不存在 = 无任何可预置内容，信任门无意义——直接放行（后续
+    // getDb 懒建库 → registerCreatedWorkspace 写 created-empty 信任），避免全新
+    // 工作区首条消息先误报「外部记忆库」再 14ms 后建库自愈的顺序错位。只判
+    // memory.db 不够：「只预置 PROJECT.md、无库」的恶意目录仍须触发信任门（#64
+    // 设计意图：建库时目录须为空才给 created-empty）——判目录存在兼顾两者。
+    if (ws !== null && isUntrustedMemoryWorkspace(ws) && existsSync(join(ws, resolved.projectDir))) {
       if (!hasExternalNoticeShown(ws)) {
         markExternalNoticeShown(ws)
         try {
@@ -1684,6 +1770,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         const db = getDb(ws, resolved.projectDir)
         const hit = buildHitInjection(db, ws, sid, text, {
           hitTopK: resolved.hitTopK,
+          hitStopwords: resolved.hitStopwords,
           titleMax: resolved.titleMax,
         }, resolved.projectDir)
         try {
@@ -2197,6 +2284,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     clearTimeout(commandTimer)
     stopDream()
     disposeDreamHeartbeats() // 热重载不残留 dream 租约心跳定时器
+    pluginTurnSteps.clear() // #120：热重载不残留整理轮步数计数/熔断闩（新实例重新计数）
+    pluginTurnCapAbort.clear()
     broadcast.dispose()
     try {
       closeAllDbs()
