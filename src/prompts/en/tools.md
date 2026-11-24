@@ -11,7 +11,7 @@
 - memory_remember.param.goal: The topic's goal sentence (recommended when level=topic, e.g. "get the femGen integration working").
 - memory_remember.param.importance: Importance (any number, no upper bound; soft guide 1-4: 4=fatal red line / health and safety, 3=stressed by the user / globally applicable, 2=a user decision or an abstract conclusion, 1=trivia).
 - memory_remember.param.corrected: Whether this is something the user corrected (for level=lesson).
-- memory_remember.param.keywords: Keywords you choose (the reflection/dream rounds ask for 8-13 content words; omit it and they are extracted automatically).
+- memory_remember.param.keywords: Keywords you choose (the reflection/dream rounds ask for 8-13 content words; omit it and they are extracted automatically). A JSON array or a comma-separated string both work: e.g. "keywords": ["login", "auth"] or "keywords": "login, auth".
 - memory_remember.out.keywords: The keywords actually stored (auto-extracted; after a merge, the latest value).
 - memory_remember.out.project: The project actually recorded (if any).
 
@@ -55,7 +55,7 @@
 - memory_update.param.importance: New importance (any number, no upper bound; soft guide 1-4: 4=fatal red line / health and safety, 3=stressed by the user / globally applicable, 2=a user decision or an abstract conclusion, 1=trivia).
 - memory_update.param.goal: New goal sentence (topic).
 - memory_update.param.project: New project name (project/fact/lesson/rules/topic); use "global" for globally applicable information; comma-separate several projects; an empty string clears it (unlabeled).
-- memory_update.param.keywords: Keywords you choose (fix or extend them whenever you notice they are off; omitting the parameter or passing an empty array leaves the keywords untouched).
+- memory_update.param.keywords: Keywords you choose (fix or extend them whenever you notice they are off; omitting the parameter or passing an empty array leaves the keywords untouched). A JSON array or a comma-separated string both work.
 
 ### memory_project
 

@@ -334,7 +334,7 @@ function rememberTool(dir: string, privacy: boolean): ToolDefinition {
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['content', 'project', 'keywords', 'importance'],
+      required: ['content', 'project', 'importance'],
       properties: {
         content: { type: 'string', description: T('memory_remember.param.content') },
         level: {
@@ -348,7 +348,19 @@ function rememberTool(dir: string, privacy: boolean): ToolDefinition {
         goal: { type: 'string', description: T('memory_remember.param.goal') },
         importance: { type: 'integer', default: 1, description: T('memory_remember.param.importance') },
         corrected: { type: 'boolean', default: false, description: T('memory_remember.param.corrected') },
-        keywords: { type: 'array', items: { type: 'string' }, description: T('memory_remember.param.keywords') },
+        // #124：keywords 不再 required（缺失时 execute 自动 bigram 提取），且类型放宽
+        // anyOf [array, string]——deepseek-v4.1-flash 实测 9 次调用 0 次写出合法数组
+        //（5 次裸逗号列表/4 次逗号串），逗号串形态 normalizeKeywords 本就支持，schema
+        // 却只允许数组（实现宽容、schema 严格），参数在宿主 JSON.parse/校验阶段就判死。
+        // 注：裸逗号列表（非法 JSON）死在宿主解析层，schema 修不到——本放宽对它是
+        // 间接引导（string 合法 → 模型更可能写出带引号的合法形态）。
+        keywords: {
+          anyOf: [
+            { type: 'array', items: { type: 'string' } },
+            { type: 'string' },
+          ],
+          description: T('memory_remember.param.keywords'),
+        },
       },
     },
     output: {
@@ -384,16 +396,24 @@ function rememberTool(dir: string, privacy: boolean): ToolDefinition {
       if (content.length === 0) throw new Error(L('remember.error.content'))
       const project = typeof parsed.project === 'string' && parsed.project.trim() ? parsed.project.trim() : null
       if (project === null) throw new Error(L('remember.error.project', { global: globalProjectMarker() }))
-      const keywords = normalizeKeywords(parsed.keywords)
+      let keywords = normalizeKeywords(parsed.keywords)
       if (keywords.length === 0) {
         // 区分「压根没传」与「传了但解析不出任何关键词」（issue #24）：旧实现两者都
         // 报「必填」，用户明明带了 8-13 个关键词却被告知没填，排查方向被带偏。
+        // #124：「压根没传」改为自动 bigram 提取兜底（tools.md 描述「不传则自动
+        // bigram 提取」此前与实现不符——实现是抛错；现在让文档成真，消掉这个模型
+        // 最容易写错的必填字段）；兜底也提不出（content 过短/无内容词）才报必填。
+        // 「传了但归一为空」（如 "、"）→ 保留 keywordsEmpty 报错引导（issue #24 语义不动）。
         const missing = parsed.keywords === undefined || parsed.keywords === null
           || (typeof parsed.keywords === 'string' && parsed.keywords.trim() === '')
           || (Array.isArray(parsed.keywords) && parsed.keywords.length === 0)
-        throw new Error(missing
-          ? L('remember.error.keywords')
-          : L('remember.error.keywordsEmpty', { received: describeArg(parsed.keywords) }))
+        if (missing) {
+          const auto = extractKeywords(content)
+          if (auto.length === 0) throw new Error(L('remember.error.keywords'))
+          keywords = auto
+        } else {
+          throw new Error(L('remember.error.keywordsEmpty', { received: describeArg(parsed.keywords) }))
+        }
       }
       const importanceRaw = coerceNumber(parsed.importance)
       if (importanceRaw === undefined) throw new Error(L('remember.error.importance'))
@@ -906,7 +926,13 @@ function updateTool(dir: string, privacy: boolean): ToolDefinition {
         importance: { type: 'integer', description: T('memory_update.param.importance') },
         goal: { type: 'string', description: T('memory_update.param.goal') },
         project: { type: 'string', description: T('memory_update.param.project') },
-        keywords: { type: 'array', items: { type: 'string' }, description: T('memory_update.param.keywords') },
+        keywords: {
+          anyOf: [
+            { type: 'array', items: { type: 'string' } },
+            { type: 'string' },
+          ],
+          description: T('memory_update.param.keywords'),
+        },
       },
     },
     output: {

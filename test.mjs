@@ -1689,8 +1689,8 @@ check('remember render shows result', rememberTool.output.render({}, remRes)[0].
 // remember 四必填：缺失逐个报错并引导重填
 const missP = await rememberTool.execute({ content: '缺参测试', level: 'fact' }, updCtx).catch((e) => String(e?.message ?? e))
 check('remember requires project', missP.includes('project 参数必填'))
-const missK = await rememberTool.execute({ content: '缺参测试', level: 'fact', project: 'dsh' }, updCtx).catch((e) => String(e?.message ?? e))
-check('remember requires keywords', missK.includes('keywords 参数必填'))
+const missK = await rememberTool.execute({ content: '缺参测试 端口约定 说明', level: 'fact', project: 'dsh', importance: 1 }, updCtx)
+check('remember keywords 缺失 → 自动提取（#124），不再报必填', Array.isArray(missK.keywords) && missK.keywords.length > 0, JSON.stringify(missK))
 const missI = await rememberTool.execute({ content: '缺参测试', level: 'fact', project: 'dsh', keywords: ['缺参', '测试'] }, updCtx).catch((e) => String(e?.message ?? e))
 check('remember requires importance', missI.includes('importance 参数必填'))
 
@@ -2528,6 +2528,59 @@ check('fork session (parentSession without origin) still injects', decisionFork.
     rmSync(ws121, { recursive: true, force: true })
     rmSync(home121, { recursive: true, force: true })
   }
+}
+
+// ── #124 keywords schema 放宽 + 缺失自动提取 ────────────────────────────────
+{
+  const ws124 = mkdtempSync(join(tmpdir(), 'mm-kw124-'))
+  const db124 = new MemoryDb(memoryDbPath(ws124))
+  const mod124 = await import('./lib/index.js')
+  const registered124 = []
+  mod124.registerMemoryTools((t) => registered124.push(t), '.dsh-meow')
+  const byName124 = Object.fromEntries(registered124.map((t) => [t.name, t]))
+  const exec124 = () => ({ agent: { session: { header: { cwd: ws124, id: 's-124' } } } })
+
+  // schema 断言：required 不含 keywords；anyOf [array, string] 两处（remember/update）
+  const rmParams124 = byName124.memory_remember.parameters
+  check('#124 remember required 不含 keywords', Array.isArray(rmParams124.required) && !rmParams124.required.includes('keywords'), JSON.stringify(rmParams124.required))
+  check('#124 remember keywords anyOf 放宽', JSON.stringify(rmParams124.properties.keywords).includes('"anyOf"') && JSON.stringify(rmParams124.properties.keywords).includes('"string"'))
+  const updParams124 = byName124.memory_update.parameters
+  check('#124 update keywords anyOf 放宽', JSON.stringify(updParams124.properties.keywords).includes('"anyOf"'))
+
+  // 逗号串形态（#124 形态 B）：归一入库
+  const rB = await byName124.memory_remember.execute(
+    { content: '部署端口是 3081', project: 'p', keywords: '部署, 端口', importance: 2 },
+    exec124(),
+  )
+  check('#124 keywords 逗号串入库', Array.isArray(rB.keywords) && rB.keywords.join(',') === '部署,端口', JSON.stringify(rB.keywords))
+
+  // 缺失 keywords（#124 建议 2）：自动 bigram 提取兜底，不再报必填
+  const rAuto = await byName124.memory_remember.execute(
+    { content: '猫猫的部署端口约定是 3081 端口', project: 'p', importance: 2 },
+    exec124(),
+  )
+  check('#124 缺失 keywords 自动提取', Array.isArray(rAuto.keywords) && rAuto.keywords.length > 0, JSON.stringify(rAuto))
+
+  // 传了但归一为空（issue #24 语义保留）：报错引导不变
+  let kwEmptyErr = null
+  try { await byName124.memory_remember.execute({ content: '内容', project: 'p', keywords: '、', importance: 2 }, exec124()) } catch (e) { kwEmptyErr = e }
+  check('#124 传了但空仍报 keywordsEmpty', kwEmptyErr !== null && String(kwEmptyErr.message).includes('解析'), String(kwEmptyErr?.message ?? '').slice(0, 80))
+
+  // 合法数组（原路径回归）
+  const rArr = await byName124.memory_remember.execute(
+    { content: '回归测试条目甲', project: 'p', keywords: ['甲词', '乙词'], importance: 1 },
+    exec124(),
+  )
+  check('#124 合法数组原路径', Array.isArray(rArr.keywords) && rArr.keywords.join(',') === '甲词,乙词', JSON.stringify(rArr.keywords))
+
+  // update keywords 逗号串（同族放宽）
+  const rU = await byName124.memory_update.execute({ id: rArr.id, keywords: '新词1, 新词2' }, exec124())
+  check('#124 update keywords 逗号串更新成功', rU.ok === true)
+  check('#124 update 落库值正确', JSON.stringify(db124.findById(rArr.id)?.row.keywords) === JSON.stringify(['新词1', '新词2']), JSON.stringify(db124.findById(rArr.id)?.row.keywords))
+
+  closeAllDbs()
+  db124.close()
+  rmSync(ws124, { recursive: true, force: true })
 }
 
 // turn-stopping 反思（单任务内连续工具 step ≥7 才触发——用户拍板语义）

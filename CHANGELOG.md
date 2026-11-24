@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.33.3 (2026-11-24)
+
+### 修复：memory_remember/update 的 keywords 参数导致整轮 MALFORMED_RESPONSE（#124）
+
+- **schema 对齐实现**：keywords 类型放宽为 `anyOf [array, string]`（remember/update 两处）——`normalizeKeywords` 自 #24 起就支持逗号串/JSON 文本归一，schema 却只允许数组（实现宽容、schema 严格），参数在宿主解析阶段就被判死。deepseek-v4.1-flash 实测 9 次调用 0 次写出合法数组；逗号串形态由此从「宿主判死」变为可入库。
+- **「不传则自动提取」成真**：keywords 移出 required；缺失时 execute 调 `extractKeywords(content)` 自动 bigram 提取（此前 tools.md 描述与实现不符——实现是抛错必填）。「传了但归一为空」保留 issue #24 的 keywordsEmpty 报错引导。
+- **字面示例**：三语言 param 描述补 `["登录", "鉴权"]` / `"登录, 鉴权"` 字面形态（弱模型对字面 JSON 敏感）。
+- 边界说明：裸逗号列表（非法 JSON，5/9 失败形态）死在宿主 JSON.parse 层，schema 修不到——本放宽对它是间接引导（string 合法 → 模型更可能写出带引号的合法形态）；宿主侧逐 call 宽松修复见 #124 建议 4（非本仓库范围）。
+
 ## v0.33.2 (2026-11-21)
 
 ### 修复：全新工作区首条消息误报「外部记忆库」并跳过首轮注入（#121）

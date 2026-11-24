@@ -11,7 +11,7 @@
 - memory_remember.param.goal: A frase de objetivo do topic (recomendada quando level=topic, ex.: "fazer a integração do femGen funcionar").
 - memory_remember.param.importance: Importância (qualquer número, sem limite superior; orientação suave 1-4: 4=linha vermelha fatal / saúde e segurança, 3=enfatizado pelo usuário / aplicável globalmente, 2=uma decisão do usuário ou uma conclusão abstrata, 1=trivialidade).
 - memory_remember.param.corrected: Se isto é algo que o usuário corrigiu (para level=lesson).
-- memory_remember.param.keywords: Palavras-chave que você escolhe (as rodadas de reflection/dream pedem de 8 a 13 palavras de conteúdo; omita e elas são extraídas automaticamente).
+- memory_remember.param.keywords: Palavras-chave que você escolhe (as rodadas de reflection/dream pedem de 8 a 13 palavras de conteúdo; omita e elas são extraídas automaticamente). Um array JSON ou uma string separada por vírgulas funcionam: ex. "keywords": ["login", "auth"] ou "keywords": "login, auth".
 - memory_remember.out.keywords: As palavras-chave realmente armazenadas (extraídas automaticamente; após uma mesclagem, o valor mais recente).
 - memory_remember.out.project: O projeto realmente registrado (se houver).
 
@@ -55,7 +55,7 @@
 - memory_update.param.importance: Nova importância (qualquer número, sem limite superior; orientação suave 1-4: 4=linha vermelha fatal / saúde e segurança, 3=enfatizado pelo usuário / aplicável globalmente, 2=uma decisão do usuário ou uma conclusão abstrata, 1=trivialidade).
 - memory_update.param.goal: Nova frase de objetivo (topic).
 - memory_update.param.project: Novo nome de projeto (project/fact/lesson/rules/topic); use "global" para informações aplicáveis globalmente; separe vários projetos por vírgula; uma string vazia limpa o campo (sem rótulo).
-- memory_update.param.keywords: Palavras-chave que você escolhe (corrija-as ou amplie-as sempre que notar que estão erradas; omitir o parâmetro ou passar um array vazio deixa as palavras-chave intactas).
+- memory_update.param.keywords: Palavras-chave que você escolhe (corrija-as ou amplie-as sempre que notar que estão erradas; omitir o parâmetro ou passar um array vazio deixa as palavras-chave intactas). Um array JSON ou uma string separada por vírgulas funcionam.
 
 ### memory_project
 
